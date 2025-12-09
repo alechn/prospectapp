@@ -161,7 +161,7 @@ def agent_analyze_page(html_content, current_url):
     for attempt in range(3):
         try:
             model = genai.GenerativeModel(
-                'gemini-1.5-flash',
+                'gemini-2.5-flash',
                 generation_config={"response_mime_type": "application/json"}
             )
             
