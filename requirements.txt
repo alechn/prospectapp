@@ -1,6 +1,6 @@
 streamlit
 pandas
 requests
-google-generativeai
+google-generativeai>=0.7.0
 unidecode
 beautifulsoup4
