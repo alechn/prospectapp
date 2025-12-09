@@ -10,14 +10,15 @@ from typing import Set, Tuple
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide")
 st.title("🇧🇷 Universal Brazilian Alumni Finder")
+st.caption("Powered by Gemini 2.5 Flash-Lite")
 
 # =========================================================
-#            PART 0: API KEY SETUP (OPTION B)
+#            PART 0: API KEY SETUP
 # =========================================================
 # 1. Try to get key from Streamlit Secrets
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"]
-    st.sidebar.success("🔑 API Key loaded securely from Secrets")
+    st.sidebar.success("🔑 API Key loaded securely")
 else:
     # 2. Fallback to manual entry
     api_key = st.sidebar.text_input("Google Gemini API Key", type="password")
@@ -49,7 +50,7 @@ def normalize_token(s: str) -> str:
 def fetch_ibge_data() -> Tuple[Set[str], Set[str]]:
     """
     Fetches top 2000 First Names and Surnames from IBGE API.
-    Cached for 24 hours so it doesn't re-run on every click.
+    Cached for 24 hours.
     """
     IBGE_FIRST_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
     IBGE_SURNAME_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
@@ -61,7 +62,7 @@ def fetch_ibge_data() -> Tuple[Set[str], Set[str]]:
         page = 1
         while len(names_set) < TARGET and page <= MAX_PAGES:
             try:
-                # 0.05s delay to be polite to IBGE servers
+                # Tiny delay to be polite to IBGE servers
                 time.sleep(0.05)
                 resp = requests.get(base_url, params={"page": page}, timeout=10)
                 resp.raise_for_status()
@@ -81,10 +82,10 @@ def fetch_ibge_data() -> Tuple[Set[str], Set[str]]:
 
     return _fetch_paginated(IBGE_FIRST_API), _fetch_paginated(IBGE_SURNAME_API)
 
-# Load data immediately upon app start
+# Load data immediately
 try:
     brazil_first_names, brazil_surnames = fetch_ibge_data()
-    st.sidebar.info(f"✅ Database Ready: {len(brazil_first_names)} names, {len(brazil_surnames)} surnames loaded.")
+    st.sidebar.info(f"✅ Database Ready: {len(brazil_first_names)} names, {len(brazil_surnames)} surnames.")
 except Exception as e:
     st.error(f"Failed to load IBGE data: {e}")
     st.stop()
@@ -94,10 +95,10 @@ except Exception as e:
 # =========================================================
 
 def extract_names_with_ai(text_content):
-    """Sends website text to Gemini 1.5 Flash to find names."""
+    """Sends website text to Gemini 2.5 Flash-Lite."""
     if not api_key: return []
     
-    # Gemini Flash has a huge context window (1M tokens)
+    # Flash-Lite handles large context easily
     truncated_text = text_content[:100000] 
 
     prompt = f"""
@@ -111,11 +112,12 @@ def extract_names_with_ai(text_content):
     """
     
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(prompt)
+        # UPDATED MODEL NAME HERE
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
         
+        response = model.generate_content(prompt)
         content = response.text
-        # Clean up markdown if Gemini adds it accidentally
+        # Clean up markdown if Gemini adds it
         content = content.replace("```json", "").replace("```", "").strip()
         
         return json.loads(content)
