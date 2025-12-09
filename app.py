@@ -11,8 +11,8 @@ from typing import Set, Tuple, List
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide")
-st.title("🇧🇷 Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash-Lite • Smart Session Agent")
+st.title("Universal Brazilian Alumni Finder")
+st.caption("Powered by Gemini 2.5 Flash-Lite • Robust Session Agent")
 
 # =========================================================
 #            PART 0: API KEY SETUP
@@ -41,18 +41,12 @@ def normalize_token(s: str) -> str:
 
 def clean_html_for_ai(html_text):
     """
-    Crucial Fix: Preserves HTML structure (forms, inputs, links) 
-    so the AI can actually see how to navigate.
+    Preserves HTML structure (forms, inputs, links) but removes noise.
     """
     soup = BeautifulSoup(html_text, "html.parser")
-    
-    # Remove junk to save tokens
-    for element in soup(["script", "style", "head", "svg", "footer", "iframe", "noscript"]):
+    for element in soup(["script", "style", "head", "svg", "footer", "iframe", "noscript", "img"]):
         element.decompose()
-        
-    # Get the raw HTML string, not just text
-    cleaned_html = str(soup)
-    return cleaned_html[:100000] # Cap at 100k chars
+    return str(soup)[:100000] # Cap at 100k chars
 
 # =========================================================
 #            PART 2: IBGE DATA (Cached)
@@ -90,12 +84,13 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-#            PART 3: THE UNIVERSAL AGENT
+#            PART 3: THE UNIVERSAL AGENT (With Retry & JSON Mode)
 # =========================================================
 
 def agent_analyze_page(html_content, current_url):
     """
-    Asks Gemini to find names AND the navigation logic.
+    Asks Gemini to find names AND navigation.
+    Uses 'response_mime_type' to enforce valid JSON.
     """
     if not api_key: return None
     
@@ -111,27 +106,38 @@ def agent_analyze_page(html_content, current_url):
     
     Current URL: {current_url}
     
-    OUTPUT FORMAT (JSON ONLY):
+    You must return a JSON object with this schema:
     {{
       "names": ["Name 1", "Name 2"],
       "navigation": {{
          "type": "LINK" or "FORM" or "NONE",
          "url": "next_url_here", 
-         "form_data": {{ "key": "value" }} (Only if type is FORM)
+         "form_data": {{ "key": "value" }}
       }}
     }}
     
-    HTML CODE TO ANALYZE:
+    HTML CODE:
     {clean_html_for_ai(html_content)}
     """
     
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash-lite') 
-        response = model.generate_content(prompt)
-        content = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(content)
-    except Exception as e:
-        return None
+    # RETRY LOGIC (Try 3 times if AI fails)
+    for attempt in range(3):
+        try:
+            model = genai.GenerativeModel(
+                'gemini-2.5-flash-lite',
+                # THIS IS THE FIX: FORCE JSON OUTPUT
+                generation_config={"response_mime_type": "application/json"}
+            )
+            
+            response = model.generate_content(prompt)
+            return json.loads(response.text)
+            
+        except Exception as e:
+            if attempt == 2: # On last attempt, fail
+                # print(f"Failed after 3 attempts: {e}")
+                return None
+            time.sleep(1) # Wait 1 sec before retry
+    return None
 
 def analyze_matches(found_names_list, source_label):
     results = []
@@ -160,7 +166,7 @@ def analyze_matches(found_names_list, source_label):
 #            PART 4: INTERFACE
 # =========================================================
 
-st.markdown("### 🕷️ Auto-Pilot Scraper")
+st.markdown("### Auto-Pilot")
 st.write("Enter the first URL. The AI will navigate automatically.")
 
 start_url = st.text_input("Directory URL:", placeholder="https://legacy.cs.stanford.edu/directory/undergraduate-alumni")
@@ -172,7 +178,6 @@ if st.button("Start Scraping", type="primary"):
         st.stop()
         
     session = requests.Session()
-    # Mimic browser
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     })
@@ -180,14 +185,12 @@ if st.button("Start Scraping", type="primary"):
     all_matches = []
     current_url = start_url
     
-    # State tracking
     next_method = "GET" 
     next_data = None 
     
     status_box = st.status("Starting Agent...", expanded=True)
     progress_bar = st.progress(0)
     
-    # Track visited states to prevent loops
     visited_fingerprints = set() 
     
     for page_num in range(1, max_pages + 1):
@@ -205,11 +208,12 @@ if st.button("Start Scraping", type="primary"):
                 status_box.error(f"❌ Error: Status Code {resp.status_code}")
                 break
 
-            # 2. AI ANALYSIS
+            # 2. AI ANALYSIS (Now with Retries)
             data = agent_analyze_page(resp.text, current_url)
             
             if not data:
-                status_box.warning("⚠️ AI could not read page. Stopping.")
+                status_box.warning(f"⚠️ AI could not read page {page_num}. Stopping.")
+                # Optional: break or continue? Usually break if we lose navigation.
                 break
                 
             # 3. PROCESS NAMES
@@ -237,16 +241,12 @@ if st.button("Start Scraping", type="primary"):
                     break
                     
             elif nav_type == "FORM":
-                # AI found the form!
                 form_data = nav.get("form_data", {})
                 if form_data:
                     next_method = "POST"
                     next_data = form_data
-                    
-                    # Log what the AI found
                     status_box.write(f"📝 Form detected. Posting: {form_data}")
                     
-                    # Stop infinite loops
                     fingerprint = str(form_data)
                     if fingerprint in visited_fingerprints:
                         status_box.warning("⚠️ Loop detected (same form token). Finishing.")
