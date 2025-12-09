@@ -7,12 +7,12 @@ import time
 from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-from typing import Set, Tuple
+from typing import Set, Tuple, List
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide")
 st.title("🇧🇷 Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash-Lite • Robust Crawler")
+st.caption("Powered by Gemini 2.5 Flash-Lite • Session-Based AI Agent")
 
 # =========================================================
 #            PART 0: API KEY SETUP
@@ -39,39 +39,12 @@ def normalize_token(s: str) -> str:
     s = "".join(ch for ch in s if "A" <= ch <= "Z")
     return s
 
-def get_page_content(url):
-    """
-    Tries to get clean text. 
-    1. Tries Jina Reader.
-    2. If that fails, falls back to raw HTML extraction.
-    """
-    # Mimic a real browser to avoid blocks
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
-    # Method A: Jina Reader (Best for cleaning)
-    try:
-        jina_url = f"https://r.jina.ai/{url}"
-        resp = requests.get(jina_url, headers=headers, timeout=15)
-        if resp.status_code == 200 and len(resp.text) > 500:
-            return resp.text, "Jina Reader"
-    except:
-        pass
-
-    # Method B: Direct HTML (Fallback)
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Kill scripts and styles
-            for script in soup(["script", "style"]):
-                script.decompose()
-            return soup.get_text(separator="\n"), "Raw HTML"
-    except Exception as e:
-        return None, str(e)
-    
-    return None, "Failed to load"
+def clean_html(html_text):
+    """Reduces token count by removing scripts, styles, and headers."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    for element in soup(["script", "style", "head", "footer", "nav"]):
+        element.decompose()
+    return soup.get_text(separator="\n")[:100000] # Cap at 100k chars
 
 # =========================================================
 #            PART 2: IBGE DATA (Cached)
@@ -97,45 +70,53 @@ def fetch_ibge_data() -> Tuple[Set[str], Set[str]]:
                     norm = normalize_token(item.get("nome"))
                     if norm: names_set.add(norm)
                 page += 1
-            except:
-                break
+            except: break
         return names_set
-
     return _fetch_paginated(IBGE_FIRST_API), _fetch_paginated(IBGE_SURNAME_API)
 
 try:
     brazil_first_names, brazil_surnames = fetch_ibge_data()
-    st.sidebar.info(f"✅ Database Ready: {len(brazil_first_names)} names, {len(brazil_surnames)} surnames.")
+    st.sidebar.info(f"✅ IBGE Database Ready: {len(brazil_first_names)} names, {len(brazil_surnames)} surnames.")
 except Exception as e:
     st.error(f"Failed to load IBGE data: {e}")
     st.stop()
 
 # =========================================================
-#            PART 3: AGENTIC AI LOGIC
+#            PART 3: THE UNIVERSAL AGENT
 # =========================================================
 
-def analyze_page_with_agent(text_content, current_url):
-    if not api_key: return {"names": [], "next_url": None}
+def agent_analyze_page(html_content, current_url):
+    """
+    Asks Gemini to find names AND determine how to get to the next page.
+    It can detect Link (GET) or Form (POST).
+    """
+    if not api_key: return None
     
-    truncated_text = text_content[:100000] 
-
     prompt = f"""
-    You are a scraping agent.
-    1. Extract a list of all personal names (Students, Alumni). Ignore generic terms like "University" or "Department".
-    2. Find the "Next Page" link URL. Look for buttons like "Next", "Next >", "2", "Older".
-
+    You are an intelligent crawling agent.
+    
+    TASK 1: Extract all personal names (Alumni/Students). Return as list of strings.
+    
+    TASK 2: Find the mechanism to go to the "Next Page".
+    - It might be a standard link: <a href="page2">Next</a>
+    - It might be a form button: <form><input type="hidden" name="page" value="token"><input type="submit" value="Next"></form>
+    
+    Analyze the HTML below and return a JSON object.
+    
     Current URL: {current_url}
-
-    Return ONLY raw JSON:
+    
+    OUTPUT FORMAT (JSON ONLY):
     {{
       "names": ["Name 1", "Name 2"],
-      "next_url": "/directory?page=2" 
+      "navigation": {{
+         "type": "LINK" or "FORM" or "NONE",
+         "url": "full_or_relative_url_if_link", 
+         "form_data": {{ "key": "value" }} (If type is FORM, extract hidden inputs needed for next page)
+      }}
     }}
     
-    If no next link is found, set "next_url": null.
-
-    TEXT TO ANALYZE:
-    {truncated_text}
+    HTML CONTENT:
+    {clean_html(html_content)}
     """
     
     try:
@@ -144,14 +125,14 @@ def analyze_page_with_agent(text_content, current_url):
         content = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(content)
     except Exception as e:
-        return {"names": [], "next_url": None}
+        # st.error(f"AI Error: {e}")
+        return None
 
 def analyze_matches(found_names_list, source_label):
     results = []
     for full_name in found_names_list:
         parts = full_name.strip().split()
         if not parts: continue
-        
         first_norm = normalize_token(parts[0])
         last_norm = normalize_token(parts[-1]) if len(parts) > 1 else ""
         
@@ -172,114 +153,125 @@ def analyze_matches(found_names_list, source_label):
     return results
 
 # =========================================================
-#            PART 4: USER INTERFACE
+#            PART 4: INTERFACE
 # =========================================================
 
-tab1, tab2 = st.tabs(["🕷️ Smart Auto-Crawler", "📋 Manual Paste"])
+st.markdown("### 🕷️ Auto-Pilot Scraper")
+st.write("Enter the first URL. The AI will detect if it needs to click Links or submit Forms (like Stanford).")
 
-with tab1:
-    st.markdown("### The \"One Size Fits All\" Crawler")
-    start_url = st.text_input("Starting URL:", placeholder="https://...")
-    max_pages = st.slider("Max Pages", 1, 50, 5)
-    
-    # DEBUG TOGGLE
-    show_debug = st.checkbox("Show Debug Info (See what the AI reads)")
-    
-    if st.button("Start Crawling"):
-        if not api_key:
-            st.error("Please add your API Key.")
-            st.stop()
-            
-        all_matches = []
-        visited_urls = set()
-        current_url = start_url
-        page_count = 0
-        
-        status_box = st.status("🕷️ Starting Agent...", expanded=True)
-        progress_bar = st.progress(0)
-        
-        while current_url and page_count < max_pages:
-            if current_url in visited_urls:
-                status_box.write(f"⚠️ Loop detected. Stopping.")
-                break
-            visited_urls.add(current_url)
-            page_count += 1
-            
-            status_box.update(label=f"Scanning Page {page_count}...", state="running")
-            status_box.write(f"**Page {page_count}:** `{current_url}`")
-            
-            # 1. Get Content (Robust Method)
-            text_content, method_used = get_page_content(current_url)
-            
-            if not text_content:
-                status_box.error(f"❌ Failed to read page. Blocked or empty.")
-                break
-            
-            status_box.write(f"📖 Read {len(text_content)} chars using {method_used}")
-            
-            # Show debug text if enabled
-            if show_debug:
-                with st.expander(f"See Text for Page {page_count}"):
-                    st.text(text_content[:2000] + "...")
+start_url = st.text_input("Directory URL:", placeholder="https://legacy.cs.stanford.edu/directory/undergraduate-alumni")
+max_pages = st.number_input("Max Pages Limit", min_value=1, value=100)
 
-            # 2. AI Analysis
-            try:
-                data = analyze_page_with_agent(text_content, current_url)
+if st.button("Start Scraping", type="primary"):
+    if not api_key:
+        st.error("Please add your API Key.")
+        st.stop()
+        
+    # --- SETUP SESSION ---
+    session = requests.Session()
+    # Mimic a browser to avoid simple blocks
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    
+    all_matches = []
+    current_url = start_url
+    
+    # We need to track the METHOD and DATA for the next step
+    # Initial step is always GET on the start_url
+    next_method = "GET" 
+    next_data = None 
+    
+    status_box = st.status("Starting Agent...", expanded=True)
+    progress_bar = st.progress(0)
+    
+    # To prevent infinite loops on the exact same URL if navigation fails
+    visited_fingerprints = set() 
+    
+    for page_num in range(1, max_pages + 1):
+        status_box.update(label=f"Scanning Page {page_num}...", state="running")
+        status_box.write(f"**Requesting:** {current_url} via {next_method}")
+        
+        try:
+            # 1. EXECUTE REQUEST
+            if next_method == "GET":
+                resp = session.get(current_url, timeout=30)
+            else: # POST
+                resp = session.post(current_url, data=next_data, timeout=30)
+            
+            if resp.status_code != 200:
+                status_box.error(f"❌ Error: Status Code {resp.status_code}")
+                break
+
+            # 2. AI ANALYSIS
+            data = agent_analyze_page(resp.text, current_url)
+            
+            if not data:
+                status_box.warning("⚠️ AI could not read page. Stopping.")
+                break
                 
-                # Check results
-                names = data.get("names", [])
-                if not names:
-                    status_box.warning("⚠️ AI found 0 names. (Check 'Show Debug' to see if text is valid)")
-                
-                matches = analyze_matches(names, f"Page {page_count}")
-                
-                if matches:
-                    status_box.success(f"✅ Found {len(matches)} potential Brazilians!")
-                    all_matches.extend(matches)
+            # 3. PROCESS NAMES
+            names = data.get("names", [])
+            matches = analyze_matches(names, f"Page {page_num}")
+            if matches:
+                all_matches.extend(matches)
+                status_box.write(f"✅ Found {len(matches)} matches.")
+            else:
+                status_box.write(f"🤷 0 matches found.")
+
+            # 4. DECIDE NEXT STEP
+            nav = data.get("navigation", {})
+            nav_type = nav.get("type", "NONE")
+            
+            if nav_type == "LINK":
+                raw_link = nav.get("url")
+                if raw_link:
+                    current_url = urljoin(current_url, raw_link)
+                    next_method = "GET"
+                    next_data = None
+                    status_box.write(f"🔗 Link found: {raw_link}")
                 else:
-                    if names:
-                        status_box.info(f"Found {len(names)} names, but none were Brazilian.")
-                
-                # 3. Next Page Logic
-                next_raw = data.get("next_url")
-                if next_raw:
-                    current_url = urljoin(current_url, next_raw)
-                    status_box.write(f"🔗 Following link: `{next_raw}`")
-                else:
-                    status_box.write("🛑 No 'Next' link found. Stopping.")
-                    current_url = None
+                    status_box.write("🛑 AI found Link type but no URL.")
+                    break
                     
-            except Exception as e:
-                status_box.error(f"Error during analysis: {e}")
-                break
-            
-            progress_bar.progress(page_count / max_pages)
-            time.sleep(1) 
-            
-        status_box.update(label="Crawling Complete!", state="complete", expanded=False)
-        
-        if all_matches:
-            st.success(f"🎉 Found {len(all_matches)} matches!")
-            df = pd.DataFrame(all_matches)
-            st.dataframe(df)
-            st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "matches.csv")
-        else:
-            st.warning("No matches found.")
-
-with tab2:
-    st.info("Backup: Copy/Paste full text here if the crawler gets blocked.")
-    raw_paste = st.text_area("Paste Content:", height=300)
-    
-    if st.button("Analyze Text"):
-        if raw_paste and api_key:
-            with st.spinner("Analyzing..."):
-                data = analyze_page_with_agent(raw_paste, "Manual Paste")
-                matches = analyze_matches(data.get("names", []), "Manual Paste")
-                
-                if matches:
-                    df = pd.DataFrame(matches)
-                    st.success(f"Found {len(df)} matches!")
-                    st.dataframe(df)
-                    st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "manual_matches.csv")
+            elif nav_type == "FORM":
+                # The AI found a hidden token!
+                form_data = nav.get("form_data", {})
+                if form_data:
+                    # For POST, the URL usually stays the same, or matches the 'action'
+                    # We assume same URL unless AI extracts action (simplified)
+                    next_method = "POST"
+                    next_data = form_data
+                    status_box.write(f"📝 Form found. Posting data: {form_data}")
+                    
+                    # Safety check: if data looks identical to last time, stop loop
+                    fingerprint = str(form_data)
+                    if fingerprint in visited_fingerprints:
+                        status_box.warning("⚠️ Loop detected (same form token). Finishing.")
+                        break
+                    visited_fingerprints.add(fingerprint)
                 else:
-                    st.warning("No matches found.")
+                    status_box.write("🛑 AI found Form type but no data.")
+                    break
+                    
+            else:
+                status_box.write("🏁 No next page detected. Job done.")
+                break
+                
+        except Exception as e:
+            status_box.error(f"Critical Error: {e}")
+            break
+            
+        progress_bar.progress(page_num / max_pages)
+        time.sleep(1) # Be polite
+
+    status_box.update(label="Complete!", state="complete", expanded=False)
+    
+    if all_matches:
+        st.balloons()
+        df = pd.DataFrame(all_matches)
+        st.success(f"🎉 Found {len(df)} total matches!")
+        st.dataframe(df)
+        st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "brazilian_alumni.csv")
+    else:
+        st.warning("No matches found.")
