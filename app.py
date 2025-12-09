@@ -10,17 +10,18 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from typing import Set, Tuple, List
 
-# --- CONFIGURATION ---
+# =========================================================
+#             PART 0: CONFIGURATION & SETUP
+# =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide")
 st.title("Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash-Lite • Robust Session Agent")
+st.caption("Powered by Gemini 2.5 Flash • Robust Session Agent")
 
-# =========================================================
-#             PART 0: API KEY SETUP
-# =========================================================
+# --- SIDEBAR: API KEY ---
+st.sidebar.header("🔑 Authentication")
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"]
-    st.sidebar.success("🔑 API Key loaded securely")
+    st.sidebar.success("API Key loaded securely")
 else:
     api_key = st.sidebar.text_input("Google Gemini API Key", type="password")
     st.sidebar.markdown("[Get a free Gemini Key here](https://aistudio.google.com/app/apikey)")
@@ -45,70 +46,15 @@ def clean_html_for_ai(html_text):
     Preserves HTML structure but removes noise to fit in context window.
     """
     soup = BeautifulSoup(html_text, "html.parser")
-    # aggressive cleaning
+    # Aggressive cleaning of non-visible/non-structural elements
     for element in soup(["script", "style", "head", "svg", "footer", "iframe", "noscript", "img", "meta", "link"]):
         element.decompose()
-    # Get text but keep some structure
     return str(soup)[:50000] # Cap at 50k chars to save tokens
 
 def clean_json_response(text):
     """
-    Fixes the common error where AI wraps JSON in markdown code blocks.
-    """
-    text = text.strip()
-    # Remove markdown code blocks if present
-    if text.startswith("```"):
-        # Find the first newline
-        first_newline = text.find("\n")
-        if first_newline != -1:
-            text = text[first_newline+1:]
-    if text.endswith("```"):
-        text = text[:-3]
-    return text.strip()
-
-# =========================================================
-#             PART 2: IBGE DATA (Cached)
-# =========================================================
-
-@st.cache_data(ttl=86400, show_spinner="Downloading IBGE Census Data...")
-def fetch_ibge_data() -> Tuple[Set[str], Set[str]]:
-    IBGE_FIRST_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
-    IBGE_SURNAME_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
-    TARGET = 2000
-    MAX_PAGES = 50
-
-    def _fetch_paginated(base_url):
-        names_set = set()
-        page = 1
-        while len(names_set) < TARGET and page <= MAX_PAGES:
-            try:
-                time.sleep(0.05)
-                resp = requests.get(base_url, params={"page": page}, timeout=10)
-                items = resp.json().get("items", [])
-                if not items: break
-                for item in items:
-                    norm = normalize_token(item.get("nome"))
-                    if norm: names_set.add(norm)
-                page += 1
-            except: break
-        return names_set
-    return _fetch_paginated(IBGE_FIRST_API), _fetch_paginated(IBGE_SURNAME_API)
-
-try:
-    brazil_first_names, brazil_surnames = fetch_ibge_data()
-    st.sidebar.info(f"✅ IBGE Database Ready: {len(brazil_first_names)} names, {len(brazil_surnames)} surnames.")
-except Exception as e:
-    st.error(f"Failed to load IBGE data: {e}")
-    st.stop()
-
-# =========================================================
-#             PART 3: THE UNIVERSAL AGENT (Patched)
-# =========================================================
-
-def clean_json_response(text):
-    """
     Uses Regex to find the first valid JSON object in the text.
-    This handles cases where the AI adds chatty text before/after the JSON.
+    Handles cases where AI adds markdown or chatty prefixes.
     """
     try:
         # Regex to find the outer-most curly braces
@@ -119,15 +65,76 @@ def clean_json_response(text):
     except:
         return text
 
+# =========================================================
+#             PART 2: DYNAMIC IBGE DATA (Cached)
+# =========================================================
+
+@st.cache_data(ttl=86400, show_spinner="Updating Brazilian Name Database...")
+def fetch_ibge_data(limit_count: int) -> Tuple[Set[str], Set[str]]:
+    IBGE_FIRST_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
+    IBGE_SURNAME_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
+    
+    # Use the slider limit
+    TARGET = limit_count
+    MAX_PAGES = 100 
+
+    def _fetch_paginated(base_url):
+        names_set = set()
+        page = 1
+        # Loop until we hit the user's target limit or max pages
+        while len(names_set) < TARGET and page <= MAX_PAGES:
+            try:
+                time.sleep(0.05) # Polite delay
+                resp = requests.get(base_url, params={"page": page}, timeout=10)
+                
+                if resp.status_code != 200: break
+                
+                items = resp.json().get("items", [])
+                if not items: break
+                
+                for item in items:
+                    norm = normalize_token(item.get("nome"))
+                    if norm: names_set.add(norm)
+                    # Optimization: Break immediately if target met
+                    if len(names_set) >= TARGET:
+                        break
+                page += 1
+            except: 
+                break
+        return names_set
+
+    return _fetch_paginated(IBGE_FIRST_API), _fetch_paginated(IBGE_SURNAME_API)
+
+# --- SIDEBAR: DB SETTINGS ---
+st.sidebar.header("⚙️ Scraper Settings")
+db_size = st.sidebar.slider(
+    "🇧🇷 Database Scope", 
+    min_value=100, 
+    max_value=10000, 
+    value=2000, 
+    step=100,
+    help="Low = Common names only (Fast). High = Includes rare names (Slower)."
+)
+
+# Load Data based on slider
+try:
+    brazil_first_names, brazil_surnames = fetch_ibge_data(db_size)
+    st.sidebar.success(f"✅ DB Loaded: Top {len(brazil_first_names)} First Names & {len(brazil_surnames)} Surnames")
+except Exception as e:
+    st.error(f"Failed to load IBGE data: {e}")
+    st.stop()
+
+# =========================================================
+#             PART 3: THE UNIVERSAL AGENT
+# =========================================================
+
 def agent_analyze_page(html_content, current_url):
     if not api_key: return None
     
-    # Pre-check: If HTML is too short, the request probably failed
     if len(html_content) < 500:
         st.error("HTML content too short. You might be blocked.")
         return None
 
-    # Simplify prompt to reduce chance of error
     prompt = f"""
     You are a data extraction system. 
     Analyze the HTML below from: {current_url}
@@ -149,8 +156,7 @@ def agent_analyze_page(html_content, current_url):
     {clean_html_for_ai(html_content)}
     """
     
-    # Disable Safety Filters (Crucial for scraping directories)
-    # Directories often trigger false "Personal Info" safety blocks
+    # SAFETY SETTINGS: BLOCK_NONE is required for directories with names
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -160,6 +166,7 @@ def agent_analyze_page(html_content, current_url):
 
     for attempt in range(3):
         try:
+            # Using 1.5-flash for higher rate limits (1500 req/day vs 20 req/day)
             model = genai.GenerativeModel(
                 'gemini-2.5-flash',
                 generation_config={"response_mime_type": "application/json"}
@@ -167,30 +174,20 @@ def agent_analyze_page(html_content, current_url):
             
             response = model.generate_content(prompt, safety_settings=safety_settings)
             
-            # CHECK: Did the AI refuse to answer?
+            # Check for safety blocks
             if not response.parts:
-                # If blocked by safety, response.text might raise an error or be empty
                 print(f"Attempt {attempt}: AI returned empty response (Likely Safety Filter).")
                 continue
 
-            # CLEAN & PARSE
             cleaned_text = clean_json_response(response.text)
             return json.loads(cleaned_text)
             
         except Exception as e:
-            # LOG THE ERROR TO STREAMLIT FOR YOU TO SEE
-            print(f"Attempt {attempt} failed: {e}")
             if attempt == 2:
                 st.warning(f"⚠️ JSON Parsing Failed. Error: {e}")
-                try:
-                    # Show what the AI actually sent so we can debug
-                    st.text("Raw AI Response (Last 500 chars):")
-                    st.code(response.text[-500:]) 
-                except:
-                    pass
             time.sleep(1) 
     return None
-    
+
 def analyze_matches(found_names_list, source_label):
     results = []
     for full_name in found_names_list:
@@ -215,7 +212,7 @@ def analyze_matches(found_names_list, source_label):
     return results
 
 # =========================================================
-#             PART 4: INTERFACE
+#             PART 4: INTERFACE & EXECUTION
 # =========================================================
 
 st.markdown("### Auto-Pilot")
@@ -230,11 +227,10 @@ if st.button("Start Scraping", type="primary"):
         st.stop()
         
     session = requests.Session()
-    # --- PATCH: HUMAN HEADERS ---
+    # Spoof a real browser to avoid 403 Forbidden
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": "https://www.google.com/"
     })
     
@@ -262,11 +258,10 @@ if st.button("Start Scraping", type="primary"):
             
             if resp.status_code != 200:
                 status_box.error(f"❌ Error: Status Code {resp.status_code}")
-                # Debug info
                 status_box.code(resp.text[:500])
                 break
 
-            # 2. AI ANALYSIS (Patched)
+            # 2. AI ANALYSIS
             data = agent_analyze_page(resp.text, current_url)
             
             if not data:
@@ -323,7 +318,8 @@ if st.button("Start Scraping", type="primary"):
             break
             
         progress_bar.progress(page_num / max_pages)
-        time.sleep(1) 
+        # 4-second delay to stay safe within free tier limits (15 RPM)
+        time.sleep(4) 
 
     status_box.update(label="Complete!", state="complete", expanded=False)
     
