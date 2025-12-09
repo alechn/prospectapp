@@ -12,7 +12,7 @@ from typing import Set, Tuple, List
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide")
 st.title("🇧🇷 Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash-Lite • Session-Based AI Agent")
+st.caption("Powered by Gemini 2.5 Flash-Lite • Smart Session Agent")
 
 # =========================================================
 #            PART 0: API KEY SETUP
@@ -39,12 +39,20 @@ def normalize_token(s: str) -> str:
     s = "".join(ch for ch in s if "A" <= ch <= "Z")
     return s
 
-def clean_html(html_text):
-    """Reduces token count by removing scripts, styles, and headers."""
+def clean_html_for_ai(html_text):
+    """
+    Crucial Fix: Preserves HTML structure (forms, inputs, links) 
+    so the AI can actually see how to navigate.
+    """
     soup = BeautifulSoup(html_text, "html.parser")
-    for element in soup(["script", "style", "head", "footer", "nav"]):
+    
+    # Remove junk to save tokens
+    for element in soup(["script", "style", "head", "svg", "footer", "iframe", "noscript"]):
         element.decompose()
-    return soup.get_text(separator="\n")[:100000] # Cap at 100k chars
+        
+    # Get the raw HTML string, not just text
+    cleaned_html = str(soup)
+    return cleaned_html[:100000] # Cap at 100k chars
 
 # =========================================================
 #            PART 2: IBGE DATA (Cached)
@@ -87,8 +95,7 @@ except Exception as e:
 
 def agent_analyze_page(html_content, current_url):
     """
-    Asks Gemini to find names AND determine how to get to the next page.
-    It can detect Link (GET) or Form (POST).
+    Asks Gemini to find names AND the navigation logic.
     """
     if not api_key: return None
     
@@ -97,11 +104,10 @@ def agent_analyze_page(html_content, current_url):
     
     TASK 1: Extract all personal names (Alumni/Students). Return as list of strings.
     
-    TASK 2: Find the mechanism to go to the "Next Page".
-    - It might be a standard link: <a href="page2">Next</a>
-    - It might be a form button: <form><input type="hidden" name="page" value="token"><input type="submit" value="Next"></form>
-    
-    Analyze the HTML below and return a JSON object.
+    TASK 2: Analyze the HTML structure to find the "Next Page" mechanism.
+    - LOOK CLOSELY at <form> tags. Does the "Next" button submit a form?
+    - If it's a form, extract the HIDDEN INPUTS needed to submit it.
+    - If it's a link <a>, extract the href.
     
     Current URL: {current_url}
     
@@ -110,13 +116,13 @@ def agent_analyze_page(html_content, current_url):
       "names": ["Name 1", "Name 2"],
       "navigation": {{
          "type": "LINK" or "FORM" or "NONE",
-         "url": "full_or_relative_url_if_link", 
-         "form_data": {{ "key": "value" }} (If type is FORM, extract hidden inputs needed for next page)
+         "url": "next_url_here", 
+         "form_data": {{ "key": "value" }} (Only if type is FORM)
       }}
     }}
     
-    HTML CONTENT:
-    {clean_html(html_content)}
+    HTML CODE TO ANALYZE:
+    {clean_html_for_ai(html_content)}
     """
     
     try:
@@ -125,7 +131,6 @@ def agent_analyze_page(html_content, current_url):
         content = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(content)
     except Exception as e:
-        # st.error(f"AI Error: {e}")
         return None
 
 def analyze_matches(found_names_list, source_label):
@@ -144,7 +149,6 @@ def analyze_matches(found_names_list, source_label):
             if is_first and is_last: match_type = "Strong"
             elif is_first: match_type = "First Name Only"
             elif is_last: match_type = "Surname Only"
-                
             results.append({
                 "Full Name": full_name,
                 "Match Strength": match_type,
@@ -157,7 +161,7 @@ def analyze_matches(found_names_list, source_label):
 # =========================================================
 
 st.markdown("### 🕷️ Auto-Pilot Scraper")
-st.write("Enter the first URL. The AI will detect if it needs to click Links or submit Forms (like Stanford).")
+st.write("Enter the first URL. The AI will navigate automatically.")
 
 start_url = st.text_input("Directory URL:", placeholder="https://legacy.cs.stanford.edu/directory/undergraduate-alumni")
 max_pages = st.number_input("Max Pages Limit", min_value=1, value=100)
@@ -167,9 +171,8 @@ if st.button("Start Scraping", type="primary"):
         st.error("Please add your API Key.")
         st.stop()
         
-    # --- SETUP SESSION ---
     session = requests.Session()
-    # Mimic a browser to avoid simple blocks
+    # Mimic browser
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     })
@@ -177,20 +180,19 @@ if st.button("Start Scraping", type="primary"):
     all_matches = []
     current_url = start_url
     
-    # We need to track the METHOD and DATA for the next step
-    # Initial step is always GET on the start_url
+    # State tracking
     next_method = "GET" 
     next_data = None 
     
     status_box = st.status("Starting Agent...", expanded=True)
     progress_bar = st.progress(0)
     
-    # To prevent infinite loops on the exact same URL if navigation fails
+    # Track visited states to prevent loops
     visited_fingerprints = set() 
     
     for page_num in range(1, max_pages + 1):
         status_box.update(label=f"Scanning Page {page_num}...", state="running")
-        status_box.write(f"**Requesting:** {current_url} via {next_method}")
+        status_box.write(f"**Requesting:** {current_url} ({next_method})")
         
         try:
             # 1. EXECUTE REQUEST
@@ -235,23 +237,23 @@ if st.button("Start Scraping", type="primary"):
                     break
                     
             elif nav_type == "FORM":
-                # The AI found a hidden token!
+                # AI found the form!
                 form_data = nav.get("form_data", {})
                 if form_data:
-                    # For POST, the URL usually stays the same, or matches the 'action'
-                    # We assume same URL unless AI extracts action (simplified)
                     next_method = "POST"
                     next_data = form_data
-                    status_box.write(f"📝 Form found. Posting data: {form_data}")
                     
-                    # Safety check: if data looks identical to last time, stop loop
+                    # Log what the AI found
+                    status_box.write(f"📝 Form detected. Posting: {form_data}")
+                    
+                    # Stop infinite loops
                     fingerprint = str(form_data)
                     if fingerprint in visited_fingerprints:
                         status_box.warning("⚠️ Loop detected (same form token). Finishing.")
                         break
                     visited_fingerprints.add(fingerprint)
                 else:
-                    status_box.write("🛑 AI found Form type but no data.")
+                    status_box.write("🛑 AI found Form but no data.")
                     break
                     
             else:
@@ -263,7 +265,7 @@ if st.button("Start Scraping", type="primary"):
             break
             
         progress_bar.progress(page_num / max_pages)
-        time.sleep(1) # Be polite
+        time.sleep(1) 
 
     status_box.update(label="Complete!", state="complete", expanded=False)
     
