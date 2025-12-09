@@ -105,10 +105,6 @@ except Exception as e:
 #             PART 3: THE UNIVERSAL AGENT (Patched)
 # =========================================================
 
-# =========================================================
-#             PART 3: THE UNIVERSAL AGENT (Robust Fix)
-# =========================================================
-
 def clean_json_response(text):
     """
     Uses Regex to find the first valid JSON object in the text.
@@ -165,7 +161,7 @@ def agent_analyze_page(html_content, current_url):
     for attempt in range(3):
         try:
             model = genai.GenerativeModel(
-                'gemini-2.5-flash-lite',
+                'gemini-1.5-flash',
                 generation_config={"response_mime_type": "application/json"}
             )
             
