@@ -105,47 +105,63 @@ except Exception as e:
 #             PART 3: THE UNIVERSAL AGENT (Patched)
 # =========================================================
 
+# =========================================================
+#             PART 3: THE UNIVERSAL AGENT (Robust Fix)
+# =========================================================
+
+def clean_json_response(text):
+    """
+    Uses Regex to find the first valid JSON object in the text.
+    This handles cases where the AI adds chatty text before/after the JSON.
+    """
+    try:
+        # Regex to find the outer-most curly braces
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return match.group(0)
+        return text
+    except:
+        return text
+
 def agent_analyze_page(html_content, current_url):
-    """
-    Asks Gemini to find names AND navigation.
-    Includes Markdown stripping to prevent JSON errors.
-    """
     if not api_key: return None
     
-    # Pre-check: If HTML is too short, the request probably failed (blocked)
+    # Pre-check: If HTML is too short, the request probably failed
     if len(html_content) < 500:
         st.error("HTML content too short. You might be blocked.")
         return None
 
+    # Simplify prompt to reduce chance of error
     prompt = f"""
-    You are an intelligent crawling agent.
+    You are a data extraction system. 
+    Analyze the HTML below from: {current_url}
     
-    TASK 1: Extract all personal names (Alumni/Students) from the HTML. 
-    - Look for lists, table rows, or directory entries.
-    - Return them as a list of strings.
+    1. Extract list of names (people/alumni).
+    2. Find the "Next Page" link or form.
     
-    TASK 2: Analyze the HTML structure to find the "Next Page" mechanism.
-    - LOOK CLOSELY at <form> tags. Does the "Next" button submit a form?
-    - If it's a form, extract the HIDDEN INPUTS needed to submit it.
-    - If it's a link <a>, extract the href.
-    
-    Current URL: {current_url}
-    
-    You must return a raw JSON object (no markdown formatting) with this schema:
+    Return ONLY a JSON object with this schema:
     {{
       "names": ["Name 1", "Name 2"],
       "navigation": {{
          "type": "LINK" or "FORM" or "NONE",
-         "url": "next_url_here", 
+         "url": "full_next_url_or_path", 
          "form_data": {{ "key": "value" }}
       }}
     }}
     
-    HTML CODE:
+    HTML:
     {clean_html_for_ai(html_content)}
     """
     
-    # RETRY LOGIC
+    # Disable Safety Filters (Crucial for scraping directories)
+    # Directories often trigger false "Personal Info" safety blocks
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    ]
+
     for attempt in range(3):
         try:
             model = genai.GenerativeModel(
@@ -153,19 +169,32 @@ def agent_analyze_page(html_content, current_url):
                 generation_config={"response_mime_type": "application/json"}
             )
             
-            response = model.generate_content(prompt)
+            response = model.generate_content(prompt, safety_settings=safety_settings)
             
-            # --- PATCH: CLEAN THE RESPONSE ---
+            # CHECK: Did the AI refuse to answer?
+            if not response.parts:
+                # If blocked by safety, response.text might raise an error or be empty
+                print(f"Attempt {attempt}: AI returned empty response (Likely Safety Filter).")
+                continue
+
+            # CLEAN & PARSE
             cleaned_text = clean_json_response(response.text)
             return json.loads(cleaned_text)
             
         except Exception as e:
-            if attempt == 2: # On last attempt, fail
-                print(f"Failed after 3 attempts: {e}")
-                return None
+            # LOG THE ERROR TO STREAMLIT FOR YOU TO SEE
+            print(f"Attempt {attempt} failed: {e}")
+            if attempt == 2:
+                st.warning(f"⚠️ JSON Parsing Failed. Error: {e}")
+                try:
+                    # Show what the AI actually sent so we can debug
+                    st.text("Raw AI Response (Last 500 chars):")
+                    st.code(response.text[-500:]) 
+                except:
+                    pass
             time.sleep(1) 
     return None
-
+    
 def analyze_matches(found_names_list, source_label):
     results = []
     for full_name in found_names_list:
