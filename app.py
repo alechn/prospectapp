@@ -46,18 +46,16 @@ def clean_html_for_ai(html_text):
     Preserves HTML structure but removes noise to fit in context window.
     """
     soup = BeautifulSoup(html_text, "html.parser")
-    # Aggressive cleaning of non-visible/non-structural elements
+    # Aggressive cleaning
     for element in soup(["script", "style", "head", "svg", "footer", "iframe", "noscript", "img", "meta", "link"]):
         element.decompose()
-    return str(soup)[:50000] # Cap at 50k chars to save tokens
+    return str(soup)[:50000] 
 
 def clean_json_response(text):
     """
     Uses Regex to find the first valid JSON object in the text.
-    Handles cases where AI adds markdown or chatty prefixes.
     """
     try:
-        # Regex to find the outer-most curly braces
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             return match.group(0)
@@ -66,25 +64,22 @@ def clean_json_response(text):
         return text
 
 # =========================================================
-#             PART 2: DYNAMIC IBGE DATA (Cached)
+#             PART 2: DYNAMIC IBGE DATA (Dual Sliders)
 # =========================================================
 
 @st.cache_data(ttl=86400, show_spinner="Updating Brazilian Name Database...")
-def fetch_ibge_data(limit_count: int) -> Tuple[Set[str], Set[str]]:
+def fetch_ibge_data(limit_first: int, limit_surname: int) -> Tuple[Set[str], Set[str]]:
     IBGE_FIRST_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
     IBGE_SURNAME_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
     
-    # Use the slider limit
-    TARGET = limit_count
     MAX_PAGES = 100 
 
-    def _fetch_paginated(base_url):
+    def _fetch_paginated(base_url, target_limit):
         names_set = set()
         page = 1
-        # Loop until we hit the user's target limit or max pages
-        while len(names_set) < TARGET and page <= MAX_PAGES:
+        while len(names_set) < target_limit and page <= MAX_PAGES:
             try:
-                time.sleep(0.05) # Polite delay
+                time.sleep(0.05) 
                 resp = requests.get(base_url, params={"page": page}, timeout=10)
                 
                 if resp.status_code != 200: break
@@ -95,37 +90,45 @@ def fetch_ibge_data(limit_count: int) -> Tuple[Set[str], Set[str]]:
                 for item in items:
                     norm = normalize_token(item.get("nome"))
                     if norm: names_set.add(norm)
-                    # Optimization: Break immediately if target met
-                    if len(names_set) >= TARGET:
+                    if len(names_set) >= target_limit:
                         break
                 page += 1
             except: 
                 break
         return names_set
 
-    return _fetch_paginated(IBGE_FIRST_API), _fetch_paginated(IBGE_SURNAME_API)
+    # Fetch separately using the two different limits
+    firsts = _fetch_paginated(IBGE_FIRST_API, limit_first)
+    surnames = _fetch_paginated(IBGE_SURNAME_API, limit_surname)
+    
+    return firsts, surnames
 
 # --- SIDEBAR: DB SETTINGS ---
 st.sidebar.header("⚙️ Scraper Settings")
-db_size = st.sidebar.slider(
-    "🇧🇷 Database Scope", 
-    min_value=100, 
-    max_value=10000, 
-    value=2000, 
-    step=100,
-    help="Low = Common names only (Fast). High = Includes rare names (Slower)."
+
+st.sidebar.subheader("First Name Sensitivity")
+limit_first = st.sidebar.slider(
+    "Common First Names", 
+    min_value=10, max_value=10000, value=500, step=10,
+    help="How many top Brazilian first names to load. (e.g. 100 = Only 'João', 'Maria'...)"
 )
 
-# Load Data based on slider
+st.sidebar.subheader("Surname Sensitivity")
+limit_surname = st.sidebar.slider(
+    "Common Surnames", 
+    min_value=10, max_value=10000, value=500, step=10,
+    help="How many top Brazilian surnames to load. Higher = catches rarer family names."
+)
+
 try:
-    brazil_first_names, brazil_surnames = fetch_ibge_data(db_size)
-    st.sidebar.success(f"✅ DB Loaded: Top {len(brazil_first_names)} First Names & {len(brazil_surnames)} Surnames")
+    brazil_first_names, brazil_surnames = fetch_ibge_data(limit_first, limit_surname)
+    st.sidebar.success(f"✅ DB Loaded: {len(brazil_first_names)} First Names / {len(brazil_surnames)} Surnames")
 except Exception as e:
     st.error(f"Failed to load IBGE data: {e}")
     st.stop()
 
 # =========================================================
-#             PART 3: THE UNIVERSAL AGENT
+#             PART 3: THE UNIVERSAL AGENT (Gemini 2.5)
 # =========================================================
 
 def agent_analyze_page(html_content, current_url):
@@ -156,7 +159,6 @@ def agent_analyze_page(html_content, current_url):
     {clean_html_for_ai(html_content)}
     """
     
-    # SAFETY SETTINGS: BLOCK_NONE is required for directories with names
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -166,7 +168,7 @@ def agent_analyze_page(html_content, current_url):
 
     for attempt in range(3):
         try:
-            # Using 1.5-flash for higher rate limits (1500 req/day vs 20 req/day)
+            # SWITCHED TO GEMINI 2.5 FLASH AS REQUESTED
             model = genai.GenerativeModel(
                 'gemini-2.5-flash',
                 generation_config={"response_mime_type": "application/json"}
@@ -174,7 +176,6 @@ def agent_analyze_page(html_content, current_url):
             
             response = model.generate_content(prompt, safety_settings=safety_settings)
             
-            # Check for safety blocks
             if not response.parts:
                 print(f"Attempt {attempt}: AI returned empty response (Likely Safety Filter).")
                 continue
@@ -227,7 +228,6 @@ if st.button("Start Scraping", type="primary"):
         st.stop()
         
     session = requests.Session()
-    # Spoof a real browser to avoid 403 Forbidden
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -250,10 +250,9 @@ if st.button("Start Scraping", type="primary"):
         status_box.write(f"**Requesting:** {current_url} ({next_method})")
         
         try:
-            # 1. EXECUTE REQUEST
             if next_method == "GET":
                 resp = session.get(current_url, timeout=30)
-            else: # POST
+            else: 
                 resp = session.post(current_url, data=next_data, timeout=30)
             
             if resp.status_code != 200:
@@ -261,7 +260,6 @@ if st.button("Start Scraping", type="primary"):
                 status_box.code(resp.text[:500])
                 break
 
-            # 2. AI ANALYSIS
             data = agent_analyze_page(resp.text, current_url)
             
             if not data:
@@ -269,7 +267,6 @@ if st.button("Start Scraping", type="primary"):
                 status_box.write("Debug - Raw Content Length: " + str(len(resp.text)))
                 break
                 
-            # 3. PROCESS NAMES
             names = data.get("names", [])
             matches = analyze_matches(names, f"Page {page_num}")
             if matches:
@@ -278,7 +275,6 @@ if st.button("Start Scraping", type="primary"):
             else:
                 status_box.write(f"🤷 0 matches found.")
 
-            # 4. DECIDE NEXT STEP
             nav = data.get("navigation", {})
             nav_type = nav.get("type", "NONE")
             
@@ -308,7 +304,6 @@ if st.button("Start Scraping", type="primary"):
                 else:
                     status_box.write("🛑 AI found Form but no data.")
                     break
-                    
             else:
                 status_box.write("🏁 No next page detected. Job done.")
                 break
@@ -318,7 +313,7 @@ if st.button("Start Scraping", type="primary"):
             break
             
         progress_bar.progress(page_num / max_pages)
-        # 4-second delay to stay safe within free tier limits (15 RPM)
+        # 4s delay for safety if using Free Tier, adjust lower if you have paid tier
         time.sleep(4) 
 
     status_box.update(label="Complete!", state="complete", expanded=False)
