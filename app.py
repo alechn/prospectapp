@@ -4,6 +4,7 @@ import pandas as pd
 import json
 import google.generativeai as genai
 import time
+import re
 from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -15,7 +16,7 @@ st.title("Universal Brazilian Alumni Finder")
 st.caption("Powered by Gemini 2.5 Flash-Lite • Robust Session Agent")
 
 # =========================================================
-#            PART 0: API KEY SETUP
+#             PART 0: API KEY SETUP
 # =========================================================
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"]
@@ -28,7 +29,7 @@ if api_key:
     genai.configure(api_key=api_key)
 
 # =========================================================
-#            PART 1: HELPER FUNCTIONS
+#             PART 1: HELPER FUNCTIONS
 # =========================================================
 
 def normalize_token(s: str) -> str:
@@ -41,15 +42,32 @@ def normalize_token(s: str) -> str:
 
 def clean_html_for_ai(html_text):
     """
-    Preserves HTML structure (forms, inputs, links) but removes noise.
+    Preserves HTML structure but removes noise to fit in context window.
     """
     soup = BeautifulSoup(html_text, "html.parser")
-    for element in soup(["script", "style", "head", "svg", "footer", "iframe", "noscript", "img"]):
+    # aggressive cleaning
+    for element in soup(["script", "style", "head", "svg", "footer", "iframe", "noscript", "img", "meta", "link"]):
         element.decompose()
-    return str(soup)[:100000] # Cap at 100k chars
+    # Get text but keep some structure
+    return str(soup)[:50000] # Cap at 50k chars to save tokens
+
+def clean_json_response(text):
+    """
+    Fixes the common error where AI wraps JSON in markdown code blocks.
+    """
+    text = text.strip()
+    # Remove markdown code blocks if present
+    if text.startswith("```"):
+        # Find the first newline
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline+1:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
 
 # =========================================================
-#            PART 2: IBGE DATA (Cached)
+#             PART 2: IBGE DATA (Cached)
 # =========================================================
 
 @st.cache_data(ttl=86400, show_spinner="Downloading IBGE Census Data...")
@@ -84,20 +102,27 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-#            PART 3: THE UNIVERSAL AGENT (With Retry & JSON Mode)
+#             PART 3: THE UNIVERSAL AGENT (Patched)
 # =========================================================
 
 def agent_analyze_page(html_content, current_url):
     """
     Asks Gemini to find names AND navigation.
-    Uses 'response_mime_type' to enforce valid JSON.
+    Includes Markdown stripping to prevent JSON errors.
     """
     if not api_key: return None
     
+    # Pre-check: If HTML is too short, the request probably failed (blocked)
+    if len(html_content) < 500:
+        st.error("HTML content too short. You might be blocked.")
+        return None
+
     prompt = f"""
     You are an intelligent crawling agent.
     
-    TASK 1: Extract all personal names (Alumni/Students). Return as list of strings.
+    TASK 1: Extract all personal names (Alumni/Students) from the HTML. 
+    - Look for lists, table rows, or directory entries.
+    - Return them as a list of strings.
     
     TASK 2: Analyze the HTML structure to find the "Next Page" mechanism.
     - LOOK CLOSELY at <form> tags. Does the "Next" button submit a form?
@@ -106,7 +131,7 @@ def agent_analyze_page(html_content, current_url):
     
     Current URL: {current_url}
     
-    You must return a JSON object with this schema:
+    You must return a raw JSON object (no markdown formatting) with this schema:
     {{
       "names": ["Name 1", "Name 2"],
       "navigation": {{
@@ -120,23 +145,25 @@ def agent_analyze_page(html_content, current_url):
     {clean_html_for_ai(html_content)}
     """
     
-    # RETRY LOGIC (Try 3 times if AI fails)
+    # RETRY LOGIC
     for attempt in range(3):
         try:
             model = genai.GenerativeModel(
                 'gemini-2.5-flash-lite',
-                # THIS IS THE FIX: FORCE JSON OUTPUT
                 generation_config={"response_mime_type": "application/json"}
             )
             
             response = model.generate_content(prompt)
-            return json.loads(response.text)
+            
+            # --- PATCH: CLEAN THE RESPONSE ---
+            cleaned_text = clean_json_response(response.text)
+            return json.loads(cleaned_text)
             
         except Exception as e:
             if attempt == 2: # On last attempt, fail
-                # print(f"Failed after 3 attempts: {e}")
+                print(f"Failed after 3 attempts: {e}")
                 return None
-            time.sleep(1) # Wait 1 sec before retry
+            time.sleep(1) 
     return None
 
 def analyze_matches(found_names_list, source_label):
@@ -163,7 +190,7 @@ def analyze_matches(found_names_list, source_label):
     return results
 
 # =========================================================
-#            PART 4: INTERFACE
+#             PART 4: INTERFACE
 # =========================================================
 
 st.markdown("### Auto-Pilot")
@@ -178,8 +205,12 @@ if st.button("Start Scraping", type="primary"):
         st.stop()
         
     session = requests.Session()
+    # --- PATCH: HUMAN HEADERS ---
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://www.google.com/"
     })
     
     all_matches = []
@@ -206,14 +237,16 @@ if st.button("Start Scraping", type="primary"):
             
             if resp.status_code != 200:
                 status_box.error(f"❌ Error: Status Code {resp.status_code}")
+                # Debug info
+                status_box.code(resp.text[:500])
                 break
 
-            # 2. AI ANALYSIS (Now with Retries)
+            # 2. AI ANALYSIS (Patched)
             data = agent_analyze_page(resp.text, current_url)
             
             if not data:
                 status_box.warning(f"⚠️ AI could not read page {page_num}. Stopping.")
-                # Optional: break or continue? Usually break if we lose navigation.
+                status_box.write("Debug - Raw Content Length: " + str(len(resp.text)))
                 break
                 
             # 3. PROCESS NAMES
