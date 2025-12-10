@@ -4,3 +4,5 @@ requests
 google-generativeai>=0.8.0
 unidecode
 beautifulsoup4
+selenium
+webdriver-manager
