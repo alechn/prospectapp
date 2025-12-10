@@ -259,7 +259,7 @@ if st.button("🚀 Start Mission", type="primary"):
             if resp and resp.status_code == 200:
                 raw_html = resp.text
                 # Check for "Ghost Page" (Too small/empty)
-                if len(raw_html) < 2000 and force_mode == "Auto-Detect (Recommended)":
+                if len(raw_html) < 10000 and force_mode == "Auto-Detect (Recommended)":
                     status_log.warning("⚠️ Native page suspicious. Escalating to Browser...")
                     current_mode = "SELENIUM"
                     driver = get_driver()
