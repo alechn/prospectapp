@@ -91,9 +91,9 @@ def fetch_ibge_data(limit_first: int, limit_surname: int):
 # --- SIDEBAR: DB SETTINGS ---
 st.sidebar.header("⚙️ Scraper Settings")
 st.sidebar.subheader("First Name Sensitivity")
-limit_first = st.sidebar.number_input("Common First Names", 10, 10000, 2000, 100)
+limit_first = st.sidebar.number_input("Common First Names", 10, 10000, 50, 20)
 st.sidebar.subheader("Surname Sensitivity")
-limit_surname = st.sidebar.number_input("Common Surnames", 10, 10000, 2000, 100)
+limit_surname = st.sidebar.number_input("Common Surnames", 10, 10000, 1000, 20)
 
 try:
     brazil_first_names, brazil_surnames = fetch_ibge_data(limit_first, limit_surname)
@@ -207,81 +207,70 @@ if st.button("Start Scraping", type="primary"):
     progress_bar = st.progress(0)
     visited_fingerprints = set()
     
+# ... (Keep previous setup code) ...
+    
     for page_num in range(1, max_pages + 1):
         status_box.update(label=f"Scanning Page {page_num}...", state="running")
         status_box.write(f"**Target:** {current_url} ({next_method})")
         
+        # ============================================================
+        # STRATEGY: "Double Tap"
+        # 1. Try Native Request.
+        # 2. If it finds names -> Great.
+        # 3. If 0 names -> Force Retry with Jina Proxy.
+        # ============================================================
+        
+        # --- ATTEMPT 1: NATIVE MODE ---
         try:
-            # --- PHASE 1: NATIVE REQUEST ---
-            valid_response = None
-            is_jina_mode = False
-            
-            # If we are posting data, we MUST use Native Mode
             if next_method == "POST":
                 resp = session.post(current_url, data=next_data, timeout=30)
-                valid_response = resp
             else:
                 resp = session.get(current_url, timeout=30)
-                valid_response = resp
             
-            # --- PHASE 2: QUALITY CHECK ---
-            # Check if we got a "Ghost Page" (Empty HTML or JS Loading screen)
-            # 1. Too short? (< 2000 chars is suspicious for a directory)
-            # 2. Status code error?
+            # Initial AI Analysis (Native)
+            # We treat this as a "Draft" attempt
+            cleaned_html = clean_html_for_ai(resp.text)
+            data = agent_analyze_page(cleaned_html, current_url, is_markdown=False)
             
-            content_length = len(valid_response.text)
-            cleaned_html = clean_html_for_ai(valid_response.text)
+            # Check results
+            names = data.get("names", []) if data else []
             
-            should_fallback = False
-            if valid_response.status_code != 200:
-                should_fallback = True
-            elif content_length < 2500: # Suspiciously small
-                status_box.write(f"⚠️ Native content suspicious ({content_length} chars).")
-                should_fallback = True
-            
-            # --- PHASE 3: FALLBACK TO JINA (Only if GET request) ---
-            if should_fallback and next_method == "GET":
-                status_box.write("🔄 Switching to Jina Proxy (JavaScript Rendering)...")
+            # --- DECISION POINT: RETRY? ---
+            # If we found 0 names and we used GET, it's likely a JS issue.
+            # Triggers "Double Tap"
+            if len(names) == 0 and next_method == "GET":
+                status_box.warning("⚠️ Native mode found 0 names. Retrying with Jina Proxy...")
+                
                 jina_url = f"https://r.jina.ai/{current_url}"
                 jina_resp = session.get(jina_url, timeout=45)
                 
                 if jina_resp.status_code == 200:
-                    valid_response = jina_resp
-                    is_jina_mode = True # Flag that we have Markdown, not HTML
-                    status_box.write("✅ Jina Proxy Successful.")
+                    # Overwrite data with Jina's findings
+                    status_box.write("✅ Jina Proxy Connected. Re-analyzing...")
+                    data = agent_analyze_page(jina_resp.text, current_url, is_markdown=True)
+                    names = data.get("names", []) if data else []
                 else:
                     status_box.error("❌ Jina Proxy also failed.")
-                    break
-            
-            # --- PHASE 4: AI ANALYSIS ---
-            if is_jina_mode:
-                # Jina returns Markdown
-                data = agent_analyze_page(valid_response.text, current_url, is_markdown=True)
-            else:
-                # Native returns HTML
-                data = agent_analyze_page(cleaned_html, current_url, is_markdown=False)
-            
+
+            # --- FINAL PROCESSING ---
             if not data:
                 status_box.warning(f"⚠️ AI could not read page {page_num}.")
                 break
                 
-            # Process Names
-            names = data.get("names", [])
             matches = analyze_matches(names, f"Page {page_num}")
             if matches:
                 all_matches.extend(matches)
                 status_box.write(f"✅ Found {len(matches)} matches.")
             else:
-                status_box.write(f"🤷 0 matches found.")
+                status_box.write(f"🤷 0 matches found (after retry).")
 
-            # --- PHASE 5: NAVIGATION LOGIC ---
+            # --- NAVIGATION LOGIC ---
             nav = data.get("navigation", {})
             nav_type = nav.get("type", "NONE")
             
             if nav_type == "LINK":
                 raw_link = nav.get("url")
                 if raw_link:
-                    # Clean Jina artifacts if they persist
                     if "r.jina.ai" in raw_link:
                         raw_link = raw_link.replace("https://r.jina.ai/", "")
                     
@@ -298,7 +287,6 @@ if st.button("Start Scraping", type="primary"):
                     break
                     
             elif nav_type == "FORM":
-                # Jina cannot handle forms, so this must be from Native mode
                 form_data = nav.get("form_data", {})
                 if form_data:
                     next_method = "POST"
@@ -321,7 +309,7 @@ if st.button("Start Scraping", type="primary"):
             break
             
         progress_bar.progress(page_num / max_pages)
-        time.sleep(4) 
+        time.sleep(4)
 
     status_box.update(label="Complete!", state="complete", expanded=False)
     
