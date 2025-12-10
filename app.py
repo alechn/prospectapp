@@ -10,7 +10,7 @@ from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# --- SELENIUM SETUP (Cloud & Local Compatible) ---
+# --- SELENIUM SETUP (Works on Cloud & Local) ---
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -49,7 +49,7 @@ def clean_html_for_ai(html_text):
     # Remove clutter but keep structure
     for element in soup(["script", "style", "svg", "noscript", "img", "iframe", "footer"]):
         element.decompose()
-    return str(soup)[:500000] # Large context window
+    return str(soup)[:500000] # Large context window for infinite scrolls
 
 def clean_json_response(text):
     try:
@@ -99,9 +99,14 @@ except Exception as e:
 # =========================================================
 
 # --- ENGINE A: NATIVE (Fast, Requests) ---
+# This uses the EXACT headers from your working code
 def fetch_native(url, method="GET", data=None):
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.google.com/"
+        }
         if method == "POST":
             return requests.post(url, data=data, headers=headers, timeout=15)
         return requests.get(url, headers=headers, timeout=15)
@@ -127,7 +132,7 @@ def fetch_selenium(driver, url, scroll_count=0, scroll_delay=2.0):
         driver.get(url)
         time.sleep(3) # Initial load
         
-        # Scroll logic
+        # Scroll logic for Infinite Scroll sites
         if scroll_count > 0:
             for i in range(scroll_count):
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -141,6 +146,10 @@ def fetch_selenium(driver, url, scroll_count=0, scroll_delay=2.0):
 def agent_analyze_page(html_content, current_url):
     if not api_key: return None
     
+    # Pre-check: Don't waste AI credits on tiny error pages
+    if len(html_content) < 500: 
+        return {"names": [], "is_empty": True}
+
     prompt = f"""
     You are a data extraction system.
     Analyze the HTML from: {current_url}
@@ -156,7 +165,7 @@ def agent_analyze_page(html_content, current_url):
          "url": "next_url",
          "form_data": {{...}}
       }},
-      "is_empty": true/false (Set to true if you see NO names and NO content)
+      "is_empty": true/false (Set to true if you see NO names or just a login screen)
     }}
     
     HTML:
@@ -186,7 +195,6 @@ def match_names(names, page_label):
         if not parts: continue
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         
-        # Match Logic
         score = 0
         match_type = "Weak"
         if f in brazil_first_names: score += 1
@@ -222,7 +230,6 @@ if st.button("🚀 Start Mission", type="primary"):
         st.stop()
 
     # Session State Setup
-    results_container = st.empty()
     status_log = st.status("Initializing Agent...", expanded=True)
     all_matches = []
     
@@ -238,7 +245,7 @@ if st.button("🚀 Start Mission", type="primary"):
         current_mode = "NATIVE"
         status_log.write("🔧 Mode: Forced Native")
     else:
-        status_log.write("🧠 Mode: Auto-Detect (Starting Native, will escalate if needed)")
+        status_log.write("🧠 Mode: Auto-Detect (Starting Native)")
 
     # 2. NAVIGATION STATE
     current_url = start_url
@@ -252,47 +259,48 @@ if st.button("🚀 Start Mission", type="primary"):
         status_log.write(f"**Target:** {current_url}")
         
         raw_html = None
+        data = None
         
-        # --- EXECUTE FETCH ---
+        # --- ATTEMPT 1: NATIVE ---
         if current_mode == "NATIVE":
             resp = fetch_native(current_url)
             if resp and resp.status_code == 200:
                 raw_html = resp.text
-                # Check for "Ghost Page" (Too small/empty)
-                if len(raw_html) < 10000 and force_mode == "Auto-Detect (Recommended)":
-                    status_log.warning("⚠️ Native page suspicious. Escalating to Browser...")
-                    current_mode = "SELENIUM"
-                    driver = get_driver()
-                    # Fall through to Selenium block below
+                
+                # Check 1: File Size (Login screens are usually small)
+                if len(raw_html) < 2500 and force_mode == "Auto-Detect (Recommended)":
+                    status_log.warning(f"⚠️ Page suspiciously small ({len(raw_html)}b). Switching to Browser...")
+                    current_mode = "SELENIUM" 
+                else:
+                    # Check 2: Content Analysis (The "Double Tap")
+                    data = agent_analyze_page(raw_html, current_url)
+                    names = data.get("names", []) if data else []
+                    
+                    if len(names) == 0 and force_mode == "Auto-Detect (Recommended)":
+                        status_log.warning("⚠️ Native mode found 0 names. Retrying with Browser...")
+                        current_mode = "SELENIUM"
+                    else:
+                        # Success in Native Mode!
+                        pass 
             else:
-                status_log.warning("⚠️ Native request failed. Escalating to Browser...")
+                status_log.warning("⚠️ Native request failed. Switching to Browser...")
                 current_mode = "SELENIUM"
-                if not driver: driver = get_driver()
 
+        # --- ATTEMPT 2: SELENIUM (If Native failed or we are in Selenium mode) ---
         if current_mode == "SELENIUM":
-            # If we just switched, or were already in Selenium
-            raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
-        
-        if not raw_html:
-            status_log.error("❌ Failed to read page in all modes.")
-            break
-
-        # --- AI ANALYSIS ---
-        data = agent_analyze_page(raw_html, current_url)
-        
-        if not data:
-            status_log.error("⚠️ AI failed to parse content.")
-            break
-            
-        # Check if AI says page is empty (Double check for Auto-Detect)
-        if data.get("is_empty") and current_mode == "NATIVE" and force_mode == "Auto-Detect (Recommended)":
-            status_log.warning("⚠️ AI sees empty page. Retrying with Browser...")
-            current_mode = "SELENIUM"
             if not driver: driver = get_driver()
+            
             raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
-            data = agent_analyze_page(raw_html, current_url) # Re-analyze
+            
+            if raw_html:
+                # Re-Analyze with the Selenium HTML
+                data = agent_analyze_page(raw_html, current_url)
+        
+        # --- FINAL RESULTS PROCESSING ---
+        if not data:
+            status_log.error("❌ Failed to parse page in all modes.")
+            break
 
-        # --- PROCESS RESULTS ---
         names = data.get("names", [])
         new_matches = match_names(names, f"Page {page}")
         
