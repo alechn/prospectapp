@@ -26,7 +26,7 @@ except ImportError:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash • Template Learning + Rank Data")
+st.caption("Powered by Gemini 2.5 Flash • Template Learning (Form & Link Support)")
 
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"]
@@ -61,16 +61,15 @@ def clean_json_response(text):
     except: return text
 
 # =========================================================
-#             PART 2: DATABASE (Now with Ranks)
+#             PART 2: DATABASE & RANKS
 # =========================================================
 @st.cache_data(ttl=86400)
 def fetch_ibge_data(limit_first, limit_surname):
-    # Returns DICTIONARIES { "MARIA": 1, "JOAO": 2 } instead of sets
     IBGE_FIRST = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
     IBGE_SURNAME = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
     
     def _fetch(url, limit):
-        data_map = {} # Name -> Rank
+        data_map = {} 
         page = 1
         while len(data_map) < limit:
             try:
@@ -85,7 +84,6 @@ def fetch_ibge_data(limit_first, limit_surname):
                 page += 1
             except: break
         return data_map
-    
     return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
 
 st.sidebar.header("⚙️ Search Settings")
@@ -132,26 +130,28 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: THE INTELLIGENCE
+#             PART 4: INTELLIGENCE (Form Aware)
 # =========================================================
 
 def agent_learn_pattern(html_content, current_url):
     if not api_key: return None
     if len(html_content) < 500: return None
 
+    # UPDATED PROMPT: Explicitly asks for the "Next" element selector
     prompt = f"""
     You are a web scraping expert. Analyze the HTML from {current_url}.
     
     1. Identify the CSS Selector for NAMES.
-    2. Identify the CSS Selector for the "Next Page" link (anchor tag).
-    3. Extract names and navigation data.
+    2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT.
+       - It might be an <a> tag (link).
+       - It might be an <input type="submit"> or <button> inside a form.
     
     Return JSON:
     {{
       "names": ["Name 1", "Name 2"],
       "selectors": {{
          "name_element": "e.g. div.alumni-name",
-         "next_link": "e.g. a.next-page-link"
+         "next_element": "e.g. input[value='Next'] or a.next-link"
       }},
       "navigation": {{ "type": "LINK" or "FORM", "url": "...", "form_data": {{...}} }}
     }}
@@ -162,7 +162,7 @@ def agent_learn_pattern(html_content, current_url):
     
     for _ in range(2): 
         try:
-            model = genai.GenerativeModel('gemini-2.5-flash-lite', generation_config={"response_mime_type": "application/json"})
+            model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
             response = model.generate_content(prompt)
             if not response.parts: continue
             return json.loads(clean_json_response(response.text))
@@ -170,21 +170,56 @@ def agent_learn_pattern(html_content, current_url):
     return None
 
 def fast_extract_mode(html_content, selectors):
+    """
+    Form-Aware Extractor. Can find Links OR submit Forms.
+    """
     soup = BeautifulSoup(html_content, "html.parser")
     extracted_names = []
     
+    # 1. Extract Names
     if selectors.get("name_element"):
         elements = soup.select(selectors["name_element"])
         for el in elements:
             extracted_names.append(el.get_text(strip=True))
             
-    next_url = None
-    if selectors.get("next_link"):
-        link = soup.select_one(selectors["next_link"])
-        if link and link.get("href"):
-            next_url = link.get("href")
+    # 2. Extract Navigation (The New Logic)
+    nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
+    
+    next_selector = selectors.get("next_element") or selectors.get("next_link")
+    
+    if next_selector:
+        # Find the element (Link or Button)
+        element = soup.select_one(next_selector)
+        
+        if element:
+            # CASE A: It's a Link
+            if element.name == "a" and element.get("href"):
+                nav_result["type"] = "LINK"
+                nav_result["next_url"] = element.get("href")
             
-    return {"names": extracted_names, "next_url": next_url}
+            # CASE B: It's a Button/Input (Likely a Form)
+            elif element.name in ["input", "button"]:
+                # Find the parent form
+                parent_form = element.find_parent("form")
+                if parent_form:
+                    nav_result["type"] = "FORM"
+                    # Scrape all inputs from this form
+                    form_data = {}
+                    for inp in parent_form.find_all("input"):
+                        if inp.get("name"):
+                            form_data[inp.get("name")] = inp.get("value", "")
+                    
+                    # Add the button itself if it has name/value (often needed for submit)
+                    if element.get("name"):
+                        form_data[element.get("name")] = element.get("value", "")
+                        
+                    nav_result["form_data"] = form_data
+                    
+                    # Form action URL
+                    if parent_form.get("action"):
+                        nav_result["next_url"] = parent_form.get("action")
+
+    return {"names": extracted_names, "nav": nav_result}
 
 def match_names_detailed(names, page_label):
     found = []
@@ -193,12 +228,10 @@ def match_names_detailed(names, page_label):
         if not parts: continue
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         
-        # Look up Ranks (0 if not found)
         rank_f = first_name_ranks.get(f, 0)
         rank_l = surname_ranks.get(l, 0)
         
         if rank_f > 0 or rank_l > 0:
-            # Detailed Logic
             if rank_f > 0 and rank_l > 0: m_type = "Strong"
             elif rank_f > 0: m_type = "First Name Only"
             else: m_type = "Surname Only"
@@ -254,7 +287,7 @@ if st.button("🚀 Start Mission", type="primary"):
     driver = None
     visited_fingerprints = set()
     
-    learned_selectors = None # STATE: Do we know the page layout?
+    learned_selectors = None
     
     if "Infinite" in mode:
         driver = get_driver()
@@ -263,7 +296,6 @@ if st.button("🚀 Start Mission", type="primary"):
     for page in range(1, max_pages + 1):
         status_log.update(label=f"Scanning Page {page}/{max_pages}...", state="running")
         
-        # --- EXECUTE REQUEST ---
         raw_html = None
         try:
             if "Classic" in mode:
@@ -277,40 +309,51 @@ if st.button("🚀 Start Mission", type="primary"):
 
         if not raw_html: status_log.error("❌ Content failed."); break
 
-        # --- INTELLIGENT EXTRACTION ---
         names = []
         nav_data = {}
-        ai_required = True # Default to using AI unless Template proves it works
+        ai_required = True 
         
-        # 1. TRY FAST MODE (If we have a template)
+        # 1. FAST MODE (Template)
         if learned_selectors:
-            status_log.write(f"⚡ using Fast Template (No AI)")
+            status_log.write(f"⚡ using Fast Template")
             fast_data = fast_extract_mode(raw_html, learned_selectors)
             names = fast_data["names"]
+            fast_nav = fast_data["nav"]
             
-            # CHECK: Did Fast Mode fail to find a Next Link?
-            # If we found names but NO link, we might need AI to find the button again.
-            if len(names) > 0 and not fast_data["next_url"]:
-                status_log.warning("⚠️ Template found names but lost navigation. Waking AI...")
-                ai_required = True # Force AI fallback
-            elif len(names) == 0:
-                 status_log.warning("⚠️ Template found 0 names. Re-learning...")
-                 ai_required = True
-            else:
-                ai_required = False # Fast mode worked perfect!
-                # Update loop variables directly from Fast Mode
-                if fast_data["next_url"]:
-                    l = fast_data["next_url"]
+            # Verify if Fast Mode succeeded
+            if len(names) > 0 and fast_nav["type"] != "NONE":
+                ai_required = False # It worked! No AI needed.
+                
+                # Apply Navigation directly
+                if fast_nav["type"] == "LINK":
+                    l = fast_nav["next_url"]
                     if "http" not in l: current_url = urljoin(current_url, l)
                     else: current_url = l
                     next_method = "GET"
                     next_data = None
                     status_log.write(f"🔗 Fast Link: {l}")
-                else:
-                    status_log.write("🏁 Fast Mode sees no next page.")
-                    # Let it end normally unless we triggered fallback above
+                    
+                elif fast_nav["type"] == "FORM":
+                    f_data = fast_nav["form_data"]
+                    next_method = "POST"
+                    next_data = f_data
+                    
+                    # Handle Action URL if present
+                    if fast_nav.get("next_url"):
+                        act = fast_nav["next_url"]
+                        if "http" not in act: current_url = urljoin(current_url, act)
+                        else: current_url = act
+                    
+                    status_log.write(f"📝 Fast Form Extracted.")
+            
+            elif len(names) == 0:
+                 status_log.warning("⚠️ Template found 0 names. Re-learning...")
+                 ai_required = True
+            else:
+                 status_log.warning("⚠️ Template lost navigation. Waking AI...")
+                 ai_required = True
 
-        # 2. RUN AI (If required)
+        # 2. AI MODE (Teacher)
         if ai_required:
             if not learned_selectors: status_log.write(f"🧠 AI Analyzing Page Structure...")
             
@@ -321,7 +364,6 @@ if st.button("🚀 Start Mission", type="primary"):
                 selectors = data.get("selectors", {})
                 nav_data = data.get("navigation", {})
                 
-                # Save the new template
                 if selectors.get("name_element"):
                     learned_selectors = selectors
                     status_log.write(f"🎓 Pattern Learned: {selectors['name_element']}")
@@ -329,9 +371,8 @@ if st.button("🚀 Start Mission", type="primary"):
                 status_log.error("❌ AI failed to read page.")
                 break
 
-        # --- MATCHING (Detailed) ---
+        # MATCHING
         new_matches = match_names_detailed(names, f"Page {page}")
-        
         if new_matches:
             all_matches.extend(new_matches)
             status_log.write(f"✅ Found {len(new_matches)} matches.")
@@ -339,7 +380,7 @@ if st.button("🚀 Start Mission", type="primary"):
         else:
             status_log.write("🤷 No matches found.")
 
-        # --- NAVIGATION (If AI was used) ---
+        # AI NAVIGATION (Fallback)
         if ai_required and "Classic" in mode:
             ntype = nav_data.get("type", "NONE")
             if ntype == "LINK" and nav_data.get("url"):
