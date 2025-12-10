@@ -5,11 +5,12 @@ import google.generativeai as genai
 import time
 import re
 import requests
+import io
 from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# --- SELENIUM SETUP ---
+# --- SELENIUM SETUP (Cloud & Local Compatible) ---
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -19,11 +20,11 @@ from webdriver_manager.core.os_manager import ChromeType
 # =========================================================
 #             PART 0: CONFIGURATION
 # =========================================================
-st.set_page_config(page_title="Universal Alumni Finder", layout="wide")
-st.title("Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash • Infinite Scroll Engine (Cloud Version)")
+st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
+st.title("🕵️ Universal Brazilian Alumni Finder")
+st.caption("Powered by Gemini 2.5 Flash • Auto-Switching Engine (Native / Selenium / Scroll)")
 
-# --- AUTH (Use Streamlit Secrets for Cloud) ---
+# --- AUTH ---
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"]
 else:
@@ -45,9 +46,10 @@ def normalize_token(s: str) -> str:
 
 def clean_html_for_ai(html_text):
     soup = BeautifulSoup(html_text, "html.parser")
-    for element in soup(["script", "style", "svg", "noscript", "img"]):
+    # Remove clutter but keep structure
+    for element in soup(["script", "style", "svg", "noscript", "img", "iframe", "footer"]):
         element.decompose()
-    return str(soup)[:500000]
+    return str(soup)[:500000] # Large context window
 
 def clean_json_response(text):
     try:
@@ -57,7 +59,7 @@ def clean_json_response(text):
     except: return text
 
 # =========================================================
-#             PART 2: DATABASE
+#             PART 2: DATABASE (IBGE)
 # =========================================================
 @st.cache_data(ttl=86400)
 def fetch_ibge_data(limit_first, limit_surname):
@@ -81,13 +83,9 @@ def fetch_ibge_data(limit_first, limit_surname):
         return s
     return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
 
-st.sidebar.header("⚙️ Settings")
+st.sidebar.header("⚙️ Search Settings")
 limit_first = st.sidebar.number_input("Common First Names", 10, 10000, 2000, 100)
 limit_surname = st.sidebar.number_input("Common Surnames", 10, 10000, 2000, 100)
-
-st.sidebar.subheader("🖱️ Scrolling Behavior")
-scroll_count = st.sidebar.slider("Scroll Depth (Pages)", 0, 20, 3)
-scroll_delay = st.sidebar.slider("Wait Time (Secs)", 1.0, 5.0, 2.0)
 
 try:
     brazil_first_names, brazil_surnames = fetch_ibge_data(limit_first, limit_surname)
@@ -97,117 +95,254 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-#             PART 3: CLOUD-READY SELENIUM
+#             PART 3: THE ENGINES
 # =========================================================
-def get_page_with_scroll(url, scrolls, delay):
-    status_box = st.empty()
-    status_box.info("🚀 Launching Cloud Browser...")
-    
+
+# --- ENGINE A: NATIVE (Fast, Requests) ---
+def fetch_native(url, method="GET", data=None):
     try:
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        
-        # This handles the driver installation automatically on both Cloud and Local
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-            options=options
-        )
-        
-        status_box.info(f"🌐 Navigating to {url}...")
-        driver.get(url)
-        time.sleep(2)
-        
-        for i in range(scrolls):
-            status_box.info(f"⬇️ Scrolling {i+1}/{scrolls}...")
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(delay)
-            
-        html = driver.page_source
-        status_box.success("✅ Page Loaded & Scrolled.")
-        driver.quit()
-        return html
-        
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        if method == "POST":
+            return requests.post(url, data=data, headers=headers, timeout=15)
+        return requests.get(url, headers=headers, timeout=15)
     except Exception as e:
-        status_box.error(f"Browser Error: {e}")
         return None
 
+# --- ENGINE B: SELENIUM (Smart, Browser) ---
+def get_driver():
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    
+    # Auto-detects environment (Cloud vs Local)
+    return webdriver.Chrome(
+        service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
+        options=options
+    )
+
+def fetch_selenium(driver, url, scroll_count=0, scroll_delay=2.0):
+    try:
+        driver.get(url)
+        time.sleep(3) # Initial load
+        
+        # Scroll logic
+        if scroll_count > 0:
+            for i in range(scroll_count):
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(scroll_delay)
+        
+        return driver.page_source
+    except Exception as e:
+        return None
+
+# --- THE BRAIN: AI ANALYZER ---
 def agent_analyze_page(html_content, current_url):
     if not api_key: return None
     
     prompt = f"""
     You are a data extraction system.
-    I have provided HTML content from: {current_url}
-    TASK 1: Extract list of names (people/alumni). 
-    TASK 2: Find the "Next Page" link (if any exist).
-    Return ONLY a JSON object:
-    {{ "names": ["Name 1", "Name 2"], "navigation": {{ "type": "LINK" or "NONE", "url": "..." }} }}
-    HTML CONTENT:
+    Analyze the HTML from: {current_url}
+    
+    TASK 1: Extract list of names (people/alumni).
+    TASK 2: Determine Navigation Strategy.
+    
+    Return JSON:
+    {{
+      "names": ["Name 1", "Name 2"],
+      "navigation": {{
+         "type": "LINK" or "FORM" or "NONE",
+         "url": "next_url",
+         "form_data": {{...}}
+      }},
+      "is_empty": true/false (Set to true if you see NO names and NO content)
+    }}
+    
+    HTML:
     {clean_html_for_ai(html_content)} 
     """
+    
     safety = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
-    for attempt in range(3):
+    
+    for _ in range(2): # 2 Retries
         try:
             model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
             response = model.generate_content(prompt, safety_settings=safety)
             if not response.parts: continue
             return json.loads(clean_json_response(response.text))
-        except Exception: time.sleep(1)
+        except: time.sleep(1)
     return None
 
-def analyze_matches(found_names_list):
-    results = []
-    for full_name in found_names_list:
-        parts = full_name.strip().split()
+def match_names(names, page_label):
+    found = []
+    for n in names:
+        parts = n.strip().split()
         if not parts: continue
-        first_norm = normalize_token(parts[0])
-        last_norm = normalize_token(parts[-1]) if len(parts) > 1 else ""
+        f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         
-        is_first = first_norm in brazil_first_names
-        is_last = last_norm in brazil_surnames
+        # Match Logic
+        score = 0
+        match_type = "Weak"
+        if f in brazil_first_names: score += 1
+        if l in brazil_surnames: score += 1
         
-        if is_first or is_last:
-            match_type = "Weak"
-            if is_first and is_last: match_type = "Strong"
-            elif is_first: match_type = "First Name Only"
-            elif is_last: match_type = "Surname Only"
-            results.append({"Full Name": full_name, "Match Strength": match_type})
-    return results
+        if score > 0:
+            if score == 2: match_type = "Strong"
+            elif f in brazil_first_names: match_type = "First Name Only"
+            else: match_type = "Surname Only"
+            
+            found.append({"Full Name": n, "Match Strength": match_type, "Source": page_label})
+    return found
 
 # =========================================================
-#             PART 4: EXECUTION
+#             PART 4: MASTER LOGIC (THE LOOP)
 # =========================================================
-st.markdown("### Auto-Pilot (Cloud Engine)")
-start_url = st.text_input("Directory URL:", placeholder="https://www.ycombinator.com/founders")
 
-if st.button("Start Scraping", type="primary"):
+st.markdown("### 🤖 Auto-Pilot Control Center")
+col1, col2 = st.columns([3, 1])
+with col1:
+    start_url = st.text_input("Target URL", placeholder="https://www.ycombinator.com/founders")
+with col2:
+    max_pages = st.number_input("Max Pages", 1, 100, 5)
+
+# Strategy settings hidden in expander
+with st.expander("Advanced Strategy Settings"):
+    force_mode = st.radio("Scraping Mode", ["Auto-Detect (Recommended)", "Force Native (Requests)", "Force Browser (Selenium)"])
+    scroll_depth = st.slider("Scroll Depth (for Infinite Scroll sites)", 0, 20, 3)
+
+if st.button("🚀 Start Mission", type="primary"):
     if not api_key:
-        st.error("Please add your API Key in the Sidebar or Cloud Secrets.")
+        st.error("Missing API Key")
         st.stop()
+
+    # Session State Setup
+    results_container = st.empty()
+    status_log = st.status("Initializing Agent...", expanded=True)
+    all_matches = []
     
-    raw_html = get_page_with_scroll(start_url, scroll_count, scroll_delay)
+    # 1. DETERMINE STRATEGY
+    current_mode = "NATIVE"
+    driver = None
     
-    if raw_html:
-        with st.spinner("🤖 AI is reading the list..."):
-            data = agent_analyze_page(raw_html, start_url)
+    if force_mode == "Force Browser (Selenium)":
+        current_mode = "SELENIUM"
+        status_log.write("🔧 Mode: Forced Browser")
+        driver = get_driver()
+    elif force_mode == "Force Native (Requests)":
+        current_mode = "NATIVE"
+        status_log.write("🔧 Mode: Forced Native")
+    else:
+        status_log.write("🧠 Mode: Auto-Detect (Starting Native, will escalate if needed)")
+
+    # 2. NAVIGATION STATE
+    current_url = start_url
+    visited = set()
+    
+    # 3. LIVE TABLE
+    table_placeholder = st.empty()
+
+    for page in range(1, max_pages + 1):
+        status_log.update(label=f"Scanning Page {page}/{max_pages}...", state="running")
+        status_log.write(f"**Target:** {current_url}")
         
-        if data:
-            names = data.get("names", [])
-            st.write(f"📝 AI extracted {len(names)} names.")
-            matches = analyze_matches(names)
-            if matches:
-                st.balloons()
-                df = pd.DataFrame(matches)
-                st.success(f"🎉 Found {len(df)} Brazilian matches!")
-                st.dataframe(df)
+        raw_html = None
+        
+        # --- EXECUTE FETCH ---
+        if current_mode == "NATIVE":
+            resp = fetch_native(current_url)
+            if resp and resp.status_code == 200:
+                raw_html = resp.text
+                # Check for "Ghost Page" (Too small/empty)
+                if len(raw_html) < 2000 and force_mode == "Auto-Detect (Recommended)":
+                    status_log.warning("⚠️ Native page suspicious. Escalating to Browser...")
+                    current_mode = "SELENIUM"
+                    driver = get_driver()
+                    # Fall through to Selenium block below
             else:
-                st.warning("No Brazilian matches found.")
+                status_log.warning("⚠️ Native request failed. Escalating to Browser...")
+                current_mode = "SELENIUM"
+                if not driver: driver = get_driver()
+
+        if current_mode == "SELENIUM":
+            # If we just switched, or were already in Selenium
+            raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
+        
+        if not raw_html:
+            status_log.error("❌ Failed to read page in all modes.")
+            break
+
+        # --- AI ANALYSIS ---
+        data = agent_analyze_page(raw_html, current_url)
+        
+        if not data:
+            status_log.error("⚠️ AI failed to parse content.")
+            break
+            
+        # Check if AI says page is empty (Double check for Auto-Detect)
+        if data.get("is_empty") and current_mode == "NATIVE" and force_mode == "Auto-Detect (Recommended)":
+            status_log.warning("⚠️ AI sees empty page. Retrying with Browser...")
+            current_mode = "SELENIUM"
+            if not driver: driver = get_driver()
+            raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
+            data = agent_analyze_page(raw_html, current_url) # Re-analyze
+
+        # --- PROCESS RESULTS ---
+        names = data.get("names", [])
+        new_matches = match_names(names, f"Page {page}")
+        
+        if new_matches:
+            all_matches.extend(new_matches)
+            status_log.write(f"✅ Found {len(new_matches)} matches.")
+            # Update Live Table
+            table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
         else:
-            st.error("AI failed to parse the page.")
+            status_log.write("🤷 No matches found on this page.")
+
+        # --- NAVIGATION ---
+        nav = data.get("navigation", {})
+        if nav.get("type") == "LINK" and nav.get("url"):
+            next_link = nav["url"]
+            if "http" not in next_link:
+                next_link = urljoin(current_url, next_link)
+            
+            if next_link in visited:
+                status_log.write("🛑 Loop detected. Stopping.")
+                break
+            
+            visited.add(current_url)
+            current_url = next_link
+            status_log.write(f"🔗 Moving to: {next_link}")
+        else:
+            status_log.write("🏁 No next page found. Job Complete.")
+            break
+        
+        time.sleep(2) # Polite delay
+
+    # --- CLEANUP ---
+    if driver:
+        driver.quit()
+    
+    status_log.update(label="Mission Complete!", state="complete", expanded=False)
+    
+    if all_matches:
+        st.balloons()
+        df = pd.DataFrame(all_matches)
+        
+        # EXPORT BUTTONS
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "brazilian_alumni.csv")
+        with c2:
+            # Excel Export
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='Sheet1')
+            st.download_button("📥 Download Excel", buffer, "brazilian_alumni.xlsx")
+    else:
+        st.warning("No matches found during this session.")
