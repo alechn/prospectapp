@@ -171,7 +171,7 @@ def agent_analyze_page(html_content, current_url):
     
     for _ in range(2): 
         try:
-            model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
+            model = genai.GenerativeModel('gemini-2.5-flash-lite', generation_config={"response_mime_type": "application/json"})
             response = model.generate_content(prompt, safety_settings=safety)
             if not response.parts: continue
             return json.loads(clean_json_response(response.text))
