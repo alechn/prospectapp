@@ -26,7 +26,7 @@ except ImportError:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash • Template Learning (Form & Link Support)")
+st.caption("Powered by Gemini 2.5 Flash • Template Learning + Auto-Stop")
 
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"]
@@ -130,25 +130,26 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE (Form Aware)
+#             PART 4: INTELLIGENCE (Auto-Limit)
 # =========================================================
 
 def agent_learn_pattern(html_content, current_url):
     if not api_key: return None
     if len(html_content) < 500: return None
 
-    # UPDATED PROMPT: Explicitly asks for the "Next" element selector
+    # UPDATED PROMPT: Now asks for 'total_pages'
     prompt = f"""
     You are a web scraping expert. Analyze the HTML from {current_url}.
     
     1. Identify the CSS Selector for NAMES.
     2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT.
-       - It might be an <a> tag (link).
-       - It might be an <input type="submit"> or <button> inside a form.
+    3. CHECK PAGINATION: Look for text like "Page 1 of 50" or a "Last" link with a page number.
+       - Extract the TOTAL NUMBER of pages if visible.
     
     Return JSON:
     {{
       "names": ["Name 1", "Name 2"],
+      "total_pages": 74 (or null if unknown),
       "selectors": {{
          "name_element": "e.g. div.alumni-name",
          "next_element": "e.g. input[value='Next'] or a.next-link"
@@ -170,52 +171,34 @@ def agent_learn_pattern(html_content, current_url):
     return None
 
 def fast_extract_mode(html_content, selectors):
-    """
-    Form-Aware Extractor. Can find Links OR submit Forms.
-    """
     soup = BeautifulSoup(html_content, "html.parser")
     extracted_names = []
     
-    # 1. Extract Names
     if selectors.get("name_element"):
         elements = soup.select(selectors["name_element"])
         for el in elements:
             extracted_names.append(el.get_text(strip=True))
             
-    # 2. Extract Navigation (The New Logic)
     nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
-    
     next_selector = selectors.get("next_element") or selectors.get("next_link")
     
     if next_selector:
-        # Find the element (Link or Button)
         element = soup.select_one(next_selector)
-        
         if element:
-            # CASE A: It's a Link
             if element.name == "a" and element.get("href"):
                 nav_result["type"] = "LINK"
                 nav_result["next_url"] = element.get("href")
-            
-            # CASE B: It's a Button/Input (Likely a Form)
             elif element.name in ["input", "button"]:
-                # Find the parent form
                 parent_form = element.find_parent("form")
                 if parent_form:
                     nav_result["type"] = "FORM"
-                    # Scrape all inputs from this form
                     form_data = {}
                     for inp in parent_form.find_all("input"):
                         if inp.get("name"):
                             form_data[inp.get("name")] = inp.get("value", "")
-                    
-                    # Add the button itself if it has name/value (often needed for submit)
                     if element.get("name"):
                         form_data[element.get("name")] = element.get("value", "")
-                        
                     nav_result["form_data"] = form_data
-                    
-                    # Form action URL
                     if parent_form.get("action"):
                         nav_result["next_url"] = parent_form.get("action")
 
@@ -254,7 +237,8 @@ col1, col2 = st.columns([3, 1])
 with col1:
     start_url = st.text_input("Target URL", placeholder="https://legacy.cs.stanford.edu/directory/masters-alumni")
 with col2:
-    max_pages = st.number_input("Max Pages", 1, 100, 5)
+    # User sets a safety cap, but AI can override it lower
+    max_pages = st.number_input("Max Pages (Safety Limit)", 1, 500, 100)
 
 st.write("---")
 st.subheader("🛠️ Engine Selection")
@@ -288,14 +272,25 @@ if st.button("🚀 Start Mission", type="primary"):
     visited_fingerprints = set()
     
     learned_selectors = None
+    detected_max_pages = None # New State Variable
     
     if "Infinite" in mode:
         driver = get_driver()
         status_log.write("🔧 Browser Launched")
 
-    for page in range(1, max_pages + 1):
-        status_log.update(label=f"Scanning Page {page}/{max_pages}...", state="running")
+    page = 0
+    # Loop continues until we hit max_pages OR detected_max_pages
+    while page < max_pages:
+        page += 1
         
+        # Stop Check: If AI found the limit, respect it
+        if detected_max_pages and page > detected_max_pages:
+            status_log.write(f"🛑 Reached detected last page ({detected_max_pages}). Stopping.")
+            break
+            
+        status_log.update(label=f"Scanning Page {page}...", state="running")
+        
+        # --- EXECUTE REQUEST ---
         raw_html = None
         try:
             if "Classic" in mode:
@@ -313,18 +308,15 @@ if st.button("🚀 Start Mission", type="primary"):
         nav_data = {}
         ai_required = True 
         
-        # 1. FAST MODE (Template)
+        # 1. FAST MODE
         if learned_selectors:
-            status_log.write(f"⚡ using Fast Template")
+            status_log.write(f"⚡ Fast Template Active")
             fast_data = fast_extract_mode(raw_html, learned_selectors)
             names = fast_data["names"]
             fast_nav = fast_data["nav"]
             
-            # Verify if Fast Mode succeeded
             if len(names) > 0 and fast_nav["type"] != "NONE":
-                ai_required = False # It worked! No AI needed.
-                
-                # Apply Navigation directly
+                ai_required = False
                 if fast_nav["type"] == "LINK":
                     l = fast_nav["next_url"]
                     if "http" not in l: current_url = urljoin(current_url, l)
@@ -332,20 +324,15 @@ if st.button("🚀 Start Mission", type="primary"):
                     next_method = "GET"
                     next_data = None
                     status_log.write(f"🔗 Fast Link: {l}")
-                    
                 elif fast_nav["type"] == "FORM":
                     f_data = fast_nav["form_data"]
                     next_method = "POST"
                     next_data = f_data
-                    
-                    # Handle Action URL if present
                     if fast_nav.get("next_url"):
                         act = fast_nav["next_url"]
                         if "http" not in act: current_url = urljoin(current_url, act)
                         else: current_url = act
-                    
                     status_log.write(f"📝 Fast Form Extracted.")
-            
             elif len(names) == 0:
                  status_log.warning("⚠️ Template found 0 names. Re-learning...")
                  ai_required = True
@@ -353,7 +340,7 @@ if st.button("🚀 Start Mission", type="primary"):
                  status_log.warning("⚠️ Template lost navigation. Waking AI...")
                  ai_required = True
 
-        # 2. AI MODE (Teacher)
+        # 2. AI MODE
         if ai_required:
             if not learned_selectors: status_log.write(f"🧠 AI Analyzing Page Structure...")
             
@@ -363,6 +350,13 @@ if st.button("🚀 Start Mission", type="primary"):
                 names = data.get("names", [])
                 selectors = data.get("selectors", {})
                 nav_data = data.get("navigation", {})
+                
+                # --- AUTO LIMIT DETECTION ---
+                if not detected_max_pages and data.get("total_pages"):
+                    try:
+                        detected_max_pages = int(data["total_pages"])
+                        status_log.success(f"🎯 AI Detected Total Pages: {detected_max_pages}. Adjusting limit.")
+                    except: pass
                 
                 if selectors.get("name_element"):
                     learned_selectors = selectors
@@ -380,7 +374,7 @@ if st.button("🚀 Start Mission", type="primary"):
         else:
             status_log.write("🤷 No matches found.")
 
-        # AI NAVIGATION (Fallback)
+        # AI NAVIGATION
         if ai_required and "Classic" in mode:
             ntype = nav_data.get("type", "NONE")
             if ntype == "LINK" and nav_data.get("url"):
