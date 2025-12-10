@@ -7,15 +7,13 @@ import time
 import re
 from unidecode import unidecode
 from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-from typing import Set, Tuple, List
 
 # =========================================================
 #             PART 0: CONFIGURATION & SETUP
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide")
 st.title("Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash • Robust Session Agent")
+st.caption("Powered by Gemini 2.5 Flash • Jina Reader (Universal Mode)")
 
 # --- SIDEBAR: API KEY ---
 st.sidebar.header("🔑 Authentication")
@@ -41,16 +39,6 @@ def normalize_token(s: str) -> str:
     s = "".join(ch for ch in s if "A" <= ch <= "Z")
     return s
 
-def clean_html_for_ai(html_text):
-    """
-    Preserves HTML structure but removes noise to fit in context window.
-    """
-    soup = BeautifulSoup(html_text, "html.parser")
-    # Aggressive cleaning
-    for element in soup(["script", "style", "head", "svg", "footer", "iframe", "noscript", "img", "meta", "link"]):
-        element.decompose()
-    return str(soup)[:50000] 
-
 def clean_json_response(text):
     """
     Uses Regex to find the first valid JSON object in the text.
@@ -64,14 +52,15 @@ def clean_json_response(text):
         return text
 
 # =========================================================
-#             PART 2: DYNAMIC IBGE DATA (Dual Sliders)
+#             PART 2: DYNAMIC IBGE DATA (Cached)
 # =========================================================
 
 @st.cache_data(ttl=86400, show_spinner="Updating Brazilian Name Database...")
-def fetch_ibge_data(limit_first: int, limit_surname: int) -> Tuple[Set[str], Set[str]]:
+def fetch_ibge_data(limit_first: int, limit_surname: int):
     IBGE_FIRST_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
     IBGE_SURNAME_API = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
     
+    # Safety cap to prevent browser freezing if user types 1,000,000
     MAX_PAGES = 100 
 
     def _fetch_paginated(base_url, target_limit):
@@ -97,66 +86,68 @@ def fetch_ibge_data(limit_first: int, limit_surname: int) -> Tuple[Set[str], Set
                 break
         return names_set
 
-    # Fetch separately using the two different limits
-    firsts = _fetch_paginated(IBGE_FIRST_API, limit_first)
-    surnames = _fetch_paginated(IBGE_SURNAME_API, limit_surname)
-    
-    return firsts, surnames
+    return _fetch_paginated(IBGE_FIRST_API, limit_first), _fetch_paginated(IBGE_SURNAME_API, limit_surname)
 
 # --- SIDEBAR: DB SETTINGS ---
 st.sidebar.header("⚙️ Scraper Settings")
 
 st.sidebar.subheader("First Name Sensitivity")
-limit_first = st.sidebar.slider(
-    "Common First Names", 
-    min_value=10, max_value=10000, value=500, step=10,
+# CHANGED: Number Input allows precise typing
+limit_first = st.sidebar.number_input(
+    "Common First Names (Count)", 
+    min_value=10, 
+    max_value=10000, 
+    value=2000, 
+    step=100,
     help="How many top Brazilian first names to load. (e.g. 100 = Only 'João', 'Maria'...)"
 )
 
 st.sidebar.subheader("Surname Sensitivity")
-limit_surname = st.sidebar.slider(
-    "Common Surnames", 
-    min_value=10, max_value=10000, value=500, step=10,
+# CHANGED: Number Input allows precise typing
+limit_surname = st.sidebar.number_input(
+    "Common Surnames (Count)", 
+    min_value=10, 
+    max_value=10000, 
+    value=2000, 
+    step=100,
     help="How many top Brazilian surnames to load. Higher = catches rarer family names."
 )
 
 try:
     brazil_first_names, brazil_surnames = fetch_ibge_data(limit_first, limit_surname)
-    st.sidebar.success(f"✅ DB Loaded: {len(brazil_first_names)} First Names / {len(brazil_surnames)} Surnames")
+    st.sidebar.success(f"✅ DB Loaded: {len(brazil_first_names)} Firsts / {len(brazil_surnames)} Surnames")
 except Exception as e:
     st.error(f"Failed to load IBGE data: {e}")
     st.stop()
 
 # =========================================================
-#             PART 3: THE UNIVERSAL AGENT (Gemini 2.5)
+#             PART 3: THE UNIVERSAL AGENT (Jina Enhanced)
 # =========================================================
 
-def agent_analyze_page(html_content, current_url):
+def agent_analyze_page(markdown_content, current_url):
     if not api_key: return None
     
-    if len(html_content) < 500:
-        st.error("HTML content too short. You might be blocked.")
-        return None
-
+    # Prompt updated for Markdown analysis
     prompt = f"""
-    You are a data extraction system. 
-    Analyze the HTML below from: {current_url}
+    You are a data extraction system.
+    I have converted a website into Markdown text below.
     
-    1. Extract list of names (people/alumni).
-    2. Find the "Next Page" link or form.
+    Source URL: {current_url}
+    
+    TASK 1: Extract list of names (people/alumni).
+    TASK 2: Find the "Next Page" link. Look for links like [Next](url) or [2](url).
     
     Return ONLY a JSON object with this schema:
     {{
       "names": ["Name 1", "Name 2"],
       "navigation": {{
-         "type": "LINK" or "FORM" or "NONE",
-         "url": "full_next_url_or_path", 
-         "form_data": {{ "key": "value" }}
+         "type": "LINK" or "NONE",
+         "url": "full_next_url_if_found"
       }}
     }}
     
-    HTML:
-    {clean_html_for_ai(html_content)}
+    MARKDOWN CONTENT:
+    {markdown_content[:60000]} 
     """
     
     safety_settings = [
@@ -168,24 +159,17 @@ def agent_analyze_page(html_content, current_url):
 
     for attempt in range(3):
         try:
-            # SWITCHED TO GEMINI 2.5 FLASH AS REQUESTED
             model = genai.GenerativeModel(
-                'gemini-2.5-flash',
+                'gemini-2.5-flash', 
                 generation_config={"response_mime_type": "application/json"}
             )
             
             response = model.generate_content(prompt, safety_settings=safety_settings)
             
-            if not response.parts:
-                print(f"Attempt {attempt}: AI returned empty response (Likely Safety Filter).")
-                continue
-
-            cleaned_text = clean_json_response(response.text)
-            return json.loads(cleaned_text)
+            if not response.parts: continue
+            return json.loads(clean_json_response(response.text))
             
-        except Exception as e:
-            if attempt == 2:
-                st.warning(f"⚠️ JSON Parsing Failed. Error: {e}")
+        except Exception:
             time.sleep(1) 
     return None
 
@@ -216,11 +200,11 @@ def analyze_matches(found_names_list, source_label):
 #             PART 4: INTERFACE & EXECUTION
 # =========================================================
 
-st.markdown("### Auto-Pilot")
-st.write("Enter the first URL. The AI will navigate automatically.")
+st.markdown("### Auto-Pilot (Universal Mode)")
+st.write("Enter the URL. The AI will use a proxy to read JavaScript pages (like YC).")
 
-start_url = st.text_input("Directory URL:", placeholder="https://legacy.cs.stanford.edu/directory/undergraduate-alumni")
-max_pages = st.number_input("Max Pages Limit", min_value=1, value=100)
+start_url = st.text_input("Directory URL:", placeholder="https://www.ycombinator.com/companies")
+max_pages = st.number_input("Max Pages Limit", min_value=1, value=5)
 
 if st.button("Start Scraping", type="primary"):
     if not api_key:
@@ -228,45 +212,40 @@ if st.button("Start Scraping", type="primary"):
         st.stop()
         
     session = requests.Session()
+    # Spoofing headers
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.google.com/"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     })
     
     all_matches = []
     current_url = start_url
     
-    next_method = "GET" 
-    next_data = None 
-    
-    status_box = st.status("Starting Agent...", expanded=True)
+    status_box = st.status("Starting Universal Agent...", expanded=True)
     progress_bar = st.progress(0)
-    
-    visited_fingerprints = set() 
     
     for page_num in range(1, max_pages + 1):
         status_box.update(label=f"Scanning Page {page_num}...", state="running")
-        status_box.write(f"**Requesting:** {current_url} ({next_method})")
+        status_box.write(f"**Target:** {current_url}")
         
         try:
-            if next_method == "GET":
-                resp = session.get(current_url, timeout=30)
-            else: 
-                resp = session.post(current_url, data=next_data, timeout=30)
+            # --- THE MAGIC TRICK (Jina Proxy) ---
+            jina_url = f"https://r.jina.ai/{current_url}"
+            status_box.write(f"**Proxying via Jina:** {jina_url}")
+            
+            resp = session.get(jina_url, timeout=45)
             
             if resp.status_code != 200:
-                status_box.error(f"❌ Error: Status Code {resp.status_code}")
-                status_box.code(resp.text[:500])
+                status_box.error(f"❌ Error: Jina Proxy returned {resp.status_code}")
                 break
 
+            # AI Analysis on Markdown
             data = agent_analyze_page(resp.text, current_url)
             
             if not data:
-                status_box.warning(f"⚠️ AI could not read page {page_num}. Stopping.")
-                status_box.write("Debug - Raw Content Length: " + str(len(resp.text)))
+                status_box.warning(f"⚠️ AI could not read page {page_num}. Content length: {len(resp.text)}")
                 break
                 
+            # Process Names
             names = data.get("names", [])
             matches = analyze_matches(names, f"Page {page_num}")
             if matches:
@@ -275,35 +254,22 @@ if st.button("Start Scraping", type="primary"):
             else:
                 status_box.write(f"🤷 0 matches found.")
 
+            # Navigation
             nav = data.get("navigation", {})
-            nav_type = nav.get("type", "NONE")
+            raw_link = nav.get("url")
             
-            if nav_type == "LINK":
-                raw_link = nav.get("url")
-                if raw_link:
+            if raw_link and nav.get("type") == "LINK":
+                # Clean up Jina prefix if it leaks into the link
+                if "r.jina.ai" in raw_link:
+                    raw_link = raw_link.replace("https://r.jina.ai/", "")
+                
+                # Handle relative links
+                if not raw_link.startswith("http"):
                     current_url = urljoin(current_url, raw_link)
-                    next_method = "GET"
-                    next_data = None
-                    status_box.write(f"🔗 Link found: {raw_link}")
                 else:
-                    status_box.write("🛑 AI found Link type but no URL.")
-                    break
+                    current_url = raw_link
                     
-            elif nav_type == "FORM":
-                form_data = nav.get("form_data", {})
-                if form_data:
-                    next_method = "POST"
-                    next_data = form_data
-                    status_box.write(f"📝 Form detected. Posting: {form_data}")
-                    
-                    fingerprint = str(form_data)
-                    if fingerprint in visited_fingerprints:
-                        status_box.warning("⚠️ Loop detected (same form token). Finishing.")
-                        break
-                    visited_fingerprints.add(fingerprint)
-                else:
-                    status_box.write("🛑 AI found Form but no data.")
-                    break
+                status_box.write(f"🔗 Next Page: {current_url}")
             else:
                 status_box.write("🏁 No next page detected. Job done.")
                 break
@@ -313,7 +279,7 @@ if st.button("Start Scraping", type="primary"):
             break
             
         progress_bar.progress(page_num / max_pages)
-        # 4s delay for safety if using Free Tier, adjust lower if you have paid tier
+        # 4-second delay for API safety
         time.sleep(4) 
 
     status_box.update(label="Complete!", state="complete", expanded=False)
