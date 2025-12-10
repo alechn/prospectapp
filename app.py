@@ -11,18 +11,22 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 # --- SELENIUM SETUP (Only loaded if needed) ---
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.os_manager import ChromeType
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
+    HAS_SELENIUM = True
+except ImportError:
+    HAS_SELENIUM = False
 
 # =========================================================
 #             PART 0: CONFIGURATION
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash • Session Lock Engine")
+st.caption("Powered by Gemini 2.5 Flash • Dual Engine (Session + Selenium)")
 
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"]
@@ -45,10 +49,9 @@ def normalize_token(s: str) -> str:
 
 def clean_html_for_ai(html_text):
     soup = BeautifulSoup(html_text, "html.parser")
-    # Aggressive cleaning to keep it fast like the original
-    for element in soup(["script", "style", "svg", "noscript", "img", "iframe", "footer", "meta", "head"]):
+    for element in soup(["script", "style", "svg", "noscript", "img", "iframe", "footer"]):
         element.decompose()
-    return str(soup)[:100000] # Cap size for speed
+    return str(soup)[:500000] # Large context for scrolling
 
 def clean_json_response(text):
     try:
@@ -83,8 +86,8 @@ def fetch_ibge_data(limit_first, limit_surname):
     return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
 
 st.sidebar.header("⚙️ Search Settings")
-limit_first = st.sidebar.number_input("Common First Names", 10, 10000, 2000, 100)
-limit_surname = st.sidebar.number_input("Common Surnames", 10, 10000, 2000, 100)
+limit_first = st.sidebar.slider("Common First Names", 10, 10000, 2000, 100)
+limit_surname = st.sidebar.slider("Common Surnames", 10, 10000, 2000, 100)
 
 try:
     brazil_first_names, brazil_surnames = fetch_ibge_data(limit_first, limit_surname)
@@ -94,10 +97,10 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-#             PART 3: ENGINES (Session Locked)
+#             PART 3: ENGINES
 # =========================================================
 
-# --- ENGINE A: NATIVE (The fast one that worked before) ---
+# --- ENGINE A: NATIVE (Session Persistent) ---
 def fetch_native(session, url, method="GET", data=None):
     try:
         if method == "POST":
@@ -106,13 +109,15 @@ def fetch_native(session, url, method="GET", data=None):
     except Exception as e:
         return None
 
-# --- ENGINE B: SELENIUM (Only for Infinite Scroll) ---
+# --- ENGINE B: SELENIUM (Browser) ---
 def get_driver():
+    if not HAS_SELENIUM: return None
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    
     return webdriver.Chrome(
         service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
         options=options
@@ -132,8 +137,8 @@ def fetch_selenium(driver, url, scroll_count=0):
 # --- AI BRAIN ---
 def agent_analyze_page(html_content, current_url):
     if not api_key: return None
-    
-    # Prompt from the original working code
+    if len(html_content) < 500: return {"names": [], "is_empty": True}
+
     prompt = f"""
     You are a data extraction system.
     Analyze the HTML from: {current_url}
@@ -189,7 +194,7 @@ def match_names(names, page_label):
     return found
 
 # =========================================================
-#             PART 4: MAIN LOOP
+#             PART 4: MAIN INTERFACE
 # =========================================================
 
 st.markdown("### 🤖 Auto-Pilot Control Center")
@@ -199,13 +204,20 @@ with col1:
 with col2:
     max_pages = st.number_input("Max Pages", 1, 100, 5)
 
-# Clear strategy selection
-mode = st.radio("Select Strategy", ["Native (Fast/Forms)", "Infinite Scroll (Selenium)"], horizontal=True, 
-                help="Use 'Native' for directories like Stanford. Use 'Infinite Scroll' for sites like YCombinator.")
+# --- THE STRATEGY SELECTOR ---
+st.write("---")
+st.subheader("🛠️ Engine Selection")
+mode = st.radio(
+    "Choose Scraping Method:", 
+    ["Classic Directory (Stanford/Wikipedia)", "Infinite Scroller (YCombinator/JS Sites)"],
+    help="Classic is fast and handles forms/pagination best. Infinite Scroller uses a real browser (slower) for dynamic sites."
+)
 
-scroll_depth = 0
-if mode == "Infinite Scroll (Selenium)":
-    scroll_depth = st.slider("Scroll Depth", 1, 20, 3)
+if mode == "Infinite Scroller (YCombinator/JS Sites)":
+    if not HAS_SELENIUM:
+        st.error("❌ Selenium library missing. Please run: pip install selenium webdriver-manager")
+        st.stop()
+    scroll_depth = st.slider("Scroll Depth (Pages down)", 1, 20, 3)
 
 if st.button("🚀 Start Mission", type="primary"):
     if not api_key: st.error("Missing API Key"); st.stop()
@@ -214,7 +226,7 @@ if st.button("🚀 Start Mission", type="primary"):
     table_placeholder = st.empty()
     all_matches = []
     
-    # SETUP SESSION ONCE
+    # SETUP
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -226,13 +238,12 @@ if st.button("🚀 Start Mission", type="primary"):
     next_method = "GET"
     next_data = None
     driver = None
+    visited_fingerprints = set()
     
-    # Initialize Driver ONCE if needed
-    if mode == "Infinite Scroll (Selenium)":
+    # LAUNCH BROWSER IF NEEDED
+    if "Infinite" in mode:
         driver = get_driver()
         status_log.write("🔧 Browser Launched")
-
-    visited_fingerprints = set()
 
     for page in range(1, max_pages + 1):
         status_log.update(label=f"Scanning Page {page}/{max_pages}...", state="running")
@@ -240,10 +251,10 @@ if st.button("🚀 Start Mission", type="primary"):
         
         raw_html = None
         
-        # --- EXECUTE REQUEST ---
         try:
-            if mode == "Native (Fast/Forms)":
-                # NATIVE MODE (Locks to Requests)
+            # --- ENGINE SELECTION ---
+            if "Classic" in mode:
+                # NATIVE MODE (Persistent Session)
                 resp = fetch_native(session, current_url, next_method, next_data)
                 if resp and resp.status_code == 200:
                     raw_html = resp.text
@@ -251,73 +262,69 @@ if st.button("🚀 Start Mission", type="primary"):
                     status_log.error(f"❌ HTTP Error: {resp.status_code if resp else 'Connection Failed'}")
                     break
             else:
-                # SELENIUM MODE (Locks to Browser)
+                # SELENIUM MODE (Browser)
                 raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
+
+            if not raw_html:
+                status_log.error("❌ Content retrieval failed.")
+                break
+
+            # --- AI ANALYSIS ---
+            data = agent_analyze_page(raw_html, current_url)
+            
+            if not data:
+                status_log.warning(f"⚠️ AI could not read page {page}.")
+                break
+
+            names = data.get("names", [])
+            new_matches = match_names(names, f"Page {page}")
+            
+            if new_matches:
+                all_matches.extend(new_matches)
+                status_log.write(f"✅ Found {len(new_matches)} matches.")
+                table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
+            else:
+                status_log.write("🤷 No matches found.")
+
+            # --- NAVIGATION ---
+            if "Classic" in mode:
+                nav = data.get("navigation", {})
+                nav_type = nav.get("type", "NONE")
+                
+                if nav_type == "LINK" and nav.get("url"):
+                    raw_link = nav["url"]
+                    if "http" not in raw_link: current_url = urljoin(current_url, raw_link)
+                    else: current_url = raw_link
+                    next_method = "GET"
+                    next_data = None
+                    status_log.write(f"🔗 Link found: {raw_link}")
+                    
+                elif nav_type == "FORM":
+                    form_data = nav.get("form_data", {})
+                    if form_data:
+                        next_method = "POST"
+                        next_data = form_data
+                        
+                        fp = str(form_data)
+                        if fp in visited_fingerprints:
+                            status_log.warning("⚠️ Loop detected. Finishing.")
+                            break
+                        visited_fingerprints.add(fp)
+                        status_log.write(f"📝 Form detected. Sending data...")
+                    else:
+                        break
+                else:
+                    status_log.write("🏁 No next page found. Job Complete.")
+                    break
+            else:
+                status_log.write("🏁 Infinite Scroll complete.")
+                break
+            
+            time.sleep(2)
+
         except Exception as e:
             status_log.error(f"Critical Error: {e}")
             break
-
-        if not raw_html:
-            status_log.error("❌ Failed to retrieve content.")
-            break
-
-        # --- AI ANALYSIS ---
-        data = agent_analyze_page(raw_html, current_url)
-        
-        if not data:
-            status_log.warning(f"⚠️ AI could not read page {page}.")
-            break
-
-        # --- MATCHING ---
-        names = data.get("names", [])
-        new_matches = match_names(names, f"Page {page}")
-        
-        if new_matches:
-            all_matches.extend(new_matches)
-            status_log.write(f"✅ Found {len(new_matches)} matches.")
-            table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-        else:
-            status_log.write("🤷 No matches found.")
-
-        # --- NAVIGATION (Only for Native Mode) ---
-        # Selenium infinite scroll doesn't need "Next Page" logic usually
-        if mode == "Native (Fast/Forms)":
-            nav = data.get("navigation", {})
-            nav_type = nav.get("type", "NONE")
-            
-            if nav_type == "LINK" and nav.get("url"):
-                raw_link = nav["url"]
-                if "http" not in raw_link: current_url = urljoin(current_url, raw_link)
-                else: current_url = raw_link
-                next_method = "GET"
-                next_data = None
-                status_log.write(f"🔗 Link found: {raw_link}")
-                
-            elif nav_type == "FORM":
-                form_data = nav.get("form_data", {})
-                if form_data:
-                    next_method = "POST"
-                    next_data = form_data
-                    
-                    # Loop Check
-                    fp = str(form_data)
-                    if fp in visited_fingerprints:
-                        status_log.warning("⚠️ Loop detected. Finishing.")
-                        break
-                    visited_fingerprints.add(fp)
-                    status_log.write(f"📝 Form detected. Sending data...")
-                else:
-                    status_log.write("🏁 Form found but empty. Job done.")
-                    break
-            else:
-                status_log.write("🏁 No next page found. Job Complete.")
-                break
-        else:
-            # Infinite Scroll usually grabs everything in one go
-            status_log.write("🏁 Scroll complete. Job done.")
-            break
-        
-        time.sleep(2)
 
     if driver: driver.quit()
     
@@ -337,4 +344,6 @@ if st.button("🚀 Start Mission", type="primary"):
                     df.to_excel(writer, index=False, sheet_name='Sheet1')
                 st.download_button("📥 Download Excel", buffer, "brazilian_alumni.xlsx")
             except:
-                st.info("💡 Install 'xlsxwriter' for Excel export.")
+                st.info("💡 Install 'xlsxwriter' to enable Excel export.")
+    else:
+        st.warning("No matches found during this session.")
