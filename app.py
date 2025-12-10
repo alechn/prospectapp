@@ -86,8 +86,18 @@ def fetch_ibge_data(limit_first, limit_surname):
     return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
 
 st.sidebar.header("⚙️ Search Settings")
-limit_first = st.sidebar.slider("Common First Names", 10, 10000, 2000, 100)
-limit_surname = st.sidebar.slider("Common Surnames", 10, 10000, 2000, 100)
+
+# --- CORRECTED: NUMBER INPUTS ---
+limit_first = st.sidebar.number_input(
+    "Common First Names (Count)", 
+    min_value=10, max_value=20000, value=2000, step=100,
+    help="Increase to find more people (but slower load). Decrease for strict filtering."
+)
+limit_surname = st.sidebar.number_input(
+    "Common Surnames (Count)", 
+    min_value=10, max_value=20000, value=2000, step=100,
+    help="Increase to find rare family names."
+)
 
 try:
     brazil_first_names, brazil_surnames = fetch_ibge_data(limit_first, limit_surname)
@@ -171,7 +181,7 @@ def agent_analyze_page(html_content, current_url):
     
     for _ in range(2): 
         try:
-            model = genai.GenerativeModel('gemini-2.5-flash-lite', generation_config={"response_mime_type": "application/json"})
+            model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
             response = model.generate_content(prompt, safety_settings=safety)
             if not response.parts: continue
             return json.loads(clean_json_response(response.text))
