@@ -163,7 +163,7 @@ def agent_learn_pattern(html_content, current_url):
     
     for _ in range(2): 
         try:
-            model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
+            model = genai.GenerativeModel('gemini-2.5-flash-lite', generation_config={"response_mime_type": "application/json"})
             response = model.generate_content(prompt)
             if not response.parts: continue
             return json.loads(clean_json_response(response.text))
