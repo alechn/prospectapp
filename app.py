@@ -26,16 +26,16 @@ except ImportError:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash • Auto-Limit + Anti-False Positive Filter")
+st.caption("Powered by Gemini 2.5 Flash • Scoring & Ranking System")
 
-# --- FILTER LIST: Common Non-Brazilian Surnames (Chinese, Korean, Indian, etc.) ---
+# --- FILTER LIST ---
 BLOCKLIST_SURNAMES = {
     "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
     "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
     "LIANG", "SONG", "TANG", "ZHENG", "HAN", "FENG", "DONG", "YE", "YU", "WEI", 
     "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
     "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
-    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN", "TENG", "PARK", "LIM", "FU", "CHIU", "CHOW", "CHAO" 
+    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN"
 }
 
 if "GOOGLE_API_KEY" in st.secrets:
@@ -97,8 +97,9 @@ def fetch_ibge_data(limit_first, limit_surname):
     return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
 
 st.sidebar.header("⚙️ Search Settings")
-limit_first = st.sidebar.number_input("Common First Names", 10, 20000, 2000, 100)
-limit_surname = st.sidebar.number_input("Common Surnames", 10, 20000, 2000, 100)
+# INCREASED DEFAULT to ensure scoring works well (More names = Better relative ranking)
+limit_first = st.sidebar.number_input("Common First Names", 10, 20000, 3000, 100)
+limit_surname = st.sidebar.number_input("Common Surnames", 10, 20000, 3000, 100)
 
 try:
     first_name_ranks, surname_ranks = fetch_ibge_data(limit_first, limit_surname)
@@ -140,7 +141,7 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE (Auto-Limit)
+#             PART 4: INTELLIGENCE
 # =========================================================
 
 def agent_learn_pattern(html_content, current_url):
@@ -152,8 +153,7 @@ def agent_learn_pattern(html_content, current_url):
     
     1. Identify the CSS Selector for NAMES.
     2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT.
-    3. CHECK PAGINATION: Look for text like "Page 1 of 50" or a "Last" link with a page number.
-       - Extract the TOTAL NUMBER of pages if visible.
+    3. CHECK PAGINATION: Look for text like "Page 1 of 50". Extract TOTAL NUMBER of pages.
     
     Return JSON:
     {{
@@ -172,7 +172,7 @@ def agent_learn_pattern(html_content, current_url):
     
     for _ in range(2): 
         try:
-            model = genai.GenerativeModel('gemini-2.5-flash-lite', generation_config={"response_mime_type": "application/json"})
+            model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
             response = model.generate_content(prompt)
             if not response.parts: continue
             return json.loads(clean_json_response(response.text))
@@ -213,6 +213,18 @@ def fast_extract_mode(html_content, selectors):
 
     return {"names": extracted_names, "nav": nav_result}
 
+# --- NEW: SCORING LOGIC ---
+def calculate_score(rank, limit):
+    """
+    Returns points (0-50) based on rank.
+    Rank 1 = 50 pts. Rank Limit = 0 pts. Not Found = 0 pts.
+    """
+    if rank == 0: return 0
+    # Inverse score: (Limit - Rank) / Limit
+    # e.g. Limit 2000, Rank 1 -> (1999/2000) * 50 = 49.9 pts
+    score = ((limit - rank) / limit) * 50
+    return max(0, score)
+
 def match_names_detailed(names, page_label):
     found = []
     for n in names:
@@ -220,22 +232,29 @@ def match_names_detailed(names, page_label):
         if not parts: continue
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         
-        # --- BLOCKLIST CHECK ---
-        if l in BLOCKLIST_SURNAMES:
-            continue # Skip this person immediately
+        # Blocklist Filter
+        if l in BLOCKLIST_SURNAMES: continue
         
+        # Get Ranks
         rank_f = first_name_ranks.get(f, 0)
         rank_l = surname_ranks.get(l, 0)
         
-        if rank_f > 0 or rank_l > 0:
+        # Calculate Scores
+        score_f = calculate_score(rank_f, limit_first)
+        score_l = calculate_score(rank_l, limit_surname)
+        
+        total_score = round(score_f + score_l, 1)
+        
+        if total_score > 0: # If at least one part matched
             if rank_f > 0 and rank_l > 0: m_type = "Strong"
             elif rank_f > 0: m_type = "First Name Only"
             else: m_type = "Surname Only"
             
             found.append({
                 "Full Name": n, 
-                "Match Strength": m_type,
-                "First Name Rank": rank_f if rank_f > 0 else "N/A",
+                "Brazil Score": total_score, # 0-100 Score
+                "Match Type": m_type,
+                "First Rank": rank_f if rank_f > 0 else "N/A",
                 "Surname Rank": rank_l if rank_l > 0 else "N/A",
                 "Source": page_label
             })
@@ -371,14 +390,18 @@ if st.button("🚀 Start Mission", type="primary"):
                 status_log.error("❌ AI failed to read page.")
                 break
 
+        # MATCHING
         new_matches = match_names_detailed(names, f"Page {page}")
         if new_matches:
             all_matches.extend(new_matches)
+            # Sort by Brazil Score DESCENDING
+            all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
             status_log.write(f"✅ Found {len(new_matches)} matches.")
             table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
         else:
             status_log.write("🤷 No matches found.")
 
+        # NAVIGATION
         if ai_required and "Classic" in mode:
             ntype = nav_data.get("type", "NONE")
             if ntype == "LINK" and nav_data.get("url"):
