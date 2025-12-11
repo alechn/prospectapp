@@ -22,11 +22,21 @@ except ImportError:
     HAS_SELENIUM = False
 
 # =========================================================
-#             PART 0: CONFIGURATION
+#             PART 0: CONFIGURATION & BLOCKLIST
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash • Template Learning + Auto-Stop")
+st.caption("Powered by Gemini 2.5 Flash • Auto-Limit + Anti-False Positive Filter")
+
+# --- FILTER LIST: Common Non-Brazilian Surnames (Chinese, Korean, Indian, etc.) ---
+BLOCKLIST_SURNAMES = {
+    "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
+    "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
+    "LIANG", "SONG", "TANG", "ZHENG", "HAN", "FENG", "DONG", "YE", "YU", "WEI", 
+    "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
+    "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
+    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN", "TENG", "PARK", "LIM", "FU", "CHIU", "CHOW", "CHAO" 
+}
 
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"]
@@ -137,7 +147,6 @@ def agent_learn_pattern(html_content, current_url):
     if not api_key: return None
     if len(html_content) < 500: return None
 
-    # UPDATED PROMPT: Now asks for 'total_pages'
     prompt = f"""
     You are a web scraping expert. Analyze the HTML from {current_url}.
     
@@ -163,7 +172,7 @@ def agent_learn_pattern(html_content, current_url):
     
     for _ in range(2): 
         try:
-            model = genai.GenerativeModel('gemini-2.5-flash-lite', generation_config={"response_mime_type": "application/json"})
+            model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
             response = model.generate_content(prompt)
             if not response.parts: continue
             return json.loads(clean_json_response(response.text))
@@ -211,6 +220,10 @@ def match_names_detailed(names, page_label):
         if not parts: continue
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         
+        # --- BLOCKLIST CHECK ---
+        if l in BLOCKLIST_SURNAMES:
+            continue # Skip this person immediately
+        
         rank_f = first_name_ranks.get(f, 0)
         rank_l = surname_ranks.get(l, 0)
         
@@ -237,7 +250,6 @@ col1, col2 = st.columns([3, 1])
 with col1:
     start_url = st.text_input("Target URL", placeholder="https://legacy.cs.stanford.edu/directory/masters-alumni")
 with col2:
-    # User sets a safety cap, but AI can override it lower
     max_pages = st.number_input("Max Pages (Safety Limit)", 1, 500, 100)
 
 st.write("---")
@@ -272,25 +284,22 @@ if st.button("🚀 Start Mission", type="primary"):
     visited_fingerprints = set()
     
     learned_selectors = None
-    detected_max_pages = None # New State Variable
+    detected_max_pages = None 
     
     if "Infinite" in mode:
         driver = get_driver()
         status_log.write("🔧 Browser Launched")
 
     page = 0
-    # Loop continues until we hit max_pages OR detected_max_pages
     while page < max_pages:
         page += 1
         
-        # Stop Check: If AI found the limit, respect it
         if detected_max_pages and page > detected_max_pages:
             status_log.write(f"🛑 Reached detected last page ({detected_max_pages}). Stopping.")
             break
             
         status_log.update(label=f"Scanning Page {page}...", state="running")
         
-        # --- EXECUTE REQUEST ---
         raw_html = None
         try:
             if "Classic" in mode:
@@ -308,7 +317,6 @@ if st.button("🚀 Start Mission", type="primary"):
         nav_data = {}
         ai_required = True 
         
-        # 1. FAST MODE
         if learned_selectors:
             status_log.write(f"⚡ Fast Template Active")
             fast_data = fast_extract_mode(raw_html, learned_selectors)
@@ -340,7 +348,6 @@ if st.button("🚀 Start Mission", type="primary"):
                  status_log.warning("⚠️ Template lost navigation. Waking AI...")
                  ai_required = True
 
-        # 2. AI MODE
         if ai_required:
             if not learned_selectors: status_log.write(f"🧠 AI Analyzing Page Structure...")
             
@@ -351,7 +358,6 @@ if st.button("🚀 Start Mission", type="primary"):
                 selectors = data.get("selectors", {})
                 nav_data = data.get("navigation", {})
                 
-                # --- AUTO LIMIT DETECTION ---
                 if not detected_max_pages and data.get("total_pages"):
                     try:
                         detected_max_pages = int(data["total_pages"])
@@ -365,7 +371,6 @@ if st.button("🚀 Start Mission", type="primary"):
                 status_log.error("❌ AI failed to read page.")
                 break
 
-        # MATCHING
         new_matches = match_names_detailed(names, f"Page {page}")
         if new_matches:
             all_matches.extend(new_matches)
@@ -374,7 +379,6 @@ if st.button("🚀 Start Mission", type="primary"):
         else:
             status_log.write("🤷 No matches found.")
 
-        # AI NAVIGATION
         if ai_required and "Classic" in mode:
             ntype = nav_data.get("type", "NONE")
             if ntype == "LINK" and nav_data.get("url"):
