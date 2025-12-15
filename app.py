@@ -426,7 +426,7 @@ if st.session_state.running:
         if driver: driver.quit()
 
 # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (Smart Re-Learning)
+    # BRANCH B: SEARCH INJECTION (Universal Backup Edition)
     # ----------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
@@ -525,30 +525,35 @@ if st.session_state.running:
                     prog_bar.progress(current_val)
                 prog_bar.empty()
 
-                # --- DEBUG SCREENSHOT (Critical) ---
-                screenshot = driver.get_screenshot_as_png()
-                with st.sidebar.expander(f"📸 Results: {surname}", expanded=True):
-                    st.image(screenshot, caption=f"Screen after waiting for {surname}")
-
-                # Extract
+                # --- EXTRACT ---
                 try:
                     soup = BeautifulSoup(driver.page_source, "html.parser")
                     
-                    # RE-LEARN Logic: If we haven't found names yet, ask AI NOW (using the results page)
-                    if not learned_selectors and not manual_name_selector:
-                        status_log.write(f"🧠 Analyzing Results Page Structure...")
-                        res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
-                        if res_data and res_data.get("selectors", {}).get("name_element"):
-                            learned_selectors = res_data["selectors"]
-                            status_log.success(f"🎓 Learned Name Selector: {learned_selectors['name_element']}")
-
-                    # Manual Override Check
+                    # A. Manual Override
                     if manual_name_selector: 
                         learned_selectors = {"name_element": manual_name_selector}
                     
+                    # B. AI Analysis (If not yet learned)
+                    if not learned_selectors:
+                        status_log.write(f"🧠 AI Analyzing Results...")
+                        res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
+                        if res_data and res_data.get("selectors", {}).get("name_element"):
+                            learned_selectors = res_data["selectors"]
+                            status_log.success(f"🎓 AI Found: {learned_selectors['name_element']}")
+                    
+                    # C. "DUMB" FALLBACK (The Fix!)
+                    # If AI failed but page has results (h3/h4 tags are standard for search titles)
+                    if not learned_selectors:
+                        status_log.warning("⚠️ AI confused. Trying generic headers (h3)...")
+                        learned_selectors = {"name_element": "h3"}
+
                     current_names = []
                     if learned_selectors:
                         els = soup.select(learned_selectors["name_element"])
+                        # If h3 gave nothing, try links directly
+                        if not els and learned_selectors["name_element"] == "h3":
+                             els = soup.select("h4 a, h3 a, .result-title")
+                             
                         current_names = [e.get_text(strip=True) for e in els]
                     
                     if current_names:
@@ -559,11 +564,7 @@ if st.session_state.running:
                             table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
                             status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
                     else:
-                        # Basic Text Check (Fallback)
-                        if surname.upper() in soup.get_text().upper():
-                            status_log.warning(f"⚠️ I see '{surname}' on page, but couldn't extract clean names. Try Manual Selector.")
-                        else:
-                            status_log.write(f"🤷 No results found for '{surname}'.")
+                        status_log.write(f"🤷 No results found for '{surname}'.")
                             
                 except: pass
 
