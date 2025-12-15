@@ -44,7 +44,6 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 st.sidebar.markdown("---")
-# --- ADVANCED MANUAL OVERRIDES ---
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q'] or #search")
     manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. div.alumni-name")
@@ -153,7 +152,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS (STABLE CONFIG)
+#             PART 3: DRIVERS (THE FIX)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -163,20 +162,45 @@ def fetch_native(session, url, method="GET", data=None):
 
 def get_driver(headless=True):
     if not HAS_SELENIUM: return None
+    
     options = Options()
     
-    if headless:
+    # 1. MANDATORY FLAGS FOR CLOUD
+    if headless or os.name == 'posix': 
         options.add_argument("--headless")
         
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     
-    # Using webdriver_manager (This worked for you previously)
-    return webdriver.Chrome(
-        service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-        options=options
-    )
+    # 2. INTELLIGENT DRIVER SELECTION
+    try:
+        # CHECK: Are we on Streamlit Cloud (Linux)?
+        if os.name == 'posix':
+            # Force use of the system-installed driver (from packages.txt)
+            # This prevents "SessionNotCreated" caused by version mismatch
+            return webdriver.Chrome(
+                service=Service("/usr/bin/chromedriver"), 
+                options=options
+            )
+        else:
+            # We are on Windows/Mac (Local) -> Use Manager to download driver
+            return webdriver.Chrome(
+                service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
+                options=options
+            )
+            
+    except Exception as e:
+        st.error(f"❌ Driver Error: {e}")
+        # DEBUG: Print what paths exist so we know what's wrong
+        st.code(f"""
+        Debug Info:
+        OS: {os.name}
+        Chromium Exists: {os.path.exists('/usr/bin/chromium')}
+        Driver Exists: {os.path.exists('/usr/bin/chromedriver')}
+        """)
+        return None
 
 def fetch_selenium(driver, url, scroll_count=0):
     try:
@@ -327,7 +351,7 @@ if st.session_state.running:
     learned_selectors = None
     
     # ----------------------------------------------------
-    # BRANCH A: PAGINATION & SCROLLING
+    # BRANCH A: PAGINATION
     # ----------------------------------------------------
     if "Search Injection" not in mode:
         session = requests.Session()
@@ -423,10 +447,9 @@ if st.session_state.running:
         if driver: driver.quit()
 
     # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (Brute Force)
+    # BRANCH B: SEARCH INJECTION
     # ----------------------------------------------------
     else:
-        # NOTE: On Cloud, run_headless is forced True by get_driver()
         driver = get_driver(headless=run_headless)
         if not driver: status_log.error("Aborted: Driver failed."); st.stop()
         
@@ -438,30 +461,27 @@ if st.session_state.running:
         status_log.write("🧠 Finding Search Box...")
         
         # --- SCREENSHOT DEBUG ---
-        # Take a screenshot so you can see if the page loaded
         screenshot = driver.get_screenshot_as_png()
-        with st.sidebar.expander("📸 Page Screenshot (Last View)", expanded=False):
-            st.image(screenshot, caption="What the bot sees")
+        with st.sidebar.expander("📸 Page Screenshot", expanded=False):
+            st.image(screenshot)
         
-        # --- MANUAL OVERRIDE LOGIC ---
+        # --- MANUAL OVERRIDE ---
         sel_input = None
         sel_btn = None
         
         if manual_search_selector:
-            status_log.warning(f"⚠️ Using Manual Selector: {manual_search_selector}")
+            status_log.warning(f"⚠️ Manual Selector: {manual_search_selector}")
             sel_input = manual_search_selector
         else:
-            # Ask AI
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
                 sel_input = data["selectors"]["search_input"]
                 sel_btn = data["selectors"].get("search_button")
         
         if not sel_input:
-            status_log.error("❌ Could not find search box. Check screenshot in sidebar.")
+            status_log.error("❌ Could not find search box.")
             driver.quit(); st.stop()
             
-        # 2. Loop Surnames
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
             status_log.update(label=f"Checking '{surname}' ({i+1}/{max_pages})", state="running")
@@ -484,7 +504,6 @@ if st.session_state.running:
                 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 
-                # Check for Manual Name Selector override
                 if manual_name_selector:
                     learned_selectors = {"name_element": manual_name_selector}
                     
