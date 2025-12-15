@@ -425,8 +425,8 @@ if st.session_state.running:
         
         if driver: driver.quit()
 
-    # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (Guaranteed Wait Edition)
+# ----------------------------------------------------
+    # BRANCH B: SEARCH INJECTION (Bulletproof Typing)
     # ----------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
@@ -435,9 +435,23 @@ if st.session_state.running:
         status_log.write("🔧 Browser Launched")
         try: 
             driver.get(start_url)
-            time.sleep(5) 
+            time.sleep(5)
         except: 
             status_log.error("Could not load URL"); driver.quit(); st.stop()
+        
+        # --- POPUP KILLER (Try to close cookie banners) ---
+        try:
+            driver.execute_script("""
+                const buttons = document.querySelectorAll('button, a');
+                buttons.forEach(btn => {
+                    if(btn.innerText.toLowerCase().includes('accept') || 
+                       btn.innerText.toLowerCase().includes('agree') ||
+                       btn.innerText.toLowerCase().includes('cookie')) {
+                        btn.click();
+                    }
+                });
+            """)
+        except: pass
         
         status_log.write("🧠 Finding Search Box...")
         
@@ -446,6 +460,7 @@ if st.session_state.running:
         
         if manual_search_selector:
             sel_input = manual_search_selector
+        
         if not sel_input:
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
@@ -473,36 +488,47 @@ if st.session_state.running:
             if not st.session_state.running: break
             
             status_log.update(label=f"🔎 Checking '{surname}' ({i+1}/{max_pages})", state="running")
-            
             search_success = False
             
-            # --- 1. INTERACTION PHASE ---
+            # --- 1. ROBUST INTERACTION PHASE ---
             try:
                 # Find Fresh
                 inp = driver.find_element(By.CSS_SELECTOR, sel_input)
-                inp.clear()
                 
-                # Type
-                for ch in surname: inp.send_keys(ch); time.sleep(random.uniform(0.05, 0.1))
-                time.sleep(0.5)
-                
-                # Submit
-                if sel_btn:
-                    try: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
-                    except: inp.send_keys(Keys.RETURN)
-                else: 
+                # STRATEGY A: Standard Typing
+                try:
+                    inp.clear()
+                    inp.send_keys(surname)
+                    time.sleep(0.5)
                     inp.send_keys(Keys.RETURN)
-                
-                search_success = True
+                    search_success = True
+                except:
+                    # STRATEGY B: Click First (Focus)
+                    try:
+                        driver.execute_script("arguments[0].click();", inp)
+                        inp.clear()
+                        inp.send_keys(surname)
+                        inp.send_keys(Keys.RETURN)
+                        search_success = True
+                    except:
+                        # STRATEGY C: JavaScript Injection (Force Value)
+                        try:
+                            driver.execute_script(f"arguments[0].value = '{surname}';", inp)
+                            # Force submit via form if possible
+                            try: inp.submit()
+                            except: inp.send_keys(Keys.RETURN)
+                            search_success = True
+                        except:
+                            raise Exception("All typing methods failed.")
                 
             except Exception as e:
-                status_log.warning(f"⚠️ Search failed for {surname}. Reloading...")
+                status_log.warning(f"⚠️ Failed to type '{surname}'. Reloading...")
                 driver.get(start_url)
                 time.sleep(3)
 
             # --- 2. GUARANTEED WAIT & SCRAPE PHASE ---
             if search_success:
-                # PROGRESS BAR (Unskippable)
+                # PROGRESS BAR
                 prog_bar = table_placeholder.progress(0)
                 step_val = 1.0 / search_delay
                 current_val = 0.0
@@ -536,8 +562,7 @@ if st.session_state.running:
                         all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                         table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
                         status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
-                except:
-                    pass
+                except: pass
 
                 # Reset
                 try: 
