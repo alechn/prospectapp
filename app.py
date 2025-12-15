@@ -24,13 +24,13 @@ except ImportError:
     HAS_SELENIUM = False
 
 # =========================================================
-#             PART 0: CONFIGURATION
+#             PART 0: CONFIGURATION & SETUP
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Powered by Multi-Model AI • Search Injection • CAPTCHA Pausing")
+st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
-# --- AI PROVIDER ---
+# --- SIDEBAR: AI BRAIN ---
 st.sidebar.header("🧠 AI Brain")
 ai_provider = st.sidebar.selectbox(
     "Choose your Model:",
@@ -38,24 +38,40 @@ ai_provider = st.sidebar.selectbox(
 )
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
+# --- BLOCKLIST (Anti-False Positive) ---
+BLOCKLIST_SURNAMES = {
+    "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
+    "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
+    "LIANG", "SONG", "TANG", "ZHENG", "HAN", "FENG", "DONG", "YE", "YU", "WEI", 
+    "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
+    "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
+    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN"
+}
+
 # =========================================================
 #             PART 1: UNIVERSAL AI ADAPTER
 # =========================================================
 def call_ai_api(prompt, provider, key):
     if not key: return None
     headers = {"Content-Type": "application/json"}
+    
     try:
+        # GEMINI
         if "Gemini" in provider:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
+            
+        # OPENAI
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "gpt-4o", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
+            
+        # ANTHROPIC
         elif "Anthropic" in provider:
             url = "https://api.anthropic.com/v1/messages"
             headers["x-api-key"] = key
@@ -63,12 +79,15 @@ def call_ai_api(prompt, provider, key):
             payload = {"model": "claude-3-5-sonnet-20241022", "max_tokens": 4000, "messages": [{"role": "user", "content": prompt}]}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
+            
+        # DEEPSEEK
         elif "DeepSeek" in provider:
             url = "https://api.deepseek.com/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
+
     except Exception as e: return None
     return None
 
@@ -94,12 +113,11 @@ def clean_html_for_ai(html_text):
         element.decompose()
     return str(soup)[:500000]
 
-BLOCKLIST_SURNAMES = {"WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", "KIM", "LEE", "PARK", "SINGH", "PATEL", "NGUYEN"}
-
 @st.cache_data(ttl=86400)
 def fetch_ibge_data(limit_first, limit_surname):
     IBGE_FIRST = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
     IBGE_SURNAME = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
+    
     def _fetch(url, limit):
         data_map = {} 
         page = 1
@@ -117,73 +135,121 @@ def fetch_ibge_data(limit_first, limit_surname):
         return data_map
     return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
 
-st.sidebar.header("⚙️ Settings")
-limit_first = st.sidebar.number_input("DB: Common First Names", 100, 20000, 3000)
-limit_surname = st.sidebar.number_input("DB: Common Surnames", 100, 20000, 3000)
+st.sidebar.header("⚙️ Search Settings")
+limit_first = st.sidebar.number_input("DB: First Names", 100, 20000, 3000, 100)
+limit_surname = st.sidebar.number_input("DB: Surnames", 100, 20000, 3000, 100)
 
 try:
     first_name_ranks, surname_ranks = fetch_ibge_data(limit_first, limit_surname)
-    # SORT SURNAMES BY RANK (Most common first)
     sorted_surnames = sorted(surname_ranks.keys(), key=lambda k: surname_ranks[k])
-    st.sidebar.success(f"✅ DB Loaded: {len(sorted_surnames)} surnames ready for injection.")
+    st.sidebar.success(f"✅ DB Loaded: {len(first_name_ranks)} Firsts / {len(surname_ranks)} Surnames")
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVER & CAPTCHA UTILS
+#             PART 3: DRIVERS & ENGINES
 # =========================================================
+def fetch_native(session, url, method="GET", data=None):
+    try:
+        if method == "POST": return session.post(url, data=data, timeout=15)
+        return session.get(url, timeout=15)
+    except: return None
+
 def get_driver(headless=True):
     if not HAS_SELENIUM: return None
     options = Options()
-    if headless:
-        options.add_argument("--headless")
+    if headless: options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-blink-features=AutomationControlled") # Hide Robot Status
+    options.add_argument("--disable-blink-features=AutomationControlled")
     return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
 
-def check_for_captcha(driver):
-    """Simple check for common CAPTCHA text."""
-    src = driver.page_source.lower()
-    if "captcha" in src or "verify you are human" in src or "challenge" in src:
-        return True
-    return False
+def fetch_selenium(driver, url, scroll_count=0):
+    try:
+        driver.get(url)
+        time.sleep(3)
+        if scroll_count > 0:
+            for i in range(scroll_count):
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(1.5)
+        return driver.page_source
+    except: return None
 
 # =========================================================
-#             PART 4: AI LOGIC (Search Aware)
+#             PART 4: INTELLIGENCE (Dynamic)
 # =========================================================
-def agent_analyze_structure(html_content, current_url, provider, key, mode):
+def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
     if len(html_content) < 500: return None
     
-    # Custom prompt based on mode
-    task_prompt = "2. Identify the 'Next Page' CLICKABLE ELEMENT (Link or Button)."
-    if mode == "Active Search Injection (Brute Force)":
-        task_prompt = "2. Identify the CSS Selector for the SEARCH INPUT BOX (for names).\n3. Identify the CSS Selector for the SEARCH SUBMIT BUTTON."
+    # Dynamic Prompt Construction
+    if task_type == "SEARCH_BOX":
+        task_desc = """
+        2. Identify the CSS Selector for the SEARCH INPUT BOX.
+        3. Identify the CSS Selector for the SEARCH SUBMIT BUTTON.
+        """
+        json_desc = '"search_input": "input[name=q]", "search_button": "button[type=submit]"'
+    else:
+        task_desc = """
+        2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT (Link or Button).
+        3. CHECK PAGINATION: Look for 'Page 1 of X'. Extract TOTAL PAGES.
+        """
+        json_desc = '"next_element": "a.next", "total_pages": 50'
 
     prompt = f"""
     You are a web scraping expert. Analyze the HTML from {current_url}.
     
-    1. Identify the CSS Selector for NAMES (alumni/people).
-    {task_prompt}
+    1. Identify the CSS Selector for NAMES.
+    {task_desc}
     
     Return JSON:
     {{
       "names": ["Name 1", "Name 2"],
       "selectors": {{
-         "name_element": "e.g. div.alumni-name",
-         "next_element": "e.g. a.next-page",
-         "search_input": "e.g. input[name='q']",
-         "search_button": "e.g. button[type='submit']"
-      }}
+         "name_element": "div.alumni-name",
+         {json_desc}
+      }},
+      "navigation": {{ "type": "LINK" or "FORM", "url": "...", "form_data": {{...}} }}
     }}
+    
     HTML:
     {clean_html_for_ai(html_content)} 
     """
+    
     for _ in range(2): 
         raw = call_ai_api(prompt, provider, key)
         if raw: return json.loads(clean_json_response(raw))
         time.sleep(1)
     return None
+
+def fast_extract_mode(html_content, selectors):
+    soup = BeautifulSoup(html_content, "html.parser")
+    extracted_names = []
+    
+    if selectors.get("name_element"):
+        elements = soup.select(selectors["name_element"])
+        for el in elements: extracted_names.append(el.get_text(strip=True))
+            
+    nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
+    next_selector = selectors.get("next_element") or selectors.get("next_link")
+    
+    if next_selector:
+        element = soup.select_one(next_selector)
+        if element:
+            if element.name == "a" and element.get("href"):
+                nav_result["type"] = "LINK"
+                nav_result["next_url"] = element.get("href")
+            elif element.name in ["input", "button"]:
+                parent_form = element.find_parent("form")
+                if parent_form:
+                    nav_result["type"] = "FORM"
+                    form_data = {}
+                    for inp in parent_form.find_all("input"):
+                        if inp.get("name"): form_data[inp.get("name")] = inp.get("value", "")
+                    if element.get("name"): form_data[element.get("name")] = element.get("value", "")
+                    nav_result["form_data"] = form_data
+                    if parent_form.get("action"): nav_result["next_url"] = parent_form.get("action")
+
+    return {"names": extracted_names, "nav": nav_result}
 
 def match_names_detailed(names, source):
     found = []
@@ -195,15 +261,15 @@ def match_names_detailed(names, source):
         
         rank_f, rank_l = first_name_ranks.get(f, 0), surname_ranks.get(l, 0)
         
-        # Scoring
         score = 0
         if rank_f > 0: score += ((limit_first - rank_f)/limit_first)*50
         if rank_l > 0: score += ((limit_surname - rank_l)/limit_surname)*50
         
         if score > 0:
+            m_type = "Strong" if (rank_f > 0 and rank_l > 0) else ("First Only" if rank_f > 0 else "Surname Only")
             found.append({
                 "Full Name": n, "Brazil Score": round(score, 1),
-                "Source": source
+                "Match Type": m_type, "Source": source
             })
     return found
 
@@ -213,129 +279,218 @@ def match_names_detailed(names, source):
 st.markdown("### 🤖 Auto-Pilot Control Center")
 c1, c2 = st.columns([3, 1])
 start_url = c1.text_input("Target URL", placeholder="https://directory.example.com")
-max_cycles = c2.number_input("Max Search Cycles", 1, 500, 10)
+max_pages = c2.number_input("Max Pages / Search Cycles", 1, 500, 10)
 
 st.write("---")
-mode = st.radio("Scraping Strategy:", [
-    "Classic Pagination (Read list page by page)",
-    "Active Search Injection (Brute Force Top Surnames)"
+st.subheader("🛠️ Strategy Selection")
+
+# 3-WAY MODE SELECTION
+mode = st.radio("Choose Operation Mode:", [
+    "Classic Directory (Native/Fast)",
+    "Infinite Scroller (Selenium)",
+    "Active Search Injection (Brute Force Surnames)"
 ])
 
-# Toggle Headless Mode for CAPTCHA solving
-run_headless = st.checkbox("Run in Background (Headless)", value=True, help="Uncheck this to see the browser popup. Useful if you need to solve a CAPTCHA manually.")
+# Conditional Controls
+run_headless = True
+scroll_depth = 0
+
+if "Infinite" in mode:
+    if not HAS_SELENIUM: st.error("❌ Selenium required."); st.stop()
+    scroll_depth = st.slider("Scroll Depth", 1, 20, 3)
+
+if "Search Injection" in mode:
+    if not HAS_SELENIUM: st.error("❌ Selenium required."); st.stop()
+    run_headless = st.checkbox("Run in Background (Headless)", value=True, help="Uncheck to solve CAPTCHAs manually.")
 
 if st.button("🚀 Start Mission", type="primary"):
     if not api_key: st.error("Missing API Key"); st.stop()
-    if not HAS_SELENIUM: st.error("Selenium required."); st.stop()
 
     status_log = st.status("Initializing...", expanded=True)
     table_placeholder = st.empty()
     all_matches = []
-    
-    # LAUNCH BROWSER
-    driver = get_driver(headless=run_headless)
-    status_log.write("🔧 Browser Launched")
-    
-    # STATE
-    driver.get(start_url)
-    time.sleep(3)
-    
     learned_selectors = None
     
-    # --- SEARCH INJECTION LOOP ---
-    if "Active Search" in mode:
-        # 1. Analyze Page ONCE to find Search Box
-        status_log.write("🧠 Analyzing Search Form...")
-        html = driver.page_source
-        data = agent_analyze_structure(html, start_url, ai_provider, api_key, mode)
+    # ----------------------------------------------------
+    # BRANCH A: CLASSIC & INFINITE (Pagination/Scroll)
+    # ----------------------------------------------------
+    if "Search Injection" not in mode:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"})
+        
+        driver = None
+        if "Infinite" in mode: driver = get_driver(headless=True)
+        
+        current_url = start_url
+        next_method, next_data = "GET", None
+        visited_fps = set()
+        detected_limit = None
+        
+        page = 0
+        while page < max_pages:
+            page += 1
+            if detected_limit and page > detected_limit: break
+            status_log.update(label=f"Scanning Page {page}...", state="running")
+            
+            # Fetch
+            raw_html = None
+            try:
+                if "Classic" in mode:
+                    resp = fetch_native(session, current_url, next_method, next_data)
+                    if resp and resp.status_code == 200: raw_html = resp.text
+                else:
+                    raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
+            except: pass
+            
+            if not raw_html: break
+
+            # Extract (Fast or AI)
+            names, nav_data, ai_needed = [], {}, True
+            
+            if learned_selectors:
+                status_log.write("⚡ Using Fast Template")
+                fast_res = fast_extract_mode(raw_html, learned_selectors)
+                names = fast_res["names"]
+                nav_res = fast_res["nav"]
+                
+                if len(names) > 0 and nav_res["type"] != "NONE":
+                    ai_needed = False
+                    # Apply Fast Nav
+                    if nav_res["type"] == "LINK":
+                        l = nav_res["next_url"]
+                        current_url = urljoin(current_url, l) if "http" not in l else l
+                        next_method, next_data = "GET", None
+                    elif nav_res["type"] == "FORM":
+                        next_method, next_data = "POST", nav_res["form_data"]
+                        if nav_res.get("next_url"): 
+                            act = nav_res["next_url"]
+                            current_url = urljoin(current_url, act) if "http" not in act else act
+                elif len(names) == 0: ai_needed = True # Re-learn
+            
+            if ai_needed:
+                if not learned_selectors: status_log.write(f"🧠 {ai_provider.split()[0]} Analyzing...")
+                data = agent_analyze_page(raw_html, current_url, ai_provider, api_key, "PAGINATION")
+                
+                if data:
+                    names = data.get("names", [])
+                    selectors = data.get("selectors", {})
+                    nav_data = data.get("navigation", {})
+                    if not detected_limit and data.get("total_pages"):
+                         try: detected_limit = int(data["total_pages"]); status_log.info(f"Limit: {detected_limit}")
+                         except: pass
+                    if selectors.get("name_element"): learned_selectors = selectors
+                else: break
+
+            # Match & Display
+            matches = match_names_detailed(names, f"Page {page}")
+            if matches:
+                all_matches.extend(matches)
+                all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
+                status_log.write(f"✅ Found {len(matches)} matches.")
+            else: status_log.write("🤷 No matches.")
+
+            # AI Navigation (Fallback)
+            if ai_needed and "Classic" in mode:
+                ntype = nav_data.get("type", "NONE")
+                if ntype == "LINK" and nav_data.get("url"):
+                    l = nav_data["url"]
+                    current_url = urljoin(current_url, l) if "http" not in l else l
+                    next_method, next_data = "GET", None
+                elif ntype == "FORM" and nav_data.get("form_data"):
+                    next_method, next_data = "POST", nav_data["form_data"]
+                    fp = str(next_data)
+                    if fp in visited_fps: break
+                    visited_fps.add(fp)
+                else: break
+            elif ai_needed and "Infinite" in mode: break
+            
+            time.sleep(1.5)
+        
+        if driver: driver.quit()
+
+    # ----------------------------------------------------
+    # BRANCH B: SEARCH INJECTION (Brute Force)
+    # ----------------------------------------------------
+    else:
+        driver = get_driver(headless=run_headless)
+        status_log.write("🔧 Browser Launched")
+        driver.get(start_url)
+        time.sleep(3)
+        
+        # 1. Find Search Box (AI)
+        status_log.write("🧠 Locating Search Input...")
+        data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
         
         if not data or not data.get("selectors", {}).get("search_input"):
-            status_log.error("❌ Could not find search box. Is the page loaded?")
-            driver.quit()
-            st.stop()
+            status_log.error("❌ Could not find search box.")
+            driver.quit(); st.stop()
             
-        selectors = data["selectors"]
-        search_selector = selectors["search_input"]
-        btn_selector = selectors.get("search_button")
+        sel_input = data["selectors"]["search_input"]
+        sel_btn = data["selectors"].get("search_button")
         
-        status_log.success(f"🎯 Target Acquired: {search_selector}")
-        
-        # 2. Iterate Surnames
-        for i, surname in enumerate(sorted_surnames[:max_cycles]):
-            status_log.update(label=f"Searching for '{surname}' ({i+1}/{max_cycles})", state="running")
-            
+        # 2. Loop Surnames
+        for i, surname in enumerate(sorted_surnames[:max_pages]):
+            status_log.update(label=f"Checking '{surname}' ({i+1}/{max_pages})", state="running")
             try:
-                # Find Input & Clear
-                inp = driver.find_element(By.CSS_SELECTOR, search_selector)
+                inp = driver.find_element(By.CSS_SELECTOR, sel_input)
                 inp.clear()
-                # Human-like typing delay
-                for char in surname:
-                    inp.send_keys(char)
-                    time.sleep(random.uniform(0.05, 0.2))
-                
+                for ch in surname: inp.send_keys(ch); time.sleep(random.uniform(0.05, 0.15))
                 time.sleep(0.5)
                 
-                # Submit (Click button OR press Enter)
-                if btn_selector:
-                    try:
-                        driver.find_element(By.CSS_SELECTOR, btn_selector).click()
+                if sel_btn:
+                    try: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
                     except: inp.send_keys(Keys.RETURN)
-                else:
-                    inp.send_keys(Keys.RETURN)
+                else: inp.send_keys(Keys.RETURN)
                 
-                time.sleep(3) # Wait for results
+                time.sleep(3)
                 
-                # CAPTCHA CHECK
-                if check_for_captcha(driver):
-                    status_log.warning("⚠️ CAPTCHA DETECTED!")
-                    if run_headless:
-                        status_log.error("Cannot solve CAPTCHA in Headless mode. Restart with 'Run in Background' unchecked.")
-                        break
-                    else:
-                        st.warning("CAPTCHA detected in browser! Please solve it manually.")
-                        time.sleep(15) # Wait for human
+                # Manual CAPTCHA Pause
+                if "captcha" in driver.page_source.lower():
+                     if not run_headless:
+                         status_log.warning("⚠️ CAPTCHA! Solve it manually now.")
+                         time.sleep(15)
                 
-                # SCRAPE RESULTS
-                # We reuse the "names" logic from the AI response logic here simply
-                # Or use the learned "name_element" if we have it
-                
+                # Extract Results
+                soup = BeautifulSoup(driver.page_source, "html.parser")
+                # Reuse learned name selector if available, else learn it
                 if not learned_selectors:
-                    # Learn Name pattern on first successful result
-                    res_data = agent_analyze_structure(driver.page_source, start_url, ai_provider, api_key, "Classic")
+                    res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
                     if res_data and res_data.get("selectors", {}).get("name_element"):
                         learned_selectors = res_data["selectors"]
                 
-                # Fast Extract
+                current_names = []
                 if learned_selectors:
-                    soup = BeautifulSoup(driver.page_source, "html.parser")
                     els = soup.select(learned_selectors["name_element"])
-                    names = [e.get_text(strip=True) for e in els]
-                    
-                    matches = match_names_detailed(names, f"Search: {surname}")
-                    if matches:
-                        all_matches.extend(matches)
-                        all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                        table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                        status_log.write(f"✅ '{surname}': Found {len(matches)} people.")
-                    else:
-                        status_log.write(f"🤷 '{surname}': No matches.")
-
-                # GO BACK (Important!)
+                    current_names = [e.get_text(strip=True) for e in els]
+                
+                matches = match_names_detailed(current_names, f"Search: {surname}")
+                if matches:
+                    all_matches.extend(matches)
+                    all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                    table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
+                    status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
+                
                 driver.get(start_url)
-                time.sleep(2)
+                time.sleep(1.5)
                 
             except Exception as e:
-                status_log.error(f"Error searching {surname}: {e}")
                 driver.get(start_url)
-                
-    # --- CLASSIC LOOP (Simplified for this example) ---
-    else:
-        # (The previous Pagination Logic would go here)
-        status_log.write("Run the previous code for Pagination Mode.")
+        
+        driver.quit()
 
-    driver.quit()
+    # ----------------------------------------------------
+    # OUTPUT
+    # ----------------------------------------------------
     status_log.update(label="Mission Complete!", state="complete")
-    
     if all_matches:
         df = pd.DataFrame(all_matches)
-        st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "results.csv")
+        c1, c2 = st.columns(2)
+        with c1: st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "results.csv")
+        with c2: 
+            try:
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    df.to_excel(writer, index=False, sheet_name='Sheet1')
+                st.download_button("📥 Download Excel", buffer, "results.xlsx")
+            except: st.info("Install 'xlsxwriter' for Excel.")
