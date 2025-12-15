@@ -503,10 +503,19 @@ if st.session_state.running:
                     except: inp.send_keys(Keys.RETURN)
                 else: inp.send_keys(Keys.RETURN)
                 
-                # --- WAITING LOGIC (THE FIX) ---
-                time.sleep(search_delay)
+                # --- WAITING LOGIC (VISUAL COUNTDOWN) ---
+                status_log.write(f"⏳ Waiting {search_delay}s for results to load...")
+                
+                # Scroll a bit to trigger lazy loading
                 try: driver.execute_script("window.scrollTo(0, 300)")
                 except: pass
+                
+                # Visual countdown bar
+                progress_bar = table_placeholder.progress(0)
+                for t in range(search_delay):
+                    time.sleep(1)
+                    progress_bar.progress((t + 1) / search_delay)
+                progress_bar.empty() # Clear bar when done
                 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 if manual_name_selector: learned_selectors = {"name_element": manual_name_selector}
