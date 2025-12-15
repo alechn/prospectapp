@@ -6,3 +6,4 @@ unidecode
 beautifulsoup4
 selenium
 webdriver-manager
+xlsxwriter
