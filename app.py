@@ -12,7 +12,7 @@ from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# --- SELENIUM SETUP ---
+# --- SELENIUM IMPORT SAFETY ---
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -26,16 +26,17 @@ except ImportError:
     HAS_SELENIUM = False
 
 # =========================================================
-#             PART 0: CONFIGURATION
+#             PART 0: CONFIGURATION & SETUP
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
 st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
+# --- SESSION STATE (Abort Logic) ---
 if "running" not in st.session_state:
     st.session_state.running = False
 
-# --- SIDEBAR ---
+# --- SIDEBAR: AI BRAIN ---
 st.sidebar.header("🧠 AI Brain")
 ai_provider = st.sidebar.selectbox(
     "Choose your Model:",
@@ -43,6 +44,7 @@ ai_provider = st.sidebar.selectbox(
 )
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
+# --- ABORT & DEBUG ---
 st.sidebar.markdown("---")
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q'] or #search")
@@ -152,7 +154,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS (THE FIX)
+#             PART 3: DRIVERS (THE CLOUD/LOCAL FIX)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -162,7 +164,6 @@ def fetch_native(session, url, method="GET", data=None):
 
 def get_driver(headless=True):
     if not HAS_SELENIUM: return None
-    
     options = Options()
     
     # 1. MANDATORY FLAGS FOR CLOUD
@@ -193,13 +194,6 @@ def get_driver(headless=True):
             
     except Exception as e:
         st.error(f"❌ Driver Error: {e}")
-        # DEBUG: Print what paths exist so we know what's wrong
-        st.code(f"""
-        Debug Info:
-        OS: {os.name}
-        Chromium Exists: {os.path.exists('/usr/bin/chromium')}
-        Driver Exists: {os.path.exists('/usr/bin/chromedriver')}
-        """)
         return None
 
 def fetch_selenium(driver, url, scroll_count=0):
@@ -351,7 +345,7 @@ if st.session_state.running:
     learned_selectors = None
     
     # ----------------------------------------------------
-    # BRANCH A: PAGINATION
+    # BRANCH A: PAGINATION & SCROLLING
     # ----------------------------------------------------
     if "Search Injection" not in mode:
         session = requests.Session()
@@ -447,41 +441,57 @@ if st.session_state.running:
         if driver: driver.quit()
 
     # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION
+    # BRANCH B: SEARCH INJECTION (Robust Fallbacks)
     # ----------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
         if not driver: status_log.error("Aborted: Driver failed."); st.stop()
         
         status_log.write("🔧 Browser Launched")
-        try: driver.get(start_url)
-        except: status_log.error("Could not load URL"); driver.quit(); st.stop()
+        try: 
+            driver.get(start_url)
+            time.sleep(5) # Wait for redirects/loading
+        except: 
+            status_log.error("Could not load URL"); driver.quit(); st.stop()
         
-        time.sleep(3)
         status_log.write("🧠 Finding Search Box...")
         
-        # --- SCREENSHOT DEBUG ---
+        # DEBUG VIEW
         screenshot = driver.get_screenshot_as_png()
-        with st.sidebar.expander("📸 Page Screenshot", expanded=False):
+        with st.sidebar.expander("📸 Debug View", expanded=True):
             st.image(screenshot)
         
-        # --- MANUAL OVERRIDE ---
         sel_input = None
         sel_btn = None
         
+        # 1. Manual Override
         if manual_search_selector:
-            status_log.warning(f"⚠️ Manual Selector: {manual_search_selector}")
             sel_input = manual_search_selector
-        else:
+            
+        # 2. AI Search
+        if not sel_input:
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
                 sel_input = data["selectors"]["search_input"]
                 sel_btn = data["selectors"].get("search_button")
         
+        # 3. Standard Fallbacks
         if not sel_input:
-            status_log.error("❌ Could not find search box.")
+            status_log.write("⚠️ Trying standard selectors...")
+            fallbacks = ["input[type='search']", "input[name='q']", "input[name='query']", "input[placeholder*='Search']", "input[aria-label='Search']"]
+            for f in fallbacks:
+                try:
+                    if driver.find_elements(By.CSS_SELECTOR, f):
+                        sel_input = f
+                        status_log.success(f"🎯 Found via fallback: {f}")
+                        break
+                except: continue
+        
+        if not sel_input:
+            status_log.error("❌ Search box not found. Check Debug View.")
             driver.quit(); st.stop()
             
+        # LOOP SURNAMES
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
             status_log.update(label=f"Checking '{surname}' ({i+1}/{max_pages})", state="running")
@@ -499,14 +509,13 @@ if st.session_state.running:
                 time.sleep(3)
                 
                 if "captcha" in driver.page_source.lower() and not run_headless:
-                     status_log.warning("⚠️ CAPTCHA! Manual solve required.")
+                     status_log.warning("⚠️ CAPTCHA detected.")
                      time.sleep(15)
                 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 
-                if manual_name_selector:
-                    learned_selectors = {"name_element": manual_name_selector}
-                    
+                if manual_name_selector: learned_selectors = {"name_element": manual_name_selector}
+                
                 if not learned_selectors:
                     res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
                     if res_data and res_data.get("selectors", {}).get("name_element"):
@@ -524,9 +533,11 @@ if st.session_state.running:
                     table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
                     status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
                 
-                driver.get(start_url)
-                time.sleep(1.5)
-            except: driver.get(start_url)
+                # Go Back Safely
+                try: driver.execute_script("window.history.go(-1)"); time.sleep(2)
+                except: driver.get(start_url); time.sleep(2)
+                
+            except: driver.get(start_url); time.sleep(2)
         
         driver.quit()
 
