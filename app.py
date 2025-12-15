@@ -44,8 +44,11 @@ ai_provider = st.sidebar.selectbox(
 )
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
-# --- ABORT & DEBUG ---
+# --- WAIT TIME SLIDER (THE FIX) ---
 st.sidebar.markdown("---")
+search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 3, 30, 8, help="Increase this if the bot returns 0 results. Gives the site time to load data.")
+
+# --- ABORT & DEBUG ---
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q'] or #search")
     manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. div.alumni-name")
@@ -180,7 +183,6 @@ def get_driver(headless=True):
         # CHECK: Are we on Streamlit Cloud (Linux)?
         if os.name == 'posix':
             # Force use of the system-installed driver (from packages.txt)
-            # This prevents "SessionNotCreated" caused by version mismatch
             return webdriver.Chrome(
                 service=Service("/usr/bin/chromedriver"), 
                 options=options
@@ -450,13 +452,12 @@ if st.session_state.running:
         status_log.write("🔧 Browser Launched")
         try: 
             driver.get(start_url)
-            time.sleep(5) # Wait for redirects/loading
+            time.sleep(5) 
         except: 
             status_log.error("Could not load URL"); driver.quit(); st.stop()
         
         status_log.write("🧠 Finding Search Box...")
         
-        # DEBUG VIEW
         screenshot = driver.get_screenshot_as_png()
         with st.sidebar.expander("📸 Debug View", expanded=True):
             st.image(screenshot)
@@ -464,18 +465,15 @@ if st.session_state.running:
         sel_input = None
         sel_btn = None
         
-        # 1. Manual Override
         if manual_search_selector:
             sel_input = manual_search_selector
             
-        # 2. AI Search
         if not sel_input:
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
                 sel_input = data["selectors"]["search_input"]
                 sel_btn = data["selectors"].get("search_button")
         
-        # 3. Standard Fallbacks
         if not sel_input:
             status_log.write("⚠️ Trying standard selectors...")
             fallbacks = ["input[type='search']", "input[name='q']", "input[name='query']", "input[placeholder*='Search']", "input[aria-label='Search']"]
@@ -491,7 +489,6 @@ if st.session_state.running:
             status_log.error("❌ Search box not found. Check Debug View.")
             driver.quit(); st.stop()
             
-        # LOOP SURNAMES
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
             status_log.update(label=f"Checking '{surname}' ({i+1}/{max_pages})", state="running")
@@ -506,14 +503,12 @@ if st.session_state.running:
                     except: inp.send_keys(Keys.RETURN)
                 else: inp.send_keys(Keys.RETURN)
                 
-                time.sleep(3)
-                
-                if "captcha" in driver.page_source.lower() and not run_headless:
-                     status_log.warning("⚠️ CAPTCHA detected.")
-                     time.sleep(15)
+                # --- WAITING LOGIC (THE FIX) ---
+                time.sleep(search_delay)
+                try: driver.execute_script("window.scrollTo(0, 300)")
+                except: pass
                 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
-                
                 if manual_name_selector: learned_selectors = {"name_element": manual_name_selector}
                 
                 if not learned_selectors:
@@ -533,7 +528,6 @@ if st.session_state.running:
                     table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
                     status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
                 
-                # Go Back Safely
                 try: driver.execute_script("window.history.go(-1)"); time.sleep(2)
                 except: driver.get(start_url); time.sleep(2)
                 
