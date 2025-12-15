@@ -6,6 +6,7 @@ import re
 import requests
 import io
 import random
+import os
 from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -30,6 +31,10 @@ st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_ico
 st.title("🕵️ Universal Brazilian Alumni Finder")
 st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
+# --- SESSION STATE INITIALIZATION (For Abort Logic) ---
+if "running" not in st.session_state:
+    st.session_state.running = False
+
 # --- SIDEBAR: AI BRAIN ---
 st.sidebar.header("🧠 AI Brain")
 ai_provider = st.sidebar.selectbox(
@@ -37,6 +42,13 @@ ai_provider = st.sidebar.selectbox(
     ["Google Gemini (Flash 2.0)", "OpenAI (GPT-4o)", "Anthropic (Claude 3.5)", "DeepSeek (V3)"]
 )
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
+
+# --- ABORT BUTTON (Always visible) ---
+st.sidebar.markdown("---")
+if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
+    st.session_state.running = False
+    st.sidebar.warning("Mission Aborted by User.")
+    st.stop()
 
 # --- BLOCKLIST (Anti-False Positive) ---
 BLOCKLIST_SURNAMES = {
@@ -146,7 +158,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS & ENGINES
+#             PART 3: DRIVERS & ENGINES (FIXED)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -157,12 +169,29 @@ def fetch_native(session, url, method="GET", data=None):
 def get_driver(headless=True):
     if not HAS_SELENIUM: return None
     options = Options()
-    if headless: options.add_argument("--headless")
+    
+    # CRITICAL FIX FOR STREAMLIT CLOUD
+    if headless:
+        options.add_argument("--headless")
+    
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
+    
+    try:
+        # 1. Try installing matching driver (Best for Local/Windows)
+        return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
+    except Exception as e:
+        # 2. Fallback to System Driver (Best for Streamlit Cloud/Linux)
+        # Streamlit Cloud installs binaries at /usr/bin/chromium and /usr/bin/chromedriver
+        try:
+            options.binary_location = "/usr/bin/chromium"
+            service = Service("/usr/bin/chromedriver")
+            return webdriver.Chrome(service=service, options=options)
+        except Exception as e2:
+            st.error(f"❌ Driver Error. Ensure 'packages.txt' contains 'chromium' and 'chromium-driver'.\nDetails: {e2}")
+            return None
 
 def fetch_selenium(driver, url, scroll_count=0):
     try:
@@ -304,6 +333,10 @@ if "Search Injection" in mode:
     run_headless = st.checkbox("Run in Background (Headless)", value=True, help="Uncheck to solve CAPTCHAs manually.")
 
 if st.button("🚀 Start Mission", type="primary"):
+    st.session_state.running = True
+
+# --- MISSION EXECUTION LOOP ---
+if st.session_state.running:
     if not api_key: st.error("Missing API Key"); st.stop()
 
     status_log = st.status("Initializing...", expanded=True)
@@ -327,7 +360,7 @@ if st.button("🚀 Start Mission", type="primary"):
         detected_limit = None
         
         page = 0
-        while page < max_pages:
+        while page < max_pages and st.session_state.running:
             page += 1
             if detected_limit and page > detected_limit: break
             status_log.update(label=f"Scanning Page {page}...", state="running")
@@ -431,6 +464,7 @@ if st.button("🚀 Start Mission", type="primary"):
         
         # 2. Loop Surnames
         for i, surname in enumerate(sorted_surnames[:max_pages]):
+            if not st.session_state.running: break
             status_log.update(label=f"Checking '{surname}' ({i+1}/{max_pages})", state="running")
             try:
                 inp = driver.find_element(By.CSS_SELECTOR, sel_input)
@@ -453,7 +487,6 @@ if st.button("🚀 Start Mission", type="primary"):
                 
                 # Extract Results
                 soup = BeautifulSoup(driver.page_source, "html.parser")
-                # Reuse learned name selector if available, else learn it
                 if not learned_selectors:
                     res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
                     if res_data and res_data.get("selectors", {}).get("name_element"):
@@ -483,6 +516,8 @@ if st.button("🚀 Start Mission", type="primary"):
     # OUTPUT
     # ----------------------------------------------------
     status_log.update(label="Mission Complete!", state="complete")
+    st.session_state.running = False # Reset state
+    
     if all_matches:
         df = pd.DataFrame(all_matches)
         c1, c2 = st.columns(2)
