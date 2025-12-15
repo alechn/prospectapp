@@ -426,7 +426,7 @@ if st.session_state.running:
         if driver: driver.quit()
 
 # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (Bulletproof Typing)
+    # BRANCH B: SEARCH INJECTION (Smart Re-Learning)
     # ----------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
@@ -439,7 +439,7 @@ if st.session_state.running:
         except: 
             status_log.error("Could not load URL"); driver.quit(); st.stop()
         
-        # --- POPUP KILLER (Try to close cookie banners) ---
+        # --- POPUP KILLER ---
         try:
             driver.execute_script("""
                 const buttons = document.querySelectorAll('button, a');
@@ -458,8 +458,7 @@ if st.session_state.running:
         sel_input = None
         sel_btn = None
         
-        if manual_search_selector:
-            sel_input = manual_search_selector
+        if manual_search_selector: sel_input = manual_search_selector
         
         if not sel_input:
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
@@ -490,43 +489,29 @@ if st.session_state.running:
             status_log.update(label=f"🔎 Checking '{surname}' ({i+1}/{max_pages})", state="running")
             search_success = False
             
-            # --- 1. ROBUST INTERACTION PHASE ---
+            # --- 1. INTERACTION ---
             try:
-                # Find Fresh
                 inp = driver.find_element(By.CSS_SELECTOR, sel_input)
+                # Strategy C: JS Injection (Most Reliable)
+                driver.execute_script(f"arguments[0].value = '{surname}';", inp)
                 
-                # STRATEGY A: Standard Typing
-                try:
-                    inp.clear()
-                    inp.send_keys(surname)
-                    time.sleep(0.5)
-                    inp.send_keys(Keys.RETURN)
-                    search_success = True
-                except:
-                    # STRATEGY B: Click First (Focus)
-                    try:
-                        driver.execute_script("arguments[0].click();", inp)
-                        inp.clear()
-                        inp.send_keys(surname)
-                        inp.send_keys(Keys.RETURN)
-                        search_success = True
+                # Try hitting Enter key first
+                try: inp.send_keys(Keys.RETURN)
+                except: 
+                    # Try submitting form
+                    try: inp.submit()
                     except:
-                        # STRATEGY C: JavaScript Injection (Force Value)
-                        try:
-                            driver.execute_script(f"arguments[0].value = '{surname}';", inp)
-                            # Force submit via form if possible
-                            try: inp.submit()
-                            except: inp.send_keys(Keys.RETURN)
-                            search_success = True
-                        except:
-                            raise Exception("All typing methods failed.")
+                        # Try clicking button
+                        if sel_btn: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
+                
+                search_success = True
                 
             except Exception as e:
                 status_log.warning(f"⚠️ Failed to type '{surname}'. Reloading...")
                 driver.get(start_url)
                 time.sleep(3)
 
-            # --- 2. GUARANTEED WAIT & SCRAPE PHASE ---
+            # --- 2. WAIT & SCRAPE ---
             if search_success:
                 # PROGRESS BAR
                 prog_bar = table_placeholder.progress(0)
@@ -540,28 +525,46 @@ if st.session_state.running:
                     prog_bar.progress(current_val)
                 prog_bar.empty()
 
+                # --- DEBUG SCREENSHOT (Critical) ---
+                screenshot = driver.get_screenshot_as_png()
+                with st.sidebar.expander(f"📸 Results: {surname}", expanded=True):
+                    st.image(screenshot, caption=f"Screen after waiting for {surname}")
+
                 # Extract
                 try:
                     soup = BeautifulSoup(driver.page_source, "html.parser")
-                    if not learned_selectors:
-                        if manual_name_selector: 
-                            learned_selectors = {"name_element": manual_name_selector}
-                        else:
-                            res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
-                            if res_data and res_data.get("selectors", {}).get("name_element"):
-                                learned_selectors = res_data["selectors"]
+                    
+                    # RE-LEARN Logic: If we haven't found names yet, ask AI NOW (using the results page)
+                    if not learned_selectors and not manual_name_selector:
+                        status_log.write(f"🧠 Analyzing Results Page Structure...")
+                        res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
+                        if res_data and res_data.get("selectors", {}).get("name_element"):
+                            learned_selectors = res_data["selectors"]
+                            status_log.success(f"🎓 Learned Name Selector: {learned_selectors['name_element']}")
+
+                    # Manual Override Check
+                    if manual_name_selector: 
+                        learned_selectors = {"name_element": manual_name_selector}
                     
                     current_names = []
                     if learned_selectors:
                         els = soup.select(learned_selectors["name_element"])
                         current_names = [e.get_text(strip=True) for e in els]
                     
-                    matches = match_names_detailed(current_names, f"Search: {surname}")
-                    if matches:
-                        all_matches.extend(matches)
-                        all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                        table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                        status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
+                    if current_names:
+                        matches = match_names_detailed(current_names, f"Search: {surname}")
+                        if matches:
+                            all_matches.extend(matches)
+                            all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                            table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
+                            status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
+                    else:
+                        # Basic Text Check (Fallback)
+                        if surname.upper() in soup.get_text().upper():
+                            status_log.warning(f"⚠️ I see '{surname}' on page, but couldn't extract clean names. Try Manual Selector.")
+                        else:
+                            status_log.write(f"🤷 No results found for '{surname}'.")
+                            
                 except: pass
 
                 # Reset
