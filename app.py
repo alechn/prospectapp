@@ -7,11 +7,12 @@ import requests
 import io
 import random
 import os
+import shutil
 from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# --- SELENIUM SETUP ---
+# --- SELENIUM IMPORT SAFETY ---
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -31,10 +32,6 @@ st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_ico
 st.title("🕵️ Universal Brazilian Alumni Finder")
 st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
-# --- SESSION STATE INITIALIZATION (For Abort Logic) ---
-if "running" not in st.session_state:
-    st.session_state.running = False
-
 # --- SIDEBAR: AI BRAIN ---
 st.sidebar.header("🧠 AI Brain")
 ai_provider = st.sidebar.selectbox(
@@ -43,11 +40,11 @@ ai_provider = st.sidebar.selectbox(
 )
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
-# --- ABORT BUTTON (Always visible) ---
+# --- ABORT BUTTON ---
+if "running" not in st.session_state: st.session_state.running = False
 st.sidebar.markdown("---")
 if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.session_state.running = False
-    st.sidebar.warning("Mission Aborted by User.")
     st.stop()
 
 # --- BLOCKLIST (Anti-False Positive) ---
@@ -68,14 +65,12 @@ def call_ai_api(prompt, provider, key):
     headers = {"Content-Type": "application/json"}
     
     try:
-        # GEMINI
         if "Gemini" in provider:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
             
-        # OPENAI
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -83,7 +78,6 @@ def call_ai_api(prompt, provider, key):
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
             
-        # ANTHROPIC
         elif "Anthropic" in provider:
             url = "https://api.anthropic.com/v1/messages"
             headers["x-api-key"] = key
@@ -92,7 +86,6 @@ def call_ai_api(prompt, provider, key):
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
             
-        # DEEPSEEK
         elif "DeepSeek" in provider:
             url = "https://api.deepseek.com/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -147,7 +140,7 @@ def fetch_ibge_data(limit_first, limit_surname):
         return data_map
     return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
 
-st.sidebar.header("⚙️ Search Settings")
+st.sidebar.header("⚙️ Settings")
 limit_first = st.sidebar.number_input("DB: First Names", 100, 20000, 3000, 100)
 limit_surname = st.sidebar.number_input("DB: Surnames", 100, 20000, 3000, 100)
 
@@ -158,7 +151,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS & ENGINES (FIXED)
+#             PART 3: DRIVERS (THE NUCLEAR FIX)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -171,39 +164,39 @@ def get_driver(headless=True):
     
     options = Options()
     
-    # 1. VISIBLE MODE (Local) vs HEADLESS (Cloud)
-    # Streamlit Cloud MUST be headless or it crashes
-    if headless:
-        options.add_argument("--headless=new") 
-    
-    # 2. CRITICAL FLAGS FOR CLOUD STABILITY
+    # 1. CRITICAL CLOUD FLAGS
+    if headless: options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080") # Prevents some "element not found" errors
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
     
-    # 3. ATTEMPT TO CONNECT
+    # 2. INTELLIGENT PATH DETECTION
+    chromium_path = "/usr/bin/chromium"
+    chromedriver_path = "/usr/bin/chromedriver"
+    
+    # If not at standard location, check system path
+    if not os.path.exists(chromium_path):
+        chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
+    if not os.path.exists(chromedriver_path):
+        chromedriver_path = shutil.which("chromedriver")
+
     try:
-        # METHOD A: LOCAL (Windows/Mac) - Uses webdriver_manager
-        # We try this ONLY if we are NOT on Linux (simplistic check) or if Method B fails
-        if os.name != 'posix': 
+        # METHOD A: EXPLICIT PATHS (Cloud/Linux)
+        if chromium_path and chromedriver_path:
+            options.binary_location = chromium_path
+            service = Service(chromedriver_path)
+            return webdriver.Chrome(service=service, options=options)
+            
+        # METHOD B: AUTOMATIC (Local/Windows/Mac)
+        else:
             return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
             
-        # METHOD B: STREAMLIT CLOUD (Linux) - Uses system binaries
-        # This is where your error is happening. We explicitly point to the packages you installed.
-        options.binary_location = "/usr/bin/chromium"
-        service = Service("/usr/bin/chromedriver")
-        return webdriver.Chrome(service=service, options=options)
-        
     except Exception as e:
-        # Fallback: If Method B failed on Linux, try Method A as a last resort
-        try:
-             return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
-        except Exception as e2:
-            st.error(f"❌ CRITICAL DRIVER ERROR: {e2}")
-            st.code("Ensure 'packages.txt' contains:\nchromium\nchromium-driver")
-            return None
+        st.error(f"❌ Driver Error: {e}")
+        st.code("Ensure 'packages.txt' contains:\nchromium\nchromium-driver")
+        return None
 
 def fetch_selenium(driver, url, scroll_count=0):
     try:
@@ -217,12 +210,11 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE (Dynamic)
+#             PART 4: INTELLIGENCE
 # =========================================================
 def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
     if len(html_content) < 500: return None
     
-    # Dynamic Prompt Construction
     if task_type == "SEARCH_BOX":
         task_desc = """
         2. Identify the CSS Selector for the SEARCH INPUT BOX.
@@ -325,14 +317,12 @@ max_pages = c2.number_input("Max Pages / Search Cycles", 1, 500, 10)
 st.write("---")
 st.subheader("🛠️ Strategy Selection")
 
-# 3-WAY MODE SELECTION
 mode = st.radio("Choose Operation Mode:", [
     "Classic Directory (Native/Fast)",
     "Infinite Scroller (Selenium)",
     "Active Search Injection (Brute Force Surnames)"
 ])
 
-# Conditional Controls
 run_headless = True
 scroll_depth = 0
 
@@ -347,7 +337,7 @@ if "Search Injection" in mode:
 if st.button("🚀 Start Mission", type="primary"):
     st.session_state.running = True
 
-# --- MISSION EXECUTION LOOP ---
+# --- EXECUTION ---
 if st.session_state.running:
     if not api_key: st.error("Missing API Key"); st.stop()
 
@@ -357,14 +347,16 @@ if st.session_state.running:
     learned_selectors = None
     
     # ----------------------------------------------------
-    # BRANCH A: CLASSIC & INFINITE (Pagination/Scroll)
+    # BRANCH A: PAGINATION
     # ----------------------------------------------------
     if "Search Injection" not in mode:
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"})
         
         driver = None
-        if "Infinite" in mode: driver = get_driver(headless=True)
+        if "Infinite" in mode: 
+            driver = get_driver(headless=True)
+            if not driver: status_log.error("Aborted: Driver failed."); st.stop()
         
         current_url = start_url
         next_method, next_data = "GET", None
@@ -377,7 +369,6 @@ if st.session_state.running:
             if detected_limit and page > detected_limit: break
             status_log.update(label=f"Scanning Page {page}...", state="running")
             
-            # Fetch
             raw_html = None
             try:
                 if "Classic" in mode:
@@ -389,18 +380,17 @@ if st.session_state.running:
             
             if not raw_html: break
 
-            # Extract (Fast or AI)
+            # Extraction Logic
             names, nav_data, ai_needed = [], {}, True
             
             if learned_selectors:
-                status_log.write("⚡ Using Fast Template")
+                status_log.write("⚡ Fast Template")
                 fast_res = fast_extract_mode(raw_html, learned_selectors)
                 names = fast_res["names"]
                 nav_res = fast_res["nav"]
                 
                 if len(names) > 0 and nav_res["type"] != "NONE":
                     ai_needed = False
-                    # Apply Fast Nav
                     if nav_res["type"] == "LINK":
                         l = nav_res["next_url"]
                         current_url = urljoin(current_url, l) if "http" not in l else l
@@ -410,7 +400,7 @@ if st.session_state.running:
                         if nav_res.get("next_url"): 
                             act = nav_res["next_url"]
                             current_url = urljoin(current_url, act) if "http" not in act else act
-                elif len(names) == 0: ai_needed = True # Re-learn
+                elif len(names) == 0: ai_needed = True 
             
             if ai_needed:
                 if not learned_selectors: status_log.write(f"🧠 {ai_provider.split()[0]} Analyzing...")
@@ -426,7 +416,7 @@ if st.session_state.running:
                     if selectors.get("name_element"): learned_selectors = selectors
                 else: break
 
-            # Match & Display
+            # Matches
             matches = match_names_detailed(names, f"Page {page}")
             if matches:
                 all_matches.extend(matches)
@@ -435,36 +425,39 @@ if st.session_state.running:
                 status_log.write(f"✅ Found {len(matches)} matches.")
             else: status_log.write("🤷 No matches.")
 
-            # AI Navigation (Fallback)
-            if ai_needed and "Classic" in mode:
-                ntype = nav_data.get("type", "NONE")
-                if ntype == "LINK" and nav_data.get("url"):
-                    l = nav_data["url"]
-                    current_url = urljoin(current_url, l) if "http" not in l else l
-                    next_method, next_data = "GET", None
-                elif ntype == "FORM" and nav_data.get("form_data"):
-                    next_method, next_data = "POST", nav_data["form_data"]
-                    fp = str(next_data)
-                    if fp in visited_fps: break
-                    visited_fps.add(fp)
+            # Nav
+            if ai_needed:
+                if "Classic" in mode:
+                    ntype = nav_data.get("type", "NONE")
+                    if ntype == "LINK" and nav_data.get("url"):
+                        l = nav_data["url"]
+                        current_url = urljoin(current_url, l) if "http" not in l else l
+                        next_method, next_data = "GET", None
+                    elif ntype == "FORM" and nav_data.get("form_data"):
+                        next_method, next_data = "POST", nav_data["form_data"]
+                        fp = str(next_data)
+                        if fp in visited_fps: break
+                        visited_fps.add(fp)
+                    else: break
                 else: break
-            elif ai_needed and "Infinite" in mode: break
             
             time.sleep(1.5)
         
         if driver: driver.quit()
 
     # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (Brute Force)
+    # BRANCH B: SEARCH INJECTION
     # ----------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
-        status_log.write("🔧 Browser Launched")
-        driver.get(start_url)
-        time.sleep(3)
+        if not driver: status_log.error("Aborted: Driver failed."); st.stop()
         
-        # 1. Find Search Box (AI)
-        status_log.write("🧠 Locating Search Input...")
+        status_log.write("🔧 Browser Launched")
+        try: driver.get(start_url)
+        except: status_log.error("Could not load URL"); driver.quit(); st.stop()
+        
+        time.sleep(3)
+        status_log.write("🧠 Finding Search Box...")
         data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
         
         if not data or not data.get("selectors", {}).get("search_input"):
@@ -474,7 +467,6 @@ if st.session_state.running:
         sel_input = data["selectors"]["search_input"]
         sel_btn = data["selectors"].get("search_button")
         
-        # 2. Loop Surnames
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
             status_log.update(label=f"Checking '{surname}' ({i+1}/{max_pages})", state="running")
@@ -491,13 +483,10 @@ if st.session_state.running:
                 
                 time.sleep(3)
                 
-                # Manual CAPTCHA Pause
-                if "captcha" in driver.page_source.lower():
-                     if not run_headless:
-                         status_log.warning("⚠️ CAPTCHA! Solve it manually now.")
-                         time.sleep(15)
+                if "captcha" in driver.page_source.lower() and not run_headless:
+                     status_log.warning("⚠️ CAPTCHA! Manual solve required.")
+                     time.sleep(15)
                 
-                # Extract Results
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 if not learned_selectors:
                     res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
@@ -518,17 +507,12 @@ if st.session_state.running:
                 
                 driver.get(start_url)
                 time.sleep(1.5)
-                
-            except Exception as e:
-                driver.get(start_url)
+            except: driver.get(start_url)
         
         driver.quit()
 
-    # ----------------------------------------------------
-    # OUTPUT
-    # ----------------------------------------------------
     status_log.update(label="Mission Complete!", state="complete")
-    st.session_state.running = False # Reset state
+    st.session_state.running = False
     
     if all_matches:
         df = pd.DataFrame(all_matches)
