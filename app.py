@@ -6,13 +6,11 @@ import re
 import requests
 import io
 import random
-import os
-import shutil
 from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# --- SELENIUM IMPORT SAFETY ---
+# --- SELENIUM SETUP ---
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -26,11 +24,15 @@ except ImportError:
     HAS_SELENIUM = False
 
 # =========================================================
-#             PART 0: CONFIGURATION & SETUP
+#             PART 0: CONFIGURATION
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
 st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
+
+# --- SESSION STATE (Abort Logic) ---
+if "running" not in st.session_state:
+    st.session_state.running = False
 
 # --- SIDEBAR: AI BRAIN ---
 st.sidebar.header("🧠 AI Brain")
@@ -41,14 +43,13 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 # --- ABORT BUTTON ---
-if "running" not in st.session_state: st.session_state.running = False
 st.sidebar.markdown("---")
 if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.session_state.running = False
     st.sidebar.warning("Mission Aborted.")
     st.stop()
 
-# --- BLOCKLIST (Anti-False Positive) ---
+# --- BLOCKLIST ---
 BLOCKLIST_SURNAMES = {
     "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
     "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
@@ -64,21 +65,18 @@ BLOCKLIST_SURNAMES = {
 def call_ai_api(prompt, provider, key):
     if not key: return None
     headers = {"Content-Type": "application/json"}
-    
     try:
         if "Gemini" in provider:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
-            
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "gpt-4o", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
-            
         elif "Anthropic" in provider:
             url = "https://api.anthropic.com/v1/messages"
             headers["x-api-key"] = key
@@ -86,14 +84,12 @@ def call_ai_api(prompt, provider, key):
             payload = {"model": "claude-3-5-sonnet-20241022", "max_tokens": 4000, "messages": [{"role": "user", "content": prompt}]}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
-            
         elif "DeepSeek" in provider:
             url = "https://api.deepseek.com/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
-
     except Exception as e: return None
     return None
 
@@ -152,7 +148,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS (RESTORED SIMPLICITY)
+#             PART 3: DRIVERS (THE PROVEN FIX)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -160,29 +156,24 @@ def fetch_native(session, url, method="GET", data=None):
         return session.get(url, timeout=15)
     except: return None
 
+# THIS IS THE EXACT FUNCTION THAT WORKED FOR YOU BEFORE
 def get_driver(headless=True):
     if not HAS_SELENIUM: return None
-    
     options = Options()
     
-    # 1. MINIMAL FLAGS (These worked for you before)
+    # We allow toggling headless for the Search Injection mode (if run locally)
     if headless:
-        options.add_argument("--headless") 
+        options.add_argument("--headless")
+        
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     
-    try:
-        # 2. INTELLIGENT INSTALLATION
-        # This asks webdriver_manager to find the best driver for the installed "chromium"
-        # It worked in your "Infinite Scroll" version, so we use it here.
-        return webdriver.Chrome(
-            service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-            options=options
-        )
-    except Exception as e:
-        st.error(f"❌ Driver Failed: {e}")
-        return None
+    # This specific manager configuration was the key to stability on your server
+    return webdriver.Chrome(
+        service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
+        options=options
+    )
 
 def fetch_selenium(driver, url, scroll_count=0):
     try:
