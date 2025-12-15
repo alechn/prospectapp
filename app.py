@@ -45,6 +45,7 @@ if "running" not in st.session_state: st.session_state.running = False
 st.sidebar.markdown("---")
 if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.session_state.running = False
+    st.sidebar.warning("Mission Aborted.")
     st.stop()
 
 # --- BLOCKLIST (Anti-False Positive) ---
@@ -65,12 +66,14 @@ def call_ai_api(prompt, provider, key):
     headers = {"Content-Type": "application/json"}
     
     try:
+        # GEMINI
         if "Gemini" in provider:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
             
+        # OPENAI
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -78,6 +81,7 @@ def call_ai_api(prompt, provider, key):
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
             
+        # ANTHROPIC
         elif "Anthropic" in provider:
             url = "https://api.anthropic.com/v1/messages"
             headers["x-api-key"] = key
@@ -86,6 +90,7 @@ def call_ai_api(prompt, provider, key):
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
             
+        # DEEPSEEK
         elif "DeepSeek" in provider:
             url = "https://api.deepseek.com/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -151,7 +156,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS (THE NUCLEAR FIX)
+#             PART 3: DRIVERS (THE CRASH FIX)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -164,38 +169,43 @@ def get_driver(headless=True):
     
     options = Options()
     
-    # 1. CRITICAL CLOUD FLAGS
-    if headless: options.add_argument("--headless=new")
+    # --- CLOUD STABILITY FLAGS ---
+    if headless: options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-features=NetworkService")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
     
-    # 2. INTELLIGENT PATH DETECTION
-    chromium_path = "/usr/bin/chromium"
-    chromedriver_path = "/usr/bin/chromedriver"
-    
-    # If not at standard location, check system path
-    if not os.path.exists(chromium_path):
-        chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
-    if not os.path.exists(chromedriver_path):
-        chromedriver_path = shutil.which("chromedriver")
-
     try:
-        # METHOD A: EXPLICIT PATHS (Cloud/Linux)
-        if chromium_path and chromedriver_path:
-            options.binary_location = chromium_path
-            service = Service(chromedriver_path)
-            return webdriver.Chrome(service=service, options=options)
+        # --- PATH DETECTION ---
+        # 1. STREAMLIT CLOUD / LINUX
+        if os.name == 'posix': # Linux/Mac
+            chromium_path = "/usr/bin/chromium"
+            chromedriver_path = "/usr/bin/chromedriver"
             
-        # METHOD B: AUTOMATIC (Local/Windows/Mac)
-        else:
-            return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
+            # Fallback: check system path if not at default location
+            if not os.path.exists(chromium_path):
+                chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
+            if not os.path.exists(chromedriver_path):
+                chromedriver_path = shutil.which("chromedriver")
+            
+            if chromium_path and chromedriver_path:
+                # Force usage of system binaries (Prevents Version Crash)
+                options.binary_location = chromium_path
+                service = Service(chromedriver_path)
+                return webdriver.Chrome(service=service, options=options)
+        
+        # 2. LOCAL WINDOWS / MAC (Fallback)
+        return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
             
     except Exception as e:
-        st.error(f"❌ Driver Error: {e}")
-        st.code("Ensure 'packages.txt' contains:\nchromium\nchromium-driver")
+        st.error(f"❌ Driver Launch Failed: {e}")
+        # Debugging info
+        st.write(f"System OS: {os.name}")
+        st.write(f"Chromium Path Found: {shutil.which('chromium')}")
+        st.write(f"Driver Path Found: {shutil.which('chromedriver')}")
         return None
 
 def fetch_selenium(driver, url, scroll_count=0):
@@ -380,7 +390,6 @@ if st.session_state.running:
             
             if not raw_html: break
 
-            # Extraction Logic
             names, nav_data, ai_needed = [], {}, True
             
             if learned_selectors:
@@ -416,7 +425,6 @@ if st.session_state.running:
                     if selectors.get("name_element"): learned_selectors = selectors
                 else: break
 
-            # Matches
             matches = match_names_detailed(names, f"Page {page}")
             if matches:
                 all_matches.extend(matches)
@@ -425,7 +433,6 @@ if st.session_state.running:
                 status_log.write(f"✅ Found {len(matches)} matches.")
             else: status_log.write("🤷 No matches.")
 
-            # Nav
             if ai_needed:
                 if "Classic" in mode:
                     ntype = nav_data.get("type", "NONE")
