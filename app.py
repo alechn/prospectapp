@@ -32,11 +32,10 @@ st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_ico
 st.title("🕵️ Universal Brazilian Alumni Finder")
 st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
-# --- SESSION STATE (Abort Logic) ---
-if "running" not in st.session_state:
-    st.session_state.running = False
+# --- SESSION STATE ---
+if "running" not in st.session_state: st.session_state.running = False
 
-# --- SIDEBAR: AI BRAIN ---
+# --- SIDEBAR ---
 st.sidebar.header("🧠 AI Brain")
 ai_provider = st.sidebar.selectbox(
     "Choose your Model:",
@@ -44,11 +43,10 @@ ai_provider = st.sidebar.selectbox(
 )
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
-# --- WAIT TIME SLIDER (THE FIX) ---
 st.sidebar.markdown("---")
-search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 3, 30, 8, help="Increase this if the bot returns 0 results. Gives the site time to load data.")
+# --- SLIDER (Wait Time) ---
+search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait after searching for results to appear.")
 
-# --- ABORT & DEBUG ---
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q'] or #search")
     manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. div.alumni-name")
@@ -157,7 +155,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS (THE CLOUD/LOCAL FIX)
+#             PART 3: DRIVERS (CLOUD/LOCAL)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -168,32 +166,17 @@ def fetch_native(session, url, method="GET", data=None):
 def get_driver(headless=True):
     if not HAS_SELENIUM: return None
     options = Options()
-    
-    # 1. MANDATORY FLAGS FOR CLOUD
-    if headless or os.name == 'posix': 
-        options.add_argument("--headless")
-        
+    if headless or os.name == 'posix': options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     
-    # 2. INTELLIGENT DRIVER SELECTION
     try:
-        # CHECK: Are we on Streamlit Cloud (Linux)?
         if os.name == 'posix':
-            # Force use of the system-installed driver (from packages.txt)
-            return webdriver.Chrome(
-                service=Service("/usr/bin/chromedriver"), 
-                options=options
-            )
+            return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
         else:
-            # We are on Windows/Mac (Local) -> Use Manager to download driver
-            return webdriver.Chrome(
-                service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-                options=options
-            )
-            
+            return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
     except Exception as e:
         st.error(f"❌ Driver Error: {e}")
         return None
@@ -442,8 +425,8 @@ if st.session_state.running:
         
         if driver: driver.quit()
 
-# ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (Robust Re-Finding)
+    # ----------------------------------------------------
+    # BRANCH B: SEARCH INJECTION (Guaranteed Wait Edition)
     # ----------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
@@ -458,24 +441,19 @@ if st.session_state.running:
         
         status_log.write("🧠 Finding Search Box...")
         
-        # --- SELECTOR DISCOVERY (One-Time) ---
         sel_input = None
         sel_btn = None
         
-        # 1. Manual Override
         if manual_search_selector:
             sel_input = manual_search_selector
-            
-        # 2. AI Analysis
         if not sel_input:
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
                 sel_input = data["selectors"]["search_input"]
                 sel_btn = data["selectors"].get("search_button")
         
-        # 3. Fallbacks
         if not sel_input:
-            status_log.write("⚠️ Using standard fallbacks...")
+            status_log.write("⚠️ Trying standard selectors...")
             fallbacks = ["input[type='search']", "input[name='q']", "input[name='query']", "input[placeholder*='Search']", "input[aria-label='Search']"]
             for f in fallbacks:
                 try:
@@ -490,99 +468,87 @@ if st.session_state.running:
             
         status_log.success(f"🎯 Target Locked: {sel_input}")
 
-        # --- MAIN EXECUTION LOOP ---
+        # --- LOOP ---
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
             
-            # Update Status
             status_log.update(label=f"🔎 Checking '{surname}' ({i+1}/{max_pages})", state="running")
             
+            search_success = False
+            
+            # --- 1. INTERACTION PHASE ---
             try:
-                # 1. FIND ELEMENT FRESH (Crucial step!)
-                try:
-                    inp = driver.find_element(By.CSS_SELECTOR, sel_input)
-                    inp.clear()
-                except:
-                    # If stale or missing, reload page and try again
-                    driver.get(start_url)
-                    time.sleep(3)
-                    inp = driver.find_element(By.CSS_SELECTOR, sel_input)
-                    inp.clear()
-
-                # 2. TYPE AND SEARCH
+                # Find Fresh
+                inp = driver.find_element(By.CSS_SELECTOR, sel_input)
+                inp.clear()
+                
+                # Type
                 for ch in surname: inp.send_keys(ch); time.sleep(random.uniform(0.05, 0.1))
                 time.sleep(0.5)
                 
+                # Submit
                 if sel_btn:
                     try: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
                     except: inp.send_keys(Keys.RETURN)
                 else: 
                     inp.send_keys(Keys.RETURN)
                 
-                # 3. VISUAL WAIT (The Fix)
-                # We use a progress bar so you SEE it waiting
-                prog_text = table_placeholder.empty()
-                prog_bar = table_placeholder.progress(0)
+                search_success = True
                 
-                for t in range(search_delay):
-                    prog_text.caption(f"⏳ Waiting for results... ({t+1}/{search_delay}s)")
-                    prog_bar.progress((t + 1) / search_delay)
-                    time.sleep(1)
-                
-                prog_bar.empty()
-                prog_text.empty()
+            except Exception as e:
+                status_log.warning(f"⚠️ Search failed for {surname}. Reloading...")
+                driver.get(start_url)
+                time.sleep(3)
 
-                # 4. CAPTCHA CHECK
-                if "captcha" in driver.page_source.lower() and not run_headless:
-                     status_log.warning("⚠️ CAPTCHA! Manual solve required.")
-                     time.sleep(15)
+            # --- 2. GUARANTEED WAIT & SCRAPE PHASE ---
+            if search_success:
+                # PROGRESS BAR (Unskippable)
+                prog_bar = table_placeholder.progress(0)
+                step_val = 1.0 / search_delay
+                current_val = 0.0
                 
-                # 5. SCRAPE RESULTS
-                soup = BeautifulSoup(driver.page_source, "html.parser")
-                
-                # Learn Name Selector if needed
-                if not learned_selectors:
-                    if manual_name_selector: 
-                        learned_selectors = {"name_element": manual_name_selector}
-                    else:
-                        res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
-                        if res_data and res_data.get("selectors", {}).get("name_element"):
-                            learned_selectors = res_data["selectors"]
-                
-                current_names = []
-                if learned_selectors:
-                    els = soup.select(learned_selectors["name_element"])
-                    current_names = [e.get_text(strip=True) for e in els]
-                
-                # 6. PROCESS MATCHES
-                matches = match_names_detailed(current_names, f"Search: {surname}")
-                if matches:
-                    all_matches.extend(matches)
-                    all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                    # Show dataframe immediately
-                    table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                    status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
-                else:
-                    # Optional: Log empty results to confirm it worked
-                    # status_log.write(f"⚪ No results for '{surname}'") 
+                for _ in range(search_delay):
+                    time.sleep(1)
+                    current_val += step_val
+                    if current_val > 1.0: current_val = 1.0
+                    prog_bar.progress(current_val)
+                prog_bar.empty()
+
+                # Extract
+                try:
+                    soup = BeautifulSoup(driver.page_source, "html.parser")
+                    if not learned_selectors:
+                        if manual_name_selector: 
+                            learned_selectors = {"name_element": manual_name_selector}
+                        else:
+                            res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
+                            if res_data and res_data.get("selectors", {}).get("name_element"):
+                                learned_selectors = res_data["selectors"]
+                    
+                    current_names = []
+                    if learned_selectors:
+                        els = soup.select(learned_selectors["name_element"])
+                        current_names = [e.get_text(strip=True) for e in els]
+                    
+                    matches = match_names_detailed(current_names, f"Search: {surname}")
+                    if matches:
+                        all_matches.extend(matches)
+                        all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                        table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
+                        status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
+                except:
                     pass
 
-                # 7. RESET FOR NEXT LOOP
-                # Try going back to save bandwidth, else reload
+                # Reset
                 try: 
                     driver.execute_script("window.history.go(-1)")
                     time.sleep(2)
                 except: 
                     driver.get(start_url)
-                    time.sleep(3)
-                    
-            except Exception as e:
-                # status_log.error(f"Error on {surname}: {e}") # Uncomment to see errors
-                driver.get(start_url)
-                time.sleep(3)
+                    time.sleep(2)
         
         driver.quit()
-        
+
     status_log.update(label="Mission Complete!", state="complete")
     st.session_state.running = False
     
