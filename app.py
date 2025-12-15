@@ -168,29 +168,41 @@ def fetch_native(session, url, method="GET", data=None):
 
 def get_driver(headless=True):
     if not HAS_SELENIUM: return None
+    
     options = Options()
     
-    # CRITICAL FIX FOR STREAMLIT CLOUD
+    # 1. VISIBLE MODE (Local) vs HEADLESS (Cloud)
+    # Streamlit Cloud MUST be headless or it crashes
     if headless:
-        options.add_argument("--headless")
+        options.add_argument("--headless=new") 
     
+    # 2. CRITICAL FLAGS FOR CLOUD STABILITY
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080") # Prevents some "element not found" errors
     options.add_argument("--disable-blink-features=AutomationControlled")
     
+    # 3. ATTEMPT TO CONNECT
     try:
-        # 1. Try installing matching driver (Best for Local/Windows)
-        return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
+        # METHOD A: LOCAL (Windows/Mac) - Uses webdriver_manager
+        # We try this ONLY if we are NOT on Linux (simplistic check) or if Method B fails
+        if os.name != 'posix': 
+            return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
+            
+        # METHOD B: STREAMLIT CLOUD (Linux) - Uses system binaries
+        # This is where your error is happening. We explicitly point to the packages you installed.
+        options.binary_location = "/usr/bin/chromium"
+        service = Service("/usr/bin/chromedriver")
+        return webdriver.Chrome(service=service, options=options)
+        
     except Exception as e:
-        # 2. Fallback to System Driver (Best for Streamlit Cloud/Linux)
-        # Streamlit Cloud installs binaries at /usr/bin/chromium and /usr/bin/chromedriver
+        # Fallback: If Method B failed on Linux, try Method A as a last resort
         try:
-            options.binary_location = "/usr/bin/chromium"
-            service = Service("/usr/bin/chromedriver")
-            return webdriver.Chrome(service=service, options=options)
+             return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
         except Exception as e2:
-            st.error(f"❌ Driver Error. Ensure 'packages.txt' contains 'chromium' and 'chromium-driver'.\nDetails: {e2}")
+            st.error(f"❌ CRITICAL DRIVER ERROR: {e2}")
+            st.code("Ensure 'packages.txt' contains:\nchromium\nchromium-driver")
             return None
 
 def fetch_selenium(driver, url, scroll_count=0):
