@@ -6,6 +6,8 @@ import re
 import requests
 import io
 import random
+import os
+import shutil
 from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -24,7 +26,7 @@ except ImportError:
     HAS_SELENIUM = False
 
 # =========================================================
-#             PART 0: CONFIGURATION
+#             PART 0: CONFIGURATION & SETUP
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
@@ -49,7 +51,7 @@ if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.sidebar.warning("Mission Aborted.")
     st.stop()
 
-# --- BLOCKLIST ---
+# --- BLOCKLIST (Anti-False Positive) ---
 BLOCKLIST_SURNAMES = {
     "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
     "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
@@ -65,18 +67,24 @@ BLOCKLIST_SURNAMES = {
 def call_ai_api(prompt, provider, key):
     if not key: return None
     headers = {"Content-Type": "application/json"}
+    
     try:
+        # GEMINI
         if "Gemini" in provider:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
+            
+        # OPENAI
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "gpt-4o", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
+            
+        # ANTHROPIC
         elif "Anthropic" in provider:
             url = "https://api.anthropic.com/v1/messages"
             headers["x-api-key"] = key
@@ -84,12 +92,15 @@ def call_ai_api(prompt, provider, key):
             payload = {"model": "claude-3-5-sonnet-20241022", "max_tokens": 4000, "messages": [{"role": "user", "content": prompt}]}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
+            
+        # DEEPSEEK
         elif "DeepSeek" in provider:
             url = "https://api.deepseek.com/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
+
     except Exception as e: return None
     return None
 
@@ -148,7 +159,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS (THE PROVEN FIX)
+#             PART 3: DRIVERS (THE CLOUD FIX)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -156,24 +167,47 @@ def fetch_native(session, url, method="GET", data=None):
         return session.get(url, timeout=15)
     except: return None
 
-# THIS IS THE EXACT FUNCTION THAT WORKED FOR YOU BEFORE
 def get_driver(headless=True):
+    """
+    Intelligent Driver Loader:
+    1. Checks if running on Streamlit Cloud (Linux).
+    2. If yes, forces usage of /usr/bin/chromedriver (Prevents Crashes).
+    3. If no (Local PC), falls back to WebDriver Manager.
+    """
     if not HAS_SELENIUM: return None
+    
     options = Options()
     
-    # We allow toggling headless for the Search Injection mode (if run locally)
-    if headless:
+    # --- CLOUD MANDATORY FLAGS ---
+    # Streamlit Cloud runs on Linux and HAS NO DISPLAY.
+    # We must force headless mode if we detect Linux, otherwise it crashes immediately.
+    if os.name == 'posix': 
         options.add_argument("--headless")
-        
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+    elif headless:
+        # Local execution (Windows/Mac) allows headless toggle
+        options.add_argument("--headless")
+
+    # --- PATH SELECTION ---
+    # Case A: Streamlit Cloud (Standard Paths)
+    # We explicitly check for the binaries installed by packages.txt
+    if os.path.exists("/usr/bin/chromium") and os.path.exists("/usr/bin/chromedriver"):
+        options.binary_location = "/usr/bin/chromium"
+        service = Service("/usr/bin/chromedriver")
+        return webdriver.Chrome(service=service, options=options)
     
-    # This specific manager configuration was the key to stability on your server
-    return webdriver.Chrome(
-        service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-        options=options
-    )
+    # Case B: Local Fallback (WebDriver Manager)
+    # This runs if the user is on their own machine
+    try:
+        return webdriver.Chrome(
+            service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
+            options=options
+        )
+    except Exception as e:
+        st.error(f"❌ Local Driver Failed: {e}")
+        return None
 
 def fetch_selenium(driver, url, scroll_count=0):
     try:
@@ -324,7 +358,7 @@ if st.session_state.running:
     learned_selectors = None
     
     # ----------------------------------------------------
-    # BRANCH A: PAGINATION
+    # BRANCH A: PAGINATION & SCROLLING
     # ----------------------------------------------------
     if "Search Injection" not in mode:
         session = requests.Session()
@@ -420,9 +454,10 @@ if st.session_state.running:
         if driver: driver.quit()
 
     # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION
+    # BRANCH B: SEARCH INJECTION (Brute Force)
     # ----------------------------------------------------
     else:
+        # NOTE: On Cloud, run_headless is forced True by get_driver()
         driver = get_driver(headless=run_headless)
         if not driver: status_log.error("Aborted: Driver failed."); st.stop()
         
@@ -457,9 +492,9 @@ if st.session_state.running:
                 
                 time.sleep(3)
                 
-                if "captcha" in driver.page_source.lower() and not run_headless:
-                     status_log.warning("⚠️ CAPTCHA! Manual solve required.")
-                     time.sleep(15)
+                # Basic CAPTCHA warning (Will only show in logs on Cloud)
+                if "captcha" in driver.page_source.lower():
+                     status_log.warning("⚠️ CAPTCHA Detected.")
                 
                 soup = BeautifulSoup(driver.page_source, "html.parser")
                 if not learned_selectors:
