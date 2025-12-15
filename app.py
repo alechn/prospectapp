@@ -442,8 +442,8 @@ if st.session_state.running:
         
         if driver: driver.quit()
 
-    # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (Robust Fallbacks)
+# ----------------------------------------------------
+    # BRANCH B: SEARCH INJECTION (Robust Re-Finding)
     # ----------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
@@ -458,30 +458,29 @@ if st.session_state.running:
         
         status_log.write("🧠 Finding Search Box...")
         
-        screenshot = driver.get_screenshot_as_png()
-        with st.sidebar.expander("📸 Debug View", expanded=True):
-            st.image(screenshot)
-        
+        # --- SELECTOR DISCOVERY (One-Time) ---
         sel_input = None
         sel_btn = None
         
+        # 1. Manual Override
         if manual_search_selector:
             sel_input = manual_search_selector
             
+        # 2. AI Analysis
         if not sel_input:
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
                 sel_input = data["selectors"]["search_input"]
                 sel_btn = data["selectors"].get("search_button")
         
+        # 3. Fallbacks
         if not sel_input:
-            status_log.write("⚠️ Trying standard selectors...")
+            status_log.write("⚠️ Using standard fallbacks...")
             fallbacks = ["input[type='search']", "input[name='q']", "input[name='query']", "input[placeholder*='Search']", "input[aria-label='Search']"]
             for f in fallbacks:
                 try:
                     if driver.find_elements(By.CSS_SELECTOR, f):
                         sel_input = f
-                        status_log.success(f"🎯 Found via fallback: {f}")
                         break
                 except: continue
         
@@ -489,61 +488,101 @@ if st.session_state.running:
             status_log.error("❌ Search box not found. Check Debug View.")
             driver.quit(); st.stop()
             
+        status_log.success(f"🎯 Target Locked: {sel_input}")
+
+        # --- MAIN EXECUTION LOOP ---
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
-            status_log.update(label=f"Checking '{surname}' ({i+1}/{max_pages})", state="running")
+            
+            # Update Status
+            status_log.update(label=f"🔎 Checking '{surname}' ({i+1}/{max_pages})", state="running")
+            
             try:
-                inp = driver.find_element(By.CSS_SELECTOR, sel_input)
-                inp.clear()
-                for ch in surname: inp.send_keys(ch); time.sleep(random.uniform(0.05, 0.15))
+                # 1. FIND ELEMENT FRESH (Crucial step!)
+                try:
+                    inp = driver.find_element(By.CSS_SELECTOR, sel_input)
+                    inp.clear()
+                except:
+                    # If stale or missing, reload page and try again
+                    driver.get(start_url)
+                    time.sleep(3)
+                    inp = driver.find_element(By.CSS_SELECTOR, sel_input)
+                    inp.clear()
+
+                # 2. TYPE AND SEARCH
+                for ch in surname: inp.send_keys(ch); time.sleep(random.uniform(0.05, 0.1))
                 time.sleep(0.5)
                 
                 if sel_btn:
                     try: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
                     except: inp.send_keys(Keys.RETURN)
-                else: inp.send_keys(Keys.RETURN)
+                else: 
+                    inp.send_keys(Keys.RETURN)
                 
-                # --- WAITING LOGIC (VISUAL COUNTDOWN) ---
-                status_log.write(f"⏳ Waiting {search_delay}s for results to load...")
+                # 3. VISUAL WAIT (The Fix)
+                # We use a progress bar so you SEE it waiting
+                prog_text = table_placeholder.empty()
+                prog_bar = table_placeholder.progress(0)
                 
-                # Scroll a bit to trigger lazy loading
-                try: driver.execute_script("window.scrollTo(0, 300)")
-                except: pass
-                
-                # Visual countdown bar
-                progress_bar = table_placeholder.progress(0)
                 for t in range(search_delay):
+                    prog_text.caption(f"⏳ Waiting for results... ({t+1}/{search_delay}s)")
+                    prog_bar.progress((t + 1) / search_delay)
                     time.sleep(1)
-                    progress_bar.progress((t + 1) / search_delay)
-                progress_bar.empty() # Clear bar when done
                 
+                prog_bar.empty()
+                prog_text.empty()
+
+                # 4. CAPTCHA CHECK
+                if "captcha" in driver.page_source.lower() and not run_headless:
+                     status_log.warning("⚠️ CAPTCHA! Manual solve required.")
+                     time.sleep(15)
+                
+                # 5. SCRAPE RESULTS
                 soup = BeautifulSoup(driver.page_source, "html.parser")
-                if manual_name_selector: learned_selectors = {"name_element": manual_name_selector}
                 
+                # Learn Name Selector if needed
                 if not learned_selectors:
-                    res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
-                    if res_data and res_data.get("selectors", {}).get("name_element"):
-                        learned_selectors = res_data["selectors"]
+                    if manual_name_selector: 
+                        learned_selectors = {"name_element": manual_name_selector}
+                    else:
+                        res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
+                        if res_data and res_data.get("selectors", {}).get("name_element"):
+                            learned_selectors = res_data["selectors"]
                 
                 current_names = []
                 if learned_selectors:
                     els = soup.select(learned_selectors["name_element"])
                     current_names = [e.get_text(strip=True) for e in els]
                 
+                # 6. PROCESS MATCHES
                 matches = match_names_detailed(current_names, f"Search: {surname}")
                 if matches:
                     all_matches.extend(matches)
                     all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                    # Show dataframe immediately
                     table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
                     status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
-                
-                try: driver.execute_script("window.history.go(-1)"); time.sleep(2)
-                except: driver.get(start_url); time.sleep(2)
-                
-            except: driver.get(start_url); time.sleep(2)
+                else:
+                    # Optional: Log empty results to confirm it worked
+                    # status_log.write(f"⚪ No results for '{surname}'") 
+                    pass
+
+                # 7. RESET FOR NEXT LOOP
+                # Try going back to save bandwidth, else reload
+                try: 
+                    driver.execute_script("window.history.go(-1)")
+                    time.sleep(2)
+                except: 
+                    driver.get(start_url)
+                    time.sleep(3)
+                    
+            except Exception as e:
+                # status_log.error(f"Error on {surname}: {e}") # Uncomment to see errors
+                driver.get(start_url)
+                time.sleep(3)
         
         driver.quit()
-
+        
     status_log.update(label="Mission Complete!", state="complete")
     st.session_state.running = False
     
