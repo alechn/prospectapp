@@ -66,14 +66,12 @@ def call_ai_api(prompt, provider, key):
     headers = {"Content-Type": "application/json"}
     
     try:
-        # GEMINI
         if "Gemini" in provider:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
             
-        # OPENAI
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -81,7 +79,6 @@ def call_ai_api(prompt, provider, key):
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
             
-        # ANTHROPIC
         elif "Anthropic" in provider:
             url = "https://api.anthropic.com/v1/messages"
             headers["x-api-key"] = key
@@ -90,7 +87,6 @@ def call_ai_api(prompt, provider, key):
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
             
-        # DEEPSEEK
         elif "DeepSeek" in provider:
             url = "https://api.deepseek.com/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -156,7 +152,7 @@ try:
 except: st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS (THE CRASH FIX)
+#             PART 3: DRIVERS (RESTORED SIMPLICITY)
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -169,43 +165,23 @@ def get_driver(headless=True):
     
     options = Options()
     
-    # --- CLOUD STABILITY FLAGS ---
-    if headless: options.add_argument("--headless")
+    # 1. MINIMAL FLAGS (These worked for you before)
+    if headless:
+        options.add_argument("--headless") 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-features=NetworkService")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-blink-features=AutomationControlled")
     
     try:
-        # --- PATH DETECTION ---
-        # 1. STREAMLIT CLOUD / LINUX
-        if os.name == 'posix': # Linux/Mac
-            chromium_path = "/usr/bin/chromium"
-            chromedriver_path = "/usr/bin/chromedriver"
-            
-            # Fallback: check system path if not at default location
-            if not os.path.exists(chromium_path):
-                chromium_path = shutil.which("chromium") or shutil.which("chromium-browser")
-            if not os.path.exists(chromedriver_path):
-                chromedriver_path = shutil.which("chromedriver")
-            
-            if chromium_path and chromedriver_path:
-                # Force usage of system binaries (Prevents Version Crash)
-                options.binary_location = chromium_path
-                service = Service(chromedriver_path)
-                return webdriver.Chrome(service=service, options=options)
-        
-        # 2. LOCAL WINDOWS / MAC (Fallback)
-        return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
-            
+        # 2. INTELLIGENT INSTALLATION
+        # This asks webdriver_manager to find the best driver for the installed "chromium"
+        # It worked in your "Infinite Scroll" version, so we use it here.
+        return webdriver.Chrome(
+            service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
+            options=options
+        )
     except Exception as e:
-        st.error(f"❌ Driver Launch Failed: {e}")
-        # Debugging info
-        st.write(f"System OS: {os.name}")
-        st.write(f"Chromium Path Found: {shutil.which('chromium')}")
-        st.write(f"Driver Path Found: {shutil.which('chromedriver')}")
+        st.error(f"❌ Driver Failed: {e}")
         return None
 
 def fetch_selenium(driver, url, scroll_count=0):
