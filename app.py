@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import json
-import google.generativeai as genai
 import time
 import re
 import requests
@@ -22,32 +21,105 @@ except ImportError:
     HAS_SELENIUM = False
 
 # =========================================================
-#             PART 0: CONFIGURATION & BLOCKLIST
+#             PART 0: CONFIGURATION & AUTH
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Powered by Gemini 2.5 Flash • Scoring & Ranking System")
+st.caption("Powered by Multi-Model AI • Template Learning • Auto-Stop")
 
-# --- FILTER LIST ---
-BLOCKLIST_SURNAMES = {
-    "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
-    "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
-    "LIANG", "SONG", "TANG", "ZHENG", "HAN", "FENG", "DONG", "YE", "YU", "WEI", 
-    "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
-    "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
-    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN"
-}
+# --- MODEL SELECTOR ---
+st.sidebar.header("🧠 AI Brain")
+ai_provider = st.sidebar.selectbox(
+    "Choose your Model:",
+    ["Google Gemini (Flash 2.0)", "OpenAI (GPT-4o)", "Anthropic (Claude 3.5 Sonnet)", "DeepSeek (V3)"],
+    help="Gemini is free-tier friendly. Claude is best for HTML analysis. GPT-4o is the smartest generalist."
+)
 
-if "GOOGLE_API_KEY" in st.secrets:
-    api_key = st.secrets["GOOGLE_API_KEY"]
-else:
-    api_key = st.sidebar.text_input("Google Gemini API Key", type="password")
-
-if api_key:
-    genai.configure(api_key=api_key)
+api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 # =========================================================
-#             PART 1: HELPER FUNCTIONS
+#             PART 1: UNIVERSAL AI ADAPTER
+# =========================================================
+
+def call_ai_api(prompt, provider, key):
+    """
+    Sends the prompt to the selected AI Provider using raw HTTP requests.
+    No SDKs required!
+    """
+    if not key: return None
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        # --- GOOGLE GEMINI ---
+        if "Gemini" in provider:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"response_mime_type": "application/json"}
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.status_code == 200:
+                return resp.json()['candidates'][0]['content']['parts'][0]['text']
+                
+        # --- OPENAI GPT-4o ---
+        elif "OpenAI" in provider:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {key}"
+            payload = {
+                "model": "gpt-4o",
+                "messages": [{"role": "system", "content": "You are a JSON-only extraction bot."}, {"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.status_code == 200:
+                return resp.json()['choices'][0]['message']['content']
+
+        # --- ANTHROPIC CLAUDE ---
+        elif "Anthropic" in provider:
+            url = "https://api.anthropic.com/v1/messages"
+            headers["x-api-key"] = key
+            headers["anthropic-version"] = "2023-06-01"
+            payload = {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 4000,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.status_code == 200:
+                return resp.json()['content'][0]['text']
+
+        # --- DEEPSEEK (OpenAI Compatible) ---
+        elif "DeepSeek" in provider:
+            url = "https://api.deepseek.com/chat/completions"
+            headers["Authorization"] = f"Bearer {key}"
+            payload = {
+                "model": "deepseek-chat",
+                "messages": [{"role": "system", "content": "You are a JSON extractor."}, {"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.status_code == 200:
+                return resp.json()['choices'][0]['message']['content']
+
+    except Exception as e:
+        st.error(f"AI Connection Error: {e}")
+        return None
+    
+    return None
+
+def clean_json_response(text):
+    if not text: return "{}"
+    try:
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match: return match.group(0)
+        return text
+    except: return text
+
+# =========================================================
+#             PART 2: HELPER FUNCTIONS & DATA
 # =========================================================
 def normalize_token(s: str) -> str:
     if not s: return ""
@@ -63,16 +135,17 @@ def clean_html_for_ai(html_text):
         element.decompose()
     return str(soup)[:500000]
 
-def clean_json_response(text):
-    try:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match: return match.group(0)
-        return text
-    except: return text
+# --- BLOCKLIST ---
+BLOCKLIST_SURNAMES = {
+    "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
+    "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
+    "LIANG", "SONG", "TANG", "ZHENG", "HAN", "FENG", "DONG", "YE", "YU", "WEI", 
+    "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
+    "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
+    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN"
+}
 
-# =========================================================
-#             PART 2: DATABASE & RANKS
-# =========================================================
+# --- IBGE DATA ---
 @st.cache_data(ttl=86400)
 def fetch_ibge_data(limit_first, limit_surname):
     IBGE_FIRST = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
@@ -96,8 +169,7 @@ def fetch_ibge_data(limit_first, limit_surname):
         return data_map
     return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
 
-st.sidebar.header("⚙️ Search Settings")
-# INCREASED DEFAULT to ensure scoring works well (More names = Better relative ranking)
+st.sidebar.header("⚙️ Settings")
 limit_first = st.sidebar.number_input("Common First Names", 10, 20000, 3000, 100)
 limit_surname = st.sidebar.number_input("Common Surnames", 10, 20000, 3000, 100)
 
@@ -109,7 +181,7 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-#             PART 3: ENGINES
+#             PART 3: ENGINES (Native & Selenium)
 # =========================================================
 
 def fetch_native(session, url, method="GET", data=None):
@@ -141,11 +213,10 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE
+#             PART 4: AGENT LOGIC (Provider Agnostic)
 # =========================================================
 
-def agent_learn_pattern(html_content, current_url):
-    if not api_key: return None
+def agent_learn_pattern(html_content, current_url, provider, key):
     if len(html_content) < 500: return None
 
     prompt = f"""
@@ -153,12 +224,12 @@ def agent_learn_pattern(html_content, current_url):
     
     1. Identify the CSS Selector for NAMES.
     2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT.
-    3. CHECK PAGINATION: Look for text like "Page 1 of 50". Extract TOTAL NUMBER of pages.
+    3. CHECK PAGINATION: Look for "Page 1 of X". Extract TOTAL NUMBER of pages.
     
     Return JSON:
     {{
       "names": ["Name 1", "Name 2"],
-      "total_pages": 74 (or null if unknown),
+      "total_pages": 74 (or null),
       "selectors": {{
          "name_element": "e.g. div.alumni-name",
          "next_element": "e.g. input[value='Next'] or a.next-link"
@@ -170,13 +241,12 @@ def agent_learn_pattern(html_content, current_url):
     {clean_html_for_ai(html_content)} 
     """
     
+    # Retry Logic
     for _ in range(2): 
-        try:
-            model = genai.GenerativeModel('gemini-2.5-flash-lite', generation_config={"response_mime_type": "application/json"})
-            response = model.generate_content(prompt)
-            if not response.parts: continue
-            return json.loads(clean_json_response(response.text))
-        except: time.sleep(1)
+        raw_text = call_ai_api(prompt, provider, key)
+        if raw_text:
+            return json.loads(clean_json_response(raw_text))
+        time.sleep(1)
     return None
 
 def fast_extract_mode(html_content, selectors):
@@ -203,25 +273,15 @@ def fast_extract_mode(html_content, selectors):
                     nav_result["type"] = "FORM"
                     form_data = {}
                     for inp in parent_form.find_all("input"):
-                        if inp.get("name"):
-                            form_data[inp.get("name")] = inp.get("value", "")
-                    if element.get("name"):
-                        form_data[element.get("name")] = element.get("value", "")
+                        if inp.get("name"): form_data[inp.get("name")] = inp.get("value", "")
+                    if element.get("name"): form_data[element.get("name")] = element.get("value", "")
                     nav_result["form_data"] = form_data
-                    if parent_form.get("action"):
-                        nav_result["next_url"] = parent_form.get("action")
+                    if parent_form.get("action"): nav_result["next_url"] = parent_form.get("action")
 
     return {"names": extracted_names, "nav": nav_result}
 
-# --- NEW: SCORING LOGIC ---
 def calculate_score(rank, limit):
-    """
-    Returns points (0-50) based on rank.
-    Rank 1 = 50 pts. Rank Limit = 0 pts. Not Found = 0 pts.
-    """
     if rank == 0: return 0
-    # Inverse score: (Limit - Rank) / Limit
-    # e.g. Limit 2000, Rank 1 -> (1999/2000) * 50 = 49.9 pts
     score = ((limit - rank) / limit) * 50
     return max(0, score)
 
@@ -232,27 +292,23 @@ def match_names_detailed(names, page_label):
         if not parts: continue
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         
-        # Blocklist Filter
         if l in BLOCKLIST_SURNAMES: continue
         
-        # Get Ranks
         rank_f = first_name_ranks.get(f, 0)
         rank_l = surname_ranks.get(l, 0)
         
-        # Calculate Scores
         score_f = calculate_score(rank_f, limit_first)
         score_l = calculate_score(rank_l, limit_surname)
-        
         total_score = round(score_f + score_l, 1)
         
-        if total_score > 0: # If at least one part matched
+        if total_score > 0:
             if rank_f > 0 and rank_l > 0: m_type = "Strong"
             elif rank_f > 0: m_type = "First Name Only"
             else: m_type = "Surname Only"
             
             found.append({
                 "Full Name": n, 
-                "Brazil Score": total_score, # 0-100 Score
+                "Brazil Score": total_score,
                 "Match Type": m_type,
                 "First Rank": rank_f if rank_f > 0 else "N/A",
                 "Surname Rank": rank_l if rank_l > 0 else "N/A",
@@ -336,6 +392,7 @@ if st.button("🚀 Start Mission", type="primary"):
         nav_data = {}
         ai_required = True 
         
+        # 1. FAST MODE
         if learned_selectors:
             status_log.write(f"⚡ Fast Template Active")
             fast_data = fast_extract_mode(raw_html, learned_selectors)
@@ -367,10 +424,12 @@ if st.button("🚀 Start Mission", type="primary"):
                  status_log.warning("⚠️ Template lost navigation. Waking AI...")
                  ai_required = True
 
+        # 2. AI MODE (Universal Provider)
         if ai_required:
-            if not learned_selectors: status_log.write(f"🧠 AI Analyzing Page Structure...")
+            if not learned_selectors: status_log.write(f"🧠 {ai_provider.split()[0]} Analyzing Page Structure...")
             
-            data = agent_learn_pattern(raw_html, current_url)
+            # CALLING THE NEW UNIVERSAL FUNCTION
+            data = agent_learn_pattern(raw_html, current_url, ai_provider, api_key)
             
             if data:
                 names = data.get("names", [])
@@ -380,7 +439,7 @@ if st.button("🚀 Start Mission", type="primary"):
                 if not detected_max_pages and data.get("total_pages"):
                     try:
                         detected_max_pages = int(data["total_pages"])
-                        status_log.success(f"🎯 AI Detected Total Pages: {detected_max_pages}. Adjusting limit.")
+                        status_log.success(f"🎯 Detected Total Pages: {detected_max_pages}. Adjusting limit.")
                     except: pass
                 
                 if selectors.get("name_element"):
@@ -394,14 +453,13 @@ if st.button("🚀 Start Mission", type="primary"):
         new_matches = match_names_detailed(names, f"Page {page}")
         if new_matches:
             all_matches.extend(new_matches)
-            # Sort by Brazil Score DESCENDING
             all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
             status_log.write(f"✅ Found {len(new_matches)} matches.")
             table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
         else:
             status_log.write("🤷 No matches found.")
 
-        # NAVIGATION
+        # AI NAVIGATION
         if ai_required and "Classic" in mode:
             ntype = nav_data.get("type", "NONE")
             if ntype == "LINK" and nav_data.get("url"):
