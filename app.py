@@ -32,7 +32,6 @@ st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_ico
 st.title("🕵️ Universal Brazilian Alumni Finder")
 st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
-# --- SESSION STATE ---
 if "running" not in st.session_state: st.session_state.running = False
 
 # --- SIDEBAR ---
@@ -44,12 +43,11 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 st.sidebar.markdown("---")
-# --- SLIDER (Wait Time) ---
-search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait after searching for results to appear.")
+search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results.")
 
 with st.sidebar.expander("🛠️ Advanced / Debug"):
-    manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q'] or #search")
-    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. div.alumni-name")
+    manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
+    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3")
 
 if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.session_state.running = False
@@ -63,11 +61,12 @@ BLOCKLIST_SURNAMES = {
     "LIANG", "SONG", "TANG", "ZHENG", "HAN", "FENG", "DONG", "YE", "YU", "WEI", 
     "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
     "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
-    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN"
+    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN",
+    "RESULTS", "WEBSITE", "SEARCH", "MENU", "SKIP", "CONTENT", "FOOTER", "HEADER"
 }
 
 # =========================================================
-#             PART 1: UNIVERSAL AI ADAPTER
+#             PART 1: AI & CLEANING UTILS
 # =========================================================
 def call_ai_api(prompt, provider, key):
     if not key: return None
@@ -97,7 +96,7 @@ def call_ai_api(prompt, provider, key):
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=20)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
-    except Exception as e: return None
+    except: return None
     return None
 
 def clean_json_response(text):
@@ -107,6 +106,29 @@ def clean_json_response(text):
         if match: return match.group(0)
         return text
     except: return text
+
+def clean_extracted_name(raw_text):
+    """
+    Cleans up scraped names by removing affiliations, titles, and junk text.
+    """
+    if not raw_text: return None
+    
+    # 1. Block Junk Lines
+    upper = raw_text.upper()
+    if "RESULTS FOR" in upper or "SEARCH" in upper or "WEBSITE" in upper:
+        return None
+    
+    # 2. Split on common separators (|, -, –, », (, etc.)
+    # We take only the first part (the name)
+    clean = re.split(r'[|\-–—»\(\)]', raw_text)[0]
+    
+    # 3. Clean whitespace
+    clean = " ".join(clean.split())
+    
+    # 4. Too short? Probably garbage
+    if len(clean) < 3: return None
+    
+    return clean.strip()
 
 # =========================================================
 #             PART 2: DATA & HELPERS
@@ -199,16 +221,10 @@ def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGI
     if len(html_content) < 500: return None
     
     if task_type == "SEARCH_BOX":
-        task_desc = """
-        2. Identify the CSS Selector for the SEARCH INPUT BOX.
-        3. Identify the CSS Selector for the SEARCH SUBMIT BUTTON.
-        """
+        task_desc = '2. Identify the CSS Selector for the SEARCH INPUT BOX.\n3. Identify the CSS Selector for the SEARCH SUBMIT BUTTON.'
         json_desc = '"search_input": "input[name=q]", "search_button": "button[type=submit]"'
     else:
-        task_desc = """
-        2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT (Link or Button).
-        3. CHECK PAGINATION: Look for 'Page 1 of X'. Extract TOTAL PAGES.
-        """
+        task_desc = '2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT (Link or Button).\n3. CHECK PAGINATION: Look for "Page 1 of X". Extract TOTAL PAGES.'
         json_desc = '"next_element": "a.next", "total_pages": 50'
 
     prompt = f"""
@@ -243,7 +259,9 @@ def fast_extract_mode(html_content, selectors):
     
     if selectors.get("name_element"):
         elements = soup.select(selectors["name_element"])
-        for el in elements: extracted_names.append(el.get_text(strip=True))
+        for el in elements:
+            clean = clean_extracted_name(el.get_text(" ", strip=True))
+            if clean: extracted_names.append(clean)
             
     nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
     next_selector = selectors.get("next_element") or selectors.get("next_link")
@@ -269,11 +287,18 @@ def fast_extract_mode(html_content, selectors):
 
 def match_names_detailed(names, source):
     found = []
+    seen_names = set() # Avoid duplicates in same batch
+    
     for n in names:
-        parts = n.strip().split()
+        # CLEANUP: Apply the cleaning function first
+        clean_n = clean_extracted_name(n)
+        if not clean_n or clean_n in seen_names: continue
+        
+        parts = clean_n.strip().split()
         if not parts: continue
+        
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
-        if l in BLOCKLIST_SURNAMES: continue
+        if l in BLOCKLIST_SURNAMES or f in BLOCKLIST_SURNAMES: continue
         
         rank_f, rank_l = first_name_ranks.get(f, 0), surname_ranks.get(l, 0)
         
@@ -284,9 +309,13 @@ def match_names_detailed(names, source):
         if score > 0:
             m_type = "Strong" if (rank_f > 0 and rank_l > 0) else ("First Only" if rank_f > 0 else "Surname Only")
             found.append({
-                "Full Name": n, "Brazil Score": round(score, 1),
-                "Match Type": m_type, "Source": source
+                "Full Name": clean_n, 
+                "Brazil Score": round(score, 1),
+                "Match Type": m_type, 
+                "Source": source
             })
+            seen_names.add(clean_n)
+            
     return found
 
 # =========================================================
@@ -425,8 +454,8 @@ if st.session_state.running:
         
         if driver: driver.quit()
 
-# ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (Universal Backup Edition)
+    # ----------------------------------------------------
+    # BRANCH B: SEARCH INJECTION (CLEANER EDITION)
     # ----------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
@@ -457,7 +486,6 @@ if st.session_state.running:
         
         sel_input = None
         sel_btn = None
-        
         if manual_search_selector: sel_input = manual_search_selector
         
         if not sel_input:
@@ -495,17 +523,12 @@ if st.session_state.running:
                 # Strategy C: JS Injection (Most Reliable)
                 driver.execute_script(f"arguments[0].value = '{surname}';", inp)
                 
-                # Try hitting Enter key first
                 try: inp.send_keys(Keys.RETURN)
                 except: 
-                    # Try submitting form
                     try: inp.submit()
                     except:
-                        # Try clicking button
                         if sel_btn: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
-                
                 search_success = True
-                
             except Exception as e:
                 status_log.warning(f"⚠️ Failed to type '{surname}'. Reloading...")
                 driver.get(start_url)
@@ -517,7 +540,6 @@ if st.session_state.running:
                 prog_bar = table_placeholder.progress(0)
                 step_val = 1.0 / search_delay
                 current_val = 0.0
-                
                 for _ in range(search_delay):
                     time.sleep(1)
                     current_val += step_val
@@ -525,15 +547,18 @@ if st.session_state.running:
                     prog_bar.progress(current_val)
                 prog_bar.empty()
 
-                # --- EXTRACT ---
+                # --- DEBUG SCREENSHOT ---
+                screenshot = driver.get_screenshot_as_png()
+                with st.sidebar.expander(f"📸 Results: {surname}", expanded=True):
+                    st.image(screenshot, caption=f"Screen after waiting for {surname}")
+
+                # Extract
                 try:
                     soup = BeautifulSoup(driver.page_source, "html.parser")
                     
-                    # A. Manual Override
                     if manual_name_selector: 
                         learned_selectors = {"name_element": manual_name_selector}
                     
-                    # B. AI Analysis (If not yet learned)
                     if not learned_selectors:
                         status_log.write(f"🧠 AI Analyzing Results...")
                         res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
@@ -541,8 +566,7 @@ if st.session_state.running:
                             learned_selectors = res_data["selectors"]
                             status_log.success(f"🎓 AI Found: {learned_selectors['name_element']}")
                     
-                    # C. "DUMB" FALLBACK (The Fix!)
-                    # If AI failed but page has results (h3/h4 tags are standard for search titles)
+                    # DUMB FALLBACK
                     if not learned_selectors:
                         status_log.warning("⚠️ AI confused. Trying generic headers (h3)...")
                         learned_selectors = {"name_element": "h3"}
@@ -550,12 +574,15 @@ if st.session_state.running:
                     current_names = []
                     if learned_selectors:
                         els = soup.select(learned_selectors["name_element"])
-                        # If h3 gave nothing, try links directly
+                        # Backup logic
                         if not els and learned_selectors["name_element"] == "h3":
-                             els = soup.select("h4 a, h3 a, .result-title")
+                             els = soup.select("h4, h2, .result-title, a")
                              
-                        current_names = [e.get_text(strip=True) for e in els]
-                    
+                        # *** CLEAN EXTRACT ***
+                        # Using get_text(" ") adds space between elements like <span>Maria</span><span>Silva</span>
+                        current_names = [clean_extracted_name(e.get_text(" ", strip=True)) for e in els]
+                        current_names = [n for n in current_names if n] # remove None
+
                     if current_names:
                         matches = match_names_detailed(current_names, f"Search: {surname}")
                         if matches:
