@@ -44,6 +44,7 @@ api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type=
 
 st.sidebar.markdown("---")
 search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results.")
+use_ai_cleaning = st.sidebar.checkbox("✨ Batch AI Cleaning", value=True, help="Wait until the end to clean all names in one go (Faster/Cheaper).")
 
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
@@ -62,11 +63,11 @@ BLOCKLIST_SURNAMES = {
     "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
     "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
     "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN",
-    "RESULTS", "WEBSITE", "SEARCH", "MENU", "SKIP", "CONTENT", "FOOTER", "HEADER"
+    "RESULTS", "WEBSITE", "SEARCH", "MENU", "SKIP", "CONTENT", "FOOTER", "HEADER", "OVERVIEW", "PROJECTS"
 }
 
 # =========================================================
-#             PART 1: AI & CLEANING UTILS
+#             PART 1: AI FUNCTIONS & HELPERS
 # =========================================================
 def call_ai_api(prompt, provider, key):
     if not key: return None
@@ -75,26 +76,26 @@ def call_ai_api(prompt, provider, key):
         if "Gemini" in provider:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
-            payload = {"model": "gpt-4o", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            payload = {"model": "gpt-4o", "messages": [{"role": "system", "content": "You are a Data Cleaning Assistant. Return JSON only."}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
         elif "Anthropic" in provider:
             url = "https://api.anthropic.com/v1/messages"
             headers["x-api-key"] = key
             headers["anthropic-version"] = "2023-06-01"
             payload = {"model": "claude-3-5-sonnet-20241022", "max_tokens": 4000, "messages": [{"role": "user", "content": prompt}]}
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
         elif "DeepSeek" in provider:
             url = "https://api.deepseek.com/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
     except: return None
     return None
@@ -109,29 +110,54 @@ def clean_json_response(text):
 
 def clean_extracted_name(raw_text):
     """
-    Cleans up scraped names by removing affiliations, titles, and junk text.
+    Basic cleanup before AI. Removes obvious junk like "Results for..."
     """
     if not raw_text: return None
-    
-    # 1. Block Junk Lines
     upper = raw_text.upper()
-    if "RESULTS FOR" in upper or "SEARCH" in upper or "WEBSITE" in upper:
-        return None
-    
-    # 2. Split on common separators (|, -, –, », (, etc.)
-    # We take only the first part (the name)
+    if "RESULTS FOR" in upper or "SEARCH" in upper or "WEBSITE" in upper: return None
+    # Split on common separators (|, -, –, », (, etc.)
     clean = re.split(r'[|\-–—»\(\)]', raw_text)[0]
-    
-    # 3. Clean whitespace
     clean = " ".join(clean.split())
-    
-    # 4. Too short? Probably garbage
     if len(clean) < 3: return None
-    
     return clean.strip()
 
+def ai_janitor_clean_names(raw_list, provider, key):
+    """
+    Sends a batch of strings to AI to fix spacing and remove non-names.
+    """
+    if not raw_list or not key: return []
+    clean_results = []
+    chunk_size = 50 # Process 50 names at a time
+    
+    for i in range(0, len(raw_list), chunk_size):
+        batch = raw_list[i:i + chunk_size]
+        prompt = f"""
+        You are a Data Cleaning Expert.
+        
+        YOUR TASK:
+        1. Extract valid HUMAN NAMES (First + Last).
+        2. Fix spacing issues (e.g., "MariaSilva" -> "Maria Silva").
+        3. Remove junk text (e.g., "Projects | Lucas Silva" -> "Lucas Silva").
+        4. Split concatenated names (e.g., "Justin SilvaJuliette Silva" -> ["Justin Silva", "Juliette Silva"]).
+        5. Ignore items that are clearly not people (e.g., "Results for Silva", "Overview", "Jewelry").
+        
+        INPUT LIST:
+        {json.dumps(batch)}
+        
+        RETURN JSON:
+        {{ "cleaned_names": ["Name 1", "Name 2"] }}
+        """
+        resp = call_ai_api(prompt, provider, key)
+        try:
+            data = json.loads(clean_json_response(resp))
+            if "cleaned_names" in data:
+                clean_results.extend(data["cleaned_names"])
+        except: pass
+            
+    return clean_results
+
 # =========================================================
-#             PART 2: DATA & HELPERS
+#             PART 2: DATA LOADING
 # =========================================================
 def normalize_token(s: str) -> str:
     if not s: return ""
@@ -196,8 +222,10 @@ def get_driver(headless=True):
     
     try:
         if os.name == 'posix':
+            # Cloud: Use system driver
             return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
         else:
+            # Local: Use Manager
             return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
     except Exception as e:
         st.error(f"❌ Driver Error: {e}")
@@ -215,7 +243,7 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE
+#             PART 4: INTELLIGENCE & MATCHING
 # =========================================================
 def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
     if len(html_content) < 500: return None
@@ -256,7 +284,6 @@ def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGI
 def fast_extract_mode(html_content, selectors):
     soup = BeautifulSoup(html_content, "html.parser")
     extracted_names = []
-    
     if selectors.get("name_element"):
         elements = soup.select(selectors["name_element"])
         for el in elements:
@@ -265,7 +292,6 @@ def fast_extract_mode(html_content, selectors):
             
     nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
     next_selector = selectors.get("next_element") or selectors.get("next_link")
-    
     if next_selector:
         element = soup.select_one(next_selector)
         if element:
@@ -282,18 +308,14 @@ def fast_extract_mode(html_content, selectors):
                     if element.get("name"): form_data[element.get("name")] = element.get("value", "")
                     nav_result["form_data"] = form_data
                     if parent_form.get("action"): nav_result["next_url"] = parent_form.get("action")
-
     return {"names": extracted_names, "nav": nav_result}
 
 def match_names_detailed(names, source):
     found = []
-    seen_names = set() # Avoid duplicates in same batch
-    
+    seen_names = set()
     for n in names:
-        # CLEANUP: Apply the cleaning function first
         clean_n = clean_extracted_name(n)
         if not clean_n or clean_n in seen_names: continue
-        
         parts = clean_n.strip().split()
         if not parts: continue
         
@@ -315,7 +337,6 @@ def match_names_detailed(names, source):
                 "Source": source
             })
             seen_names.add(clean_n)
-            
     return found
 
 # =========================================================
@@ -566,7 +587,6 @@ if st.session_state.running:
                             learned_selectors = res_data["selectors"]
                             status_log.success(f"🎓 AI Found: {learned_selectors['name_element']}")
                     
-                    # DUMB FALLBACK
                     if not learned_selectors:
                         status_log.warning("⚠️ AI confused. Trying generic headers (h3)...")
                         learned_selectors = {"name_element": "h3"}
@@ -574,22 +594,23 @@ if st.session_state.running:
                     current_names = []
                     if learned_selectors:
                         els = soup.select(learned_selectors["name_element"])
-                        # Backup logic
                         if not els and learned_selectors["name_element"] == "h3":
                              els = soup.select("h4, h2, .result-title, a")
-                             
-                        # *** CLEAN EXTRACT ***
-                        # Using get_text(" ") adds space between elements like <span>Maria</span><span>Silva</span>
-                        current_names = [clean_extracted_name(e.get_text(" ", strip=True)) for e in els]
-                        current_names = [n for n in current_names if n] # remove None
+                        
+                        # Grab Raw messy text
+                        current_names = [e.get_text(" ", strip=True) for e in els]
+                        # Slight pre-filter to reduce AI load later
+                        current_names = [n for n in current_names if len(n) > 3 and "RESULTS FOR" not in n.upper()]
 
                     if current_names:
+                        # For Batch Mode, we collect slightly messy data now and clean later
+                        # For now, just match roughly to show progress
                         matches = match_names_detailed(current_names, f"Search: {surname}")
                         if matches:
                             all_matches.extend(matches)
                             all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                             table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                            status_log.write(f"✅ Found {len(matches)} for '{surname}'.")
+                            status_log.write(f"✅ Found {len(matches)} potential matches.")
                     else:
                         status_log.write(f"🤷 No results found for '{surname}'.")
                             
@@ -604,6 +625,26 @@ if st.session_state.running:
                     time.sleep(2)
         
         driver.quit()
+
+        # --- BATCH AI CLEANING (Final Step) ---
+        if use_ai_cleaning and all_matches:
+            status_log.write(f"🧹 AI is cleaning {len(all_matches)} total raw items... This may take a moment.")
+            
+            # 1. Extract raw names
+            raw_names_list = [m["Full Name"] for m in all_matches]
+            # Remove duplicates before sending
+            raw_names_list = list(set(raw_names_list))
+            
+            # 2. Send to AI
+            cleaned_names = ai_janitor_clean_names(raw_names_list, ai_provider, api_key)
+            
+            # 3. Re-Score
+            if cleaned_names:
+                all_matches = match_names_detailed(cleaned_names, "Batch Processed")
+                status_log.success(f"✨ Cleanup complete! Final count: {len(all_matches)} unique names.")
+                table_placeholder.dataframe(pd.DataFrame(all_matches), height=500)
+            else:
+                status_log.warning("⚠️ AI Cleaning returned 0 names. Keeping original list.")
 
     status_log.update(label="Mission Complete!", state="complete")
     st.session_state.running = False
