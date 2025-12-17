@@ -44,7 +44,7 @@ api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type=
 
 st.sidebar.markdown("---")
 search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results.")
-use_ai_cleaning = st.sidebar.checkbox("✨ Batch AI Cleaning", value=True, help="Wait until the end to clean all names in one go (Faster/Cheaper).")
+use_ai_cleaning = st.sidebar.checkbox("✨ Batch AI Cleaning", value=True, help="Wait until the end to clean all names in one go.")
 
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
@@ -74,25 +74,25 @@ def call_ai_api(prompt, provider, key):
     headers = {"Content-Type": "application/json"}
     try:
         if "Gemini" in provider:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+            url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=){key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
         elif "OpenAI" in provider:
-            url = "https://api.openai.com/v1/chat/completions"
+            url = "[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "gpt-4o", "messages": [{"role": "system", "content": "You are a Data Cleaning Assistant. Return JSON only."}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
         elif "Anthropic" in provider:
-            url = "https://api.anthropic.com/v1/messages"
+            url = "[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)"
             headers["x-api-key"] = key
             headers["anthropic-version"] = "2023-06-01"
             payload = {"model": "claude-3-5-sonnet-20241022", "max_tokens": 4000, "messages": [{"role": "user", "content": prompt}]}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
         elif "DeepSeek" in provider:
-            url = "https://api.deepseek.com/chat/completions"
+            url = "[https://api.deepseek.com/chat/completions](https://api.deepseek.com/chat/completions)"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -102,6 +102,9 @@ def call_ai_api(prompt, provider, key):
 
 def clean_json_response(text):
     if not text: return "{}"
+    # Remove markdown code blocks if present
+    text = re.sub(r'```json', '', text)
+    text = re.sub(r'```', '', text)
     try:
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match: return match.group(0)
@@ -109,32 +112,23 @@ def clean_json_response(text):
     except: return text
 
 def clean_extracted_name(raw_text):
-    """
-    Basic cleanup before AI. Removes obvious junk like "Results for..."
-    """
     if not raw_text: return None
     upper = raw_text.upper()
     if "RESULTS FOR" in upper or "SEARCH" in upper or "WEBSITE" in upper: return None
-    # Split on common separators (|, -, –, », (, etc.)
     clean = re.split(r'[|\-–—»\(\)]', raw_text)[0]
     clean = " ".join(clean.split())
     if len(clean) < 3: return None
     return clean.strip()
 
 def ai_janitor_clean_names(raw_list, provider, key):
-    """
-    Robust Version: Handles loose JSON and smaller batches.
-    """
     if not raw_list or not key: return []
     clean_results = []
-    chunk_size = 30 # Smaller batches = less errors
+    chunk_size = 30 
     
     for i in range(0, len(raw_list), chunk_size):
         batch = raw_list[i:i + chunk_size]
-        
         prompt = f"""
-        You are a Data Cleaning Assistant. Clean this list of messy strings.
-        
+        You are a Data Cleaning Expert.
         RULES:
         1. Extract HUMAN NAMES.
         2. Fix spacing (e.g. "MariaSilva" -> "Maria Silva").
@@ -142,33 +136,31 @@ def ai_janitor_clean_names(raw_list, provider, key):
         4. If a string contains multiple names, split them.
         5. Return a simple JSON list of strings.
         
-        INPUT:
-        {json.dumps(batch)}
+        INPUT: {json.dumps(batch)}
         
-        RETURN JSON FORMAT:
-        {{ "cleaned_names": ["Name 1", "Name 2"] }}
+        RETURN JSON FORMAT: {{ "cleaned_names": ["Name 1", "Name 2"] }}
         """
         
         try:
             resp_text = call_ai_api(prompt, provider, key)
-            if not resp_text: continue
-            
-            # Cleaning the response text to ensure it's valid JSON
+            if not resp_text: 
+                clean_results.extend(batch) # Fallback to original
+                continue
+                
             clean_text = clean_json_response(resp_text)
             data = json.loads(clean_text)
             
-            # Handle different JSON structures
             if isinstance(data, dict) and "cleaned_names" in data:
                 clean_results.extend(data["cleaned_names"])
             elif isinstance(data, list):
                 clean_results.extend(data)
+            else:
+                clean_results.extend(batch) # Fallback
                 
-        except Exception as e:
-            # If AI fails for a batch, just keep the original non-empty items
-            # This prevents losing data if the API hiccups
-            clean_results.extend([x for x in batch if len(x) > 3])
+        except Exception:
+            clean_results.extend(batch) # Fallback
             
-    return list(set(clean_results)) # Remove duplicates
+    return list(set(clean_results))
 
 # =========================================================
 #             PART 2: DATA LOADING
@@ -186,8 +178,8 @@ def clean_html_for_ai(html_text):
 
 @st.cache_data(ttl=86400)
 def fetch_ibge_data(limit_first, limit_surname):
-    IBGE_FIRST = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
-    IBGE_SURNAME = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
+    IBGE_FIRST = "[https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome](https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome)"
+    IBGE_SURNAME = "[https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome](https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome)"
     
     def _fetch(url, limit):
         data_map = {} 
@@ -236,10 +228,8 @@ def get_driver(headless=True):
     
     try:
         if os.name == 'posix':
-            # Cloud: Use system driver
             return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
         else:
-            # Local: Use Manager
             return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
     except Exception as e:
         st.error(f"❌ Driver Error: {e}")
@@ -257,7 +247,7 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE & MATCHING
+#             PART 4: INTELLIGENCE
 # =========================================================
 def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
     if len(html_content) < 500: return None
@@ -358,7 +348,7 @@ def match_names_detailed(names, source):
 # =========================================================
 st.markdown("### 🤖 Auto-Pilot Control Center")
 c1, c2 = st.columns([3, 1])
-start_url = c1.text_input("Target URL", placeholder="https://directory.example.com")
+start_url = c1.text_input("Target URL", placeholder="[https://directory.example.com](https://directory.example.com)")
 max_pages = c2.number_input("Max Pages / Search Cycles", 1, 500, 10)
 
 st.write("---")
@@ -398,7 +388,7 @@ if st.session_state.running:
     # ----------------------------------------------------
     if "Search Injection" not in mode:
         session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"})
+        session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "[https://google.com](https://google.com)"})
         
         driver = None
         if "Infinite" in mode: 
@@ -503,7 +493,6 @@ if st.session_state.running:
         except: 
             status_log.error("Could not load URL"); driver.quit(); st.stop()
         
-        # --- POPUP KILLER ---
         try:
             driver.execute_script("""
                 const buttons = document.querySelectorAll('button, a');
@@ -552,10 +541,8 @@ if st.session_state.running:
             status_log.update(label=f"🔎 Checking '{surname}' ({i+1}/{max_pages})", state="running")
             search_success = False
             
-            # --- 1. INTERACTION ---
             try:
                 inp = driver.find_element(By.CSS_SELECTOR, sel_input)
-                # Strategy C: JS Injection (Most Reliable)
                 driver.execute_script(f"arguments[0].value = '{surname}';", inp)
                 
                 try: inp.send_keys(Keys.RETURN)
@@ -569,9 +556,7 @@ if st.session_state.running:
                 driver.get(start_url)
                 time.sleep(3)
 
-            # --- 2. WAIT & SCRAPE ---
             if search_success:
-                # PROGRESS BAR
                 prog_bar = table_placeholder.progress(0)
                 step_val = 1.0 / search_delay
                 current_val = 0.0
@@ -582,12 +567,10 @@ if st.session_state.running:
                     prog_bar.progress(current_val)
                 prog_bar.empty()
 
-                # --- DEBUG SCREENSHOT ---
                 screenshot = driver.get_screenshot_as_png()
                 with st.sidebar.expander(f"📸 Results: {surname}", expanded=True):
                     st.image(screenshot, caption=f"Screen after waiting for {surname}")
 
-                # Extract
                 try:
                     soup = BeautifulSoup(driver.page_source, "html.parser")
                     
@@ -611,14 +594,10 @@ if st.session_state.running:
                         if not els and learned_selectors["name_element"] == "h3":
                              els = soup.select("h4, h2, .result-title, a")
                         
-                        # Grab Raw messy text
                         current_names = [e.get_text(" ", strip=True) for e in els]
-                        # Slight pre-filter to reduce AI load later
-                        current_names = [n for n in current_names if len(n) > 3 and "RESULTS FOR" not in n.upper()]
+                        current_names = [n for n in current_names if len(n) > 3]
 
                     if current_names:
-                        # For Batch Mode, we collect slightly messy data now and clean later
-                        # For now, just match roughly to show progress
                         matches = match_names_detailed(current_names, f"Search: {surname}")
                         if matches:
                             all_matches.extend(matches)
@@ -630,7 +609,6 @@ if st.session_state.running:
                             
                 except: pass
 
-                # Reset
                 try: 
                     driver.execute_script("window.history.go(-1)")
                     time.sleep(2)
@@ -640,25 +618,20 @@ if st.session_state.running:
         
         driver.quit()
 
-        # --- BATCH AI CLEANING (Final Step) ---
+        # --- BATCH AI CLEANING ---
         if use_ai_cleaning and all_matches:
-            status_log.write(f"🧹 AI is cleaning {len(all_matches)} total raw items... This may take a moment.")
-            
-            # 1. Extract raw names
+            status_log.write(f"🧹 AI is cleaning {len(all_matches)} items... (Might take 30s)")
             raw_names_list = [m["Full Name"] for m in all_matches]
-            # Remove duplicates before sending
-            raw_names_list = list(set(raw_names_list))
+            raw_names_list = list(set(raw_names_list)) # De-dupe
             
-            # 2. Send to AI
             cleaned_names = ai_janitor_clean_names(raw_names_list, ai_provider, api_key)
             
-            # 3. Re-Score
             if cleaned_names:
                 all_matches = match_names_detailed(cleaned_names, "Batch Processed")
-                status_log.success(f"✨ Cleanup complete! Final count: {len(all_matches)} unique names.")
+                status_log.success(f"✨ Final Count: {len(all_matches)} unique names.")
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=500)
             else:
-                status_log.warning("⚠️ AI Cleaning returned 0 names. Keeping original list.")
+                status_log.warning("⚠️ Cleanup failed. Using original data.")
 
     status_log.update(label="Mission Complete!", state="complete")
     st.session_state.running = False
