@@ -12,7 +12,7 @@ from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# --- SELENIUM SETUP ---
+# --- SELENIUM IMPORT SAFETY ---
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -34,7 +34,7 @@ st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
 if "running" not in st.session_state: st.session_state.running = False
 
-# --- SIDEBAR: AI BRAIN ---
+# --- SIDEBAR ---
 st.sidebar.header("🧠 AI Brain")
 ai_provider = st.sidebar.selectbox(
     "Choose your Model:",
@@ -57,7 +57,7 @@ if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.sidebar.warning("Mission Aborted.")
     st.stop()
 
-# --- BLOCKLIST ---
+# --- BLOCKLIST (Aggressive Filter) ---
 BLOCKLIST_SURNAMES = {
     "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
     "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
@@ -65,7 +65,10 @@ BLOCKLIST_SURNAMES = {
     "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
     "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
     "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN",
-    "RESULTS", "WEBSITE", "SEARCH", "MENU", "SKIP", "CONTENT", "FOOTER", "HEADER", "OVERVIEW", "PROJECTS"
+    # Junk Words
+    "RESULTS", "WEBSITE", "SEARCH", "MENU", "SKIP", "CONTENT", "FOOTER", "HEADER", 
+    "OVERVIEW", "PROJECTS", "PEOPLE", "PROFILE", "VIEW", "CONTACT", "SPOTLIGHT", 
+    "EDITION", "JEWELS", "COLAR", "PAINTER", "GUIDE", "LOG", "REVIEW", "PDF"
 }
 
 # =========================================================
@@ -113,12 +116,31 @@ def clean_json_response(text):
     except: return text
 
 def clean_extracted_name(raw_text):
+    """
+    Aggressive cleaning function.
+    """
     if not raw_text: return None
+    
+    # 1. Junk Check
     upper = raw_text.upper()
-    if "RESULTS FOR" in upper or "SEARCH" in upper or "WEBSITE" in upper: return None
-    clean = re.split(r'[|\-–—»\(\)]', raw_text)[0]
+    for bad_word in ["RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "JEWELS", "SPOTLIGHT"]:
+        if bad_word in upper: return None
+
+    # 2. Prefix Removal (e.g. "Student Spotlight: Josh Souza" -> "Josh Souza")
+    # Removes anything before the last colon if present
+    if ":" in raw_text:
+        raw_text = raw_text.split(":")[-1]
+
+    # 3. Suffix Removal (e.g. "Fernando, University of..." -> "Fernando")
+    # Splits on common dividers and takes the first part
+    clean = re.split(r'[|,\-–—»\(\)]', raw_text)[0]
+    
     clean = " ".join(clean.split())
+    
+    # 4. Length Check (Names usually aren't 6 words long)
+    if len(clean.split()) > 5: return None
     if len(clean) < 3: return None
+    
     return clean.strip()
 
 def ai_janitor_clean_names(raw_list, provider, key):
@@ -130,21 +152,21 @@ def ai_janitor_clean_names(raw_list, provider, key):
         batch = raw_list[i:i + chunk_size]
         prompt = f"""
         You are a Data Cleaning Expert.
-        RULES:
-        1. Extract HUMAN NAMES.
-        2. Fix spacing (e.g. "MariaSilva" -> "Maria Silva").
-        3. Remove titles/junk (e.g. "Projects | Lucas" -> "Lucas").
-        4. Split concatenated names.
-        5. Return JSON list.
         
-        INPUT: {json.dumps(batch)}
-        RETURN JSON FORMAT: {{ "cleaned_names": ["Name 1", "Name 2"] }}
+        INPUT LIST: {json.dumps(batch)}
+
+        RULES:
+        1. Extract ONLY valid PERSON names. 
+        2. DELETE entries that are products (e.g. "Colar", "Edition"), titles (e.g. "Spotlight", "Profile"), or junk.
+        3. Remove prefixes/suffixes (e.g. "Dr. Name" -> "Name", "Name, PhD" -> "Name").
+        4. Fix spacing (e.g. "MariaSilva" -> "Maria Silva").
+        5. If uncertain, DELETE IT. Better to miss a name than include junk.
+        
+        RETURN JSON: {{ "cleaned_names": ["Name 1", "Name 2"] }}
         """
         try:
             resp_text = call_ai_api(prompt, provider, key)
-            if not resp_text: 
-                clean_results.extend([x for x in batch if len(x)>3])
-                continue
+            if not resp_text: continue
             
             clean_text = clean_json_response(resp_text)
             data = json.loads(clean_text)
@@ -153,10 +175,7 @@ def ai_janitor_clean_names(raw_list, provider, key):
                 clean_results.extend(data["cleaned_names"])
             elif isinstance(data, list):
                 clean_results.extend(data)
-            else:
-                clean_results.extend([x for x in batch if len(x)>3])
-        except:
-            clean_results.extend([x for x in batch if len(x)>3])
+        except: pass
             
     return list(set(clean_results))
 
@@ -307,11 +326,13 @@ def match_names_detailed(names, source):
     found = []
     seen = set()
     for n in names:
+        # Re-Clean just in case
         clean_n = clean_extracted_name(n)
         if not clean_n or clean_n in seen: continue
         
         parts = clean_n.strip().split()
-        if not parts: continue
+        if len(parts) < 2: continue # Must have at least First + Last
+        
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         if l in BLOCKLIST_SURNAMES or f in BLOCKLIST_SURNAMES: continue
         
@@ -374,7 +395,7 @@ if st.session_state.running:
     learned_selectors = None
     
     # ==========================================================
-    # BRANCH A: CLASSIC & INFINITE SCROLL (Restored!)
+    # BRANCH A: CLASSIC & INFINITE SCROLL
     # ==========================================================
     if "Search Injection" not in mode:
         session = requests.Session()
@@ -559,9 +580,13 @@ if st.session_state.running:
                     els = soup.select(learned_selectors["name_element"])
                     if not els and learned_selectors["name_element"] == "h3":
                         els = soup.select("h4, h2, .result-title, a")
-                        
-                    raw_names = [e.get_text(" ", strip=True) for e in els]
-                    raw_names = [n for n in raw_names if len(n)>3 and "RESULTS" not in n.upper()]
+                    
+                    # RAW EXTRACTION (We clean it later)
+                    raw_names = []
+                    for e in els:
+                        # Clean aggressive FIRST
+                        clean = clean_extracted_name(e.get_text(" ", strip=True))
+                        if clean: raw_names.append(clean)
 
                     if raw_names:
                         matches = match_names_detailed(raw_names, f"Search: {surname}")
