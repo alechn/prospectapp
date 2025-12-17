@@ -123,38 +123,52 @@ def clean_extracted_name(raw_text):
 
 def ai_janitor_clean_names(raw_list, provider, key):
     """
-    Sends a batch of strings to AI to fix spacing and remove non-names.
+    Robust Version: Handles loose JSON and smaller batches.
     """
     if not raw_list or not key: return []
     clean_results = []
-    chunk_size = 50 # Process 50 names at a time
+    chunk_size = 30 # Smaller batches = less errors
     
     for i in range(0, len(raw_list), chunk_size):
         batch = raw_list[i:i + chunk_size]
+        
         prompt = f"""
-        You are a Data Cleaning Expert.
+        You are a Data Cleaning Assistant. Clean this list of messy strings.
         
-        YOUR TASK:
-        1. Extract valid HUMAN NAMES (First + Last).
-        2. Fix spacing issues (e.g., "MariaSilva" -> "Maria Silva").
-        3. Remove junk text (e.g., "Projects | Lucas Silva" -> "Lucas Silva").
-        4. Split concatenated names (e.g., "Justin SilvaJuliette Silva" -> ["Justin Silva", "Juliette Silva"]).
-        5. Ignore items that are clearly not people (e.g., "Results for Silva", "Overview", "Jewelry").
+        RULES:
+        1. Extract HUMAN NAMES.
+        2. Fix spacing (e.g. "MariaSilva" -> "Maria Silva").
+        3. Remove titles/junk (e.g. "Projects | Lucas" -> "Lucas").
+        4. If a string contains multiple names, split them.
+        5. Return a simple JSON list of strings.
         
-        INPUT LIST:
+        INPUT:
         {json.dumps(batch)}
         
-        RETURN JSON:
+        RETURN JSON FORMAT:
         {{ "cleaned_names": ["Name 1", "Name 2"] }}
         """
-        resp = call_ai_api(prompt, provider, key)
+        
         try:
-            data = json.loads(clean_json_response(resp))
-            if "cleaned_names" in data:
-                clean_results.extend(data["cleaned_names"])
-        except: pass
+            resp_text = call_ai_api(prompt, provider, key)
+            if not resp_text: continue
             
-    return clean_results
+            # Cleaning the response text to ensure it's valid JSON
+            clean_text = clean_json_response(resp_text)
+            data = json.loads(clean_text)
+            
+            # Handle different JSON structures
+            if isinstance(data, dict) and "cleaned_names" in data:
+                clean_results.extend(data["cleaned_names"])
+            elif isinstance(data, list):
+                clean_results.extend(data)
+                
+        except Exception as e:
+            # If AI fails for a batch, just keep the original non-empty items
+            # This prevents losing data if the API hiccups
+            clean_results.extend([x for x in batch if len(x) > 3])
+            
+    return list(set(clean_results)) # Remove duplicates
 
 # =========================================================
 #             PART 2: DATA LOADING
