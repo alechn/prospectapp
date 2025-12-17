@@ -43,14 +43,12 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 st.sidebar.markdown("---")
-# --- GLOBAL SETTINGS ---
-search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results in Search Mode.")
+search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results.")
 use_ai_cleaning = st.sidebar.checkbox("✨ Batch AI Cleaning", value=True, help="Wait until the end to clean all names in one go.")
 
-# --- DEBUG & MANUAL OVERRIDES ---
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
-    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3 or div.alumni-name")
+    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3")
 
 if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.session_state.running = False
@@ -68,7 +66,8 @@ BLOCKLIST_SURNAMES = {
     # Junk Words
     "RESULTS", "WEBSITE", "SEARCH", "MENU", "SKIP", "CONTENT", "FOOTER", "HEADER", 
     "OVERVIEW", "PROJECTS", "PEOPLE", "PROFILE", "VIEW", "CONTACT", "SPOTLIGHT", 
-    "EDITION", "JEWELS", "COLAR", "PAINTER", "GUIDE", "LOG", "REVIEW", "PDF"
+    "EDITION", "JEWELS", "COLAR", "PAINTER", "GUIDE", "LOG", "REVIEW", "PDF",
+    "CALCULATION", "EXPERIENCE", "WAGE", "LIVING", "GOING", "FAST", "ANTONY", "CLEOPATRA"
 }
 
 # =========================================================
@@ -83,6 +82,7 @@ def call_ai_api(prompt, provider, key):
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
+            else: st.error(f"AI Error {resp.status_code}: {resp.text}")
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -102,7 +102,9 @@ def call_ai_api(prompt, provider, key):
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
-    except: return None
+    except Exception as e: 
+        st.error(f"API Call Failed: {e}")
+        return None
     return None
 
 def clean_json_response(text):
@@ -117,28 +119,32 @@ def clean_json_response(text):
 
 def clean_extracted_name(raw_text):
     """
-    Aggressive cleaning function.
+    Aggressive cleaning function. Filters junk phrases immediately.
     """
-    if not raw_text: return None
+    if not isinstance(raw_text, str): return None
     
-    # 1. Junk Check
+    # 1. Block Junk Phrases (The "MIT Experience" Killer)
     upper = raw_text.upper()
-    for bad_word in ["RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "JEWELS", "SPOTLIGHT"]:
-        if bad_word in upper: return None
+    junk_phrases = [
+        "RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "JEWELS", "SPOTLIGHT",
+        "EXPERIENCE IN", "CALCULATION FOR", "LIVING WAGE", "GOING FAST", 
+        "ANTONY AND", "GUIDE TO", "LOG OF", "REVIEW OF", "MENU", "SKIP TO", 
+        "CONTENT", "FOOTER", "HEADER", "OVERVIEW", "PROJECTS", "PEOPLE",
+        "PROFILE", "VIEW", "CONTACT"
+    ]
+    if any(phrase in upper for phrase in junk_phrases):
+        return None
 
-    # 2. Prefix Removal (e.g. "Student Spotlight: Josh Souza" -> "Josh Souza")
-    # Removes anything before the last colon if present
-    if ":" in raw_text:
-        raw_text = raw_text.split(":")[-1]
-
-    # 3. Suffix Removal (e.g. "Fernando, University of..." -> "Fernando")
-    # Splits on common dividers and takes the first part
-    clean = re.split(r'[|,\-–—»\(\)]', raw_text)[0]
+    # 2. Prefix/Suffix Removal
+    # Remove text before colons (e.g. "Spotlight: Josh")
+    if ":" in raw_text: raw_text = raw_text.split(":")[-1]
     
+    # Split on common dividers
+    clean = re.split(r'[|,\-–—»\(\)]', raw_text)[0]
     clean = " ".join(clean.split())
     
-    # 4. Length Check (Names usually aren't 6 words long)
-    if len(clean.split()) > 5: return None
+    # 3. Validations
+    if len(clean.split()) > 5: return None # Too long to be a name
     if len(clean) < 3: return None
     
     return clean.strip()
@@ -147,6 +153,9 @@ def ai_janitor_clean_names(raw_list, provider, key):
     if not raw_list or not key: return []
     clean_results = []
     chunk_size = 30
+    
+    # DEBUG: Show progress
+    progress_bar = st.progress(0)
     
     for i in range(0, len(raw_list), chunk_size):
         batch = raw_list[i:i + chunk_size]
@@ -160,13 +169,15 @@ def ai_janitor_clean_names(raw_list, provider, key):
         2. DELETE entries that are products (e.g. "Colar", "Edition"), titles (e.g. "Spotlight", "Profile"), or junk.
         3. Remove prefixes/suffixes (e.g. "Dr. Name" -> "Name", "Name, PhD" -> "Name").
         4. Fix spacing (e.g. "MariaSilva" -> "Maria Silva").
-        5. If uncertain, DELETE IT. Better to miss a name than include junk.
         
         RETURN JSON: {{ "cleaned_names": ["Name 1", "Name 2"] }}
         """
+        
         try:
             resp_text = call_ai_api(prompt, provider, key)
-            if not resp_text: continue
+            if not resp_text: 
+                clean_results.extend(batch)
+                continue
             
             clean_text = clean_json_response(resp_text)
             data = json.loads(clean_text)
@@ -175,7 +186,14 @@ def ai_janitor_clean_names(raw_list, provider, key):
                 clean_results.extend(data["cleaned_names"])
             elif isinstance(data, list):
                 clean_results.extend(data)
-        except: pass
+            else:
+                clean_results.extend(batch)
+                
+        except Exception as e:
+            st.warning(f"Batch {i//chunk_size + 1} Failed: {e}")
+            clean_results.extend(batch)
+        
+        progress_bar.progress(min((i + chunk_size) / len(raw_list), 1.0))
             
     return list(set(clean_results))
 
@@ -326,12 +344,11 @@ def match_names_detailed(names, source):
     found = []
     seen = set()
     for n in names:
-        # Re-Clean just in case
         clean_n = clean_extracted_name(n)
         if not clean_n or clean_n in seen: continue
         
         parts = clean_n.strip().split()
-        if len(parts) < 2: continue # Must have at least First + Last
+        if len(parts) < 2: continue 
         
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         if l in BLOCKLIST_SURNAMES or f in BLOCKLIST_SURNAMES: continue
