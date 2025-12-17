@@ -12,7 +12,7 @@ from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# --- SELENIUM IMPORT SAFETY ---
+# --- SELENIUM SETUP ---
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -34,7 +34,7 @@ st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
 if "running" not in st.session_state: st.session_state.running = False
 
-# --- SIDEBAR ---
+# --- SIDEBAR: AI BRAIN ---
 st.sidebar.header("🧠 AI Brain")
 ai_provider = st.sidebar.selectbox(
     "Choose your Model:",
@@ -43,12 +43,14 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 st.sidebar.markdown("---")
-search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results.")
+# --- GLOBAL SETTINGS ---
+search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results in Search Mode.")
 use_ai_cleaning = st.sidebar.checkbox("✨ Batch AI Cleaning", value=True, help="Wait until the end to clean all names in one go.")
 
+# --- DEBUG & MANUAL OVERRIDES ---
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
-    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3")
+    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3 or div.alumni-name")
 
 if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.session_state.running = False
@@ -74,25 +76,25 @@ def call_ai_api(prompt, provider, key):
     headers = {"Content-Type": "application/json"}
     try:
         if "Gemini" in provider:
-            url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=){key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
         elif "OpenAI" in provider:
-            url = "[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)"
+            url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "gpt-4o", "messages": [{"role": "system", "content": "You are a Data Cleaning Assistant. Return JSON only."}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
         elif "Anthropic" in provider:
-            url = "[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)"
+            url = "https://api.anthropic.com/v1/messages"
             headers["x-api-key"] = key
             headers["anthropic-version"] = "2023-06-01"
             payload = {"model": "claude-3-5-sonnet-20241022", "max_tokens": 4000, "messages": [{"role": "user", "content": prompt}]}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['content'][0]['text']
         elif "DeepSeek" in provider:
-            url = "[https://api.deepseek.com/chat/completions](https://api.deepseek.com/chat/completions)"
+            url = "https://api.deepseek.com/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -102,7 +104,6 @@ def call_ai_api(prompt, provider, key):
 
 def clean_json_response(text):
     if not text: return "{}"
-    # Remove markdown code blocks if present
     text = re.sub(r'```json', '', text)
     text = re.sub(r'```', '', text)
     try:
@@ -123,7 +124,7 @@ def clean_extracted_name(raw_text):
 def ai_janitor_clean_names(raw_list, provider, key):
     if not raw_list or not key: return []
     clean_results = []
-    chunk_size = 30 
+    chunk_size = 30
     
     for i in range(0, len(raw_list), chunk_size):
         batch = raw_list[i:i + chunk_size]
@@ -133,20 +134,18 @@ def ai_janitor_clean_names(raw_list, provider, key):
         1. Extract HUMAN NAMES.
         2. Fix spacing (e.g. "MariaSilva" -> "Maria Silva").
         3. Remove titles/junk (e.g. "Projects | Lucas" -> "Lucas").
-        4. If a string contains multiple names, split them.
-        5. Return a simple JSON list of strings.
+        4. Split concatenated names.
+        5. Return JSON list.
         
         INPUT: {json.dumps(batch)}
-        
         RETURN JSON FORMAT: {{ "cleaned_names": ["Name 1", "Name 2"] }}
         """
-        
         try:
             resp_text = call_ai_api(prompt, provider, key)
             if not resp_text: 
-                clean_results.extend(batch) # Fallback to original
+                clean_results.extend([x for x in batch if len(x)>3])
                 continue
-                
+            
             clean_text = clean_json_response(resp_text)
             data = json.loads(clean_text)
             
@@ -155,10 +154,9 @@ def ai_janitor_clean_names(raw_list, provider, key):
             elif isinstance(data, list):
                 clean_results.extend(data)
             else:
-                clean_results.extend(batch) # Fallback
-                
-        except Exception:
-            clean_results.extend(batch) # Fallback
+                clean_results.extend([x for x in batch if len(x)>3])
+        except:
+            clean_results.extend([x for x in batch if len(x)>3])
             
     return list(set(clean_results))
 
@@ -178,8 +176,8 @@ def clean_html_for_ai(html_text):
 
 @st.cache_data(ttl=86400)
 def fetch_ibge_data(limit_first, limit_surname):
-    IBGE_FIRST = "[https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome](https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome)"
-    IBGE_SURNAME = "[https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome](https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome)"
+    IBGE_FIRST = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
+    IBGE_SURNAME = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
     
     def _fetch(url, limit):
         data_map = {} 
@@ -206,7 +204,9 @@ try:
     first_name_ranks, surname_ranks = fetch_ibge_data(limit_first, limit_surname)
     sorted_surnames = sorted(surname_ranks.keys(), key=lambda k: surname_ranks[k])
     st.sidebar.success(f"✅ DB Loaded: {len(first_name_ranks)} Firsts / {len(surname_ranks)} Surnames")
-except: st.stop()
+except Exception as e:
+    st.error(f"IBGE API Error: {e}")
+    st.stop()
 
 # =========================================================
 #             PART 3: DRIVERS (CLOUD/LOCAL)
@@ -247,38 +247,25 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE
+#             PART 4: INTELLIGENCE & TEMPLATES
 # =========================================================
 def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
     if len(html_content) < 500: return None
     
     if task_type == "SEARCH_BOX":
-        task_desc = '2. Identify the CSS Selector for the SEARCH INPUT BOX.\n3. Identify the CSS Selector for the SEARCH SUBMIT BUTTON.'
+        task_desc = '2. Identify CSS for SEARCH INPUT.\n3. Identify CSS for SUBMIT BUTTON.'
         json_desc = '"search_input": "input[name=q]", "search_button": "button[type=submit]"'
     else:
-        task_desc = '2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT (Link or Button).\n3. CHECK PAGINATION: Look for "Page 1 of X". Extract TOTAL PAGES.'
-        json_desc = '"next_element": "a.next", "total_pages": 50'
+        task_desc = '2. Identify CSS for "Next Page" LINK.'
+        json_desc = '"next_element": "a.next"'
 
     prompt = f"""
-    You are a web scraping expert. Analyze the HTML from {current_url}.
-    
-    1. Identify the CSS Selector for NAMES.
+    Analyze HTML from {current_url}.
+    1. Identify CSS Selector for NAMES.
     {task_desc}
-    
-    Return JSON:
-    {{
-      "names": ["Name 1", "Name 2"],
-      "selectors": {{
-         "name_element": "div.alumni-name",
-         {json_desc}
-      }},
-      "navigation": {{ "type": "LINK" or "FORM", "url": "...", "form_data": {{...}} }}
-    }}
-    
-    HTML:
-    {clean_html_for_ai(html_content)} 
+    Return JSON: {{ "selectors": {{ "name_element": "div.alumni-name", {json_desc} }} }}
+    HTML: {clean_html_for_ai(html_content)} 
     """
-    
     for _ in range(2): 
         raw = call_ai_api(prompt, provider, key)
         if raw: return json.loads(clean_json_response(raw))
@@ -288,6 +275,7 @@ def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGI
 def fast_extract_mode(html_content, selectors):
     soup = BeautifulSoup(html_content, "html.parser")
     extracted_names = []
+    
     if selectors.get("name_element"):
         elements = soup.select(selectors["name_element"])
         for el in elements:
@@ -296,6 +284,7 @@ def fast_extract_mode(html_content, selectors):
             
     nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
     next_selector = selectors.get("next_element") or selectors.get("next_link")
+    
     if next_selector:
         element = soup.select_one(next_selector)
         if element:
@@ -316,17 +305,18 @@ def fast_extract_mode(html_content, selectors):
 
 def match_names_detailed(names, source):
     found = []
-    seen_names = set()
+    seen = set()
     for n in names:
         clean_n = clean_extracted_name(n)
-        if not clean_n or clean_n in seen_names: continue
+        if not clean_n or clean_n in seen: continue
+        
         parts = clean_n.strip().split()
         if not parts: continue
-        
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         if l in BLOCKLIST_SURNAMES or f in BLOCKLIST_SURNAMES: continue
         
-        rank_f, rank_l = first_name_ranks.get(f, 0), surname_ranks.get(l, 0)
+        rank_f = first_name_ranks.get(f, 0)
+        rank_l = surname_ranks.get(l, 0)
         
         score = 0
         if rank_f > 0: score += ((limit_first - rank_f)/limit_first)*50
@@ -340,7 +330,7 @@ def match_names_detailed(names, source):
                 "Match Type": m_type, 
                 "Source": source
             })
-            seen_names.add(clean_n)
+            seen.add(clean_n)
     return found
 
 # =========================================================
@@ -348,7 +338,7 @@ def match_names_detailed(names, source):
 # =========================================================
 st.markdown("### 🤖 Auto-Pilot Control Center")
 c1, c2 = st.columns([3, 1])
-start_url = c1.text_input("Target URL", placeholder="[https://directory.example.com](https://directory.example.com)")
+start_url = c1.text_input("Target URL", placeholder="https://directory.example.com")
 max_pages = c2.number_input("Max Pages / Search Cycles", 1, 500, 10)
 
 st.write("---")
@@ -383,12 +373,12 @@ if st.session_state.running:
     all_matches = []
     learned_selectors = None
     
-    # ----------------------------------------------------
-    # BRANCH A: PAGINATION & SCROLLING
-    # ----------------------------------------------------
+    # ==========================================================
+    # BRANCH A: CLASSIC & INFINITE SCROLL (Restored!)
+    # ==========================================================
     if "Search Injection" not in mode:
         session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "[https://google.com](https://google.com)"})
+        session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"})
         
         driver = None
         if "Infinite" in mode: 
@@ -479,171 +469,140 @@ if st.session_state.running:
         
         if driver: driver.quit()
 
-    # ----------------------------------------------------
-    # BRANCH B: SEARCH INJECTION (CLEANER EDITION)
-    # ----------------------------------------------------
+    # ==========================================================
+    # BRANCH B: SEARCH INJECTION (FINAL BACKUP EDITION)
+    # ==========================================================
     else:
         driver = get_driver(headless=run_headless)
-        if not driver: status_log.error("Aborted: Driver failed."); st.stop()
+        if not driver: status_log.error("Driver Failed"); st.stop()
         
-        status_log.write("🔧 Browser Launched")
+        status_log.write(f"📝 Checking against IBGE DB ({len(sorted_surnames)} surnames).")
+        
         try: 
             driver.get(start_url)
             time.sleep(5)
         except: 
-            status_log.error("Could not load URL"); driver.quit(); st.stop()
-        
+            status_log.error("Bad URL"); driver.quit(); st.stop()
+
+        # Cookie Killer
         try:
-            driver.execute_script("""
-                const buttons = document.querySelectorAll('button, a');
-                buttons.forEach(btn => {
-                    if(btn.innerText.toLowerCase().includes('accept') || 
-                       btn.innerText.toLowerCase().includes('agree') ||
-                       btn.innerText.toLowerCase().includes('cookie')) {
-                        btn.click();
-                    }
-                });
-            """)
+            driver.execute_script("document.querySelectorAll('button,a').forEach(b=>{if(/accept|agree|cookie/i.test(b.innerText))b.click()})")
         except: pass
         
-        status_log.write("🧠 Finding Search Box...")
-        
+        # Find Search Box
         sel_input = None
         sel_btn = None
         if manual_search_selector: sel_input = manual_search_selector
         
         if not sel_input:
+            status_log.write("🧠 AI Finding Search Box...")
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
                 sel_input = data["selectors"]["search_input"]
                 sel_btn = data["selectors"].get("search_button")
         
         if not sel_input:
-            status_log.write("⚠️ Trying standard selectors...")
-            fallbacks = ["input[type='search']", "input[name='q']", "input[name='query']", "input[placeholder*='Search']", "input[aria-label='Search']"]
-            for f in fallbacks:
-                try:
-                    if driver.find_elements(By.CSS_SELECTOR, f):
-                        sel_input = f
-                        break
-                except: continue
+            status_log.write("⚠️ Using standard selectors...")
+            for f in ["input[type='search']", "input[name='q']", "input[name='query']", "input[aria-label='Search']"]:
+                if len(driver.find_elements(By.CSS_SELECTOR, f)) > 0:
+                    sel_input = f
+                    break
         
         if not sel_input:
-            status_log.error("❌ Search box not found. Check Debug View.")
+            status_log.error("❌ No Search Box Found.")
             driver.quit(); st.stop()
             
-        status_log.success(f"🎯 Target Locked: {sel_input}")
+        status_log.success(f"🎯 Target: {sel_input}")
 
-        # --- LOOP ---
+        # LOOP
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
             
             status_log.update(label=f"🔎 Checking '{surname}' ({i+1}/{max_pages})", state="running")
-            search_success = False
+            success = False
             
             try:
                 inp = driver.find_element(By.CSS_SELECTOR, sel_input)
                 driver.execute_script(f"arguments[0].value = '{surname}';", inp)
-                
                 try: inp.send_keys(Keys.RETURN)
                 except: 
                     try: inp.submit()
                     except:
                         if sel_btn: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
-                search_success = True
-            except Exception as e:
-                status_log.warning(f"⚠️ Failed to type '{surname}'. Reloading...")
-                driver.get(start_url)
-                time.sleep(3)
+                success = True
+            except:
+                driver.get(start_url); time.sleep(3)
 
-            if search_success:
-                prog_bar = table_placeholder.progress(0)
-                step_val = 1.0 / search_delay
-                current_val = 0.0
-                for _ in range(search_delay):
+            if success:
+                # Timer
+                bar = table_placeholder.progress(0)
+                for t in range(search_delay):
                     time.sleep(1)
-                    current_val += step_val
-                    if current_val > 1.0: current_val = 1.0
-                    prog_bar.progress(current_val)
-                prog_bar.empty()
+                    bar.progress((t+1)/search_delay)
+                bar.empty()
 
-                screenshot = driver.get_screenshot_as_png()
-                with st.sidebar.expander(f"📸 Results: {surname}", expanded=True):
-                    st.image(screenshot, caption=f"Screen after waiting for {surname}")
-
+                # Extract
                 try:
                     soup = BeautifulSoup(driver.page_source, "html.parser")
                     
-                    if manual_name_selector: 
-                        learned_selectors = {"name_element": manual_name_selector}
+                    if manual_name_selector: learned_selectors = {"name_element": manual_name_selector}
                     
                     if not learned_selectors:
-                        status_log.write(f"🧠 AI Analyzing Results...")
-                        res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
-                        if res_data and res_data.get("selectors", {}).get("name_element"):
-                            learned_selectors = res_data["selectors"]
-                            status_log.success(f"🎓 AI Found: {learned_selectors['name_element']}")
+                         status_log.write("🧠 AI Learning Structure...")
+                         res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
+                         if res_data and res_data.get("selectors", {}).get("name_element"):
+                             learned_selectors = res_data["selectors"]
                     
                     if not learned_selectors:
-                        status_log.warning("⚠️ AI confused. Trying generic headers (h3)...")
-                        learned_selectors = {"name_element": "h3"}
-
-                    current_names = []
-                    if learned_selectors:
-                        els = soup.select(learned_selectors["name_element"])
-                        if not els and learned_selectors["name_element"] == "h3":
-                             els = soup.select("h4, h2, .result-title, a")
+                        learned_selectors = {"name_element": "h3"} # Fallback
                         
-                        current_names = [e.get_text(" ", strip=True) for e in els]
-                        current_names = [n for n in current_names if len(n) > 3]
+                    els = soup.select(learned_selectors["name_element"])
+                    if not els and learned_selectors["name_element"] == "h3":
+                        els = soup.select("h4, h2, .result-title, a")
+                        
+                    raw_names = [e.get_text(" ", strip=True) for e in els]
+                    raw_names = [n for n in raw_names if len(n)>3 and "RESULTS" not in n.upper()]
 
-                    if current_names:
-                        matches = match_names_detailed(current_names, f"Search: {surname}")
+                    if raw_names:
+                        matches = match_names_detailed(raw_names, f"Search: {surname}")
                         if matches:
                             all_matches.extend(matches)
-                            all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                            # De-dupe by name
+                            all_matches = [dict(t) for t in {tuple(d.items()) for d in all_matches}]
                             table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                            status_log.write(f"✅ Found {len(matches)} potential matches.")
+                            status_log.write(f"✅ Found {len(matches)} results.")
                     else:
-                        status_log.write(f"🤷 No results found for '{surname}'.")
-                            
+                        status_log.write(f"🤷 0 results for '{surname}'")
                 except: pass
 
-                try: 
-                    driver.execute_script("window.history.go(-1)")
-                    time.sleep(2)
-                except: 
-                    driver.get(start_url)
-                    time.sleep(2)
+                try: driver.execute_script("window.history.go(-1)"); time.sleep(2)
+                except: driver.get(start_url); time.sleep(2)
         
         driver.quit()
 
-        # --- BATCH AI CLEANING ---
+        # BATCH CLEAN
         if use_ai_cleaning and all_matches:
-            status_log.write(f"🧹 AI is cleaning {len(all_matches)} items... (Might take 30s)")
-            raw_names_list = [m["Full Name"] for m in all_matches]
-            raw_names_list = list(set(raw_names_list)) # De-dupe
+            status_log.write(f"🧹 AI Cleaning {len(all_matches)} items...")
+            raw_list = [m["Full Name"] for m in all_matches]
+            clean = ai_janitor_clean_names(list(set(raw_list)), ai_provider, api_key)
             
-            cleaned_names = ai_janitor_clean_names(raw_names_list, ai_provider, api_key)
-            
-            if cleaned_names:
-                all_matches = match_names_detailed(cleaned_names, "Batch Processed")
-                status_log.success(f"✨ Final Count: {len(all_matches)} unique names.")
+            if clean:
+                all_matches = match_names_detailed(clean, "Batch Processed")
+                status_log.success(f"✨ Final: {len(all_matches)} Unique Names")
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=500)
             else:
-                status_log.warning("⚠️ Cleanup failed. Using original data.")
+                status_log.warning("⚠️ Cleanup failed. Saving original data.")
 
-    status_log.update(label="Mission Complete!", state="complete")
+    status_log.update(label="Done!", state="complete")
     st.session_state.running = False
     
     if all_matches:
         df = pd.DataFrame(all_matches)
         c1, c2 = st.columns(2)
-        with c1: st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "results.csv")
+        with c1: st.download_button("📥 CSV", df.to_csv(index=False).encode('utf-8'), "results.csv")
         with c2: 
             try:
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Sheet1')
-                st.download_button("📥 Download Excel", buffer, "results.xlsx")
-            except: st.info("Install 'xlsxwriter' for Excel.")
+                b = io.BytesIO()
+                with pd.ExcelWriter(b, engine='xlsxwriter') as w: df.to_excel(w, index=False)
+                st.download_button("📥 Excel", b, "results.xlsx")
+            except: pass
