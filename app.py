@@ -12,7 +12,7 @@ from unidecode import unidecode
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# --- SELENIUM IMPORT SAFETY ---
+# --- SELENIUM SETUP ---
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -43,12 +43,14 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 st.sidebar.markdown("---")
-search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results.")
+# --- GLOBAL SETTINGS ---
+search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results in Search Mode.")
 use_ai_cleaning = st.sidebar.checkbox("✨ Batch AI Cleaning", value=True, help="Wait until the end to clean all names in one go.")
 
+# --- DEBUG & MANUAL OVERRIDES ---
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
-    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3")
+    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3 or div.alumni-name")
 
 if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.session_state.running = False
@@ -71,7 +73,7 @@ BLOCKLIST_SURNAMES = {
 }
 
 # =========================================================
-#             PART 1: AI FUNCTIONS & HELPERS
+#             PART 1: AI FUNCTIONS
 # =========================================================
 def call_ai_api(prompt, provider, key):
     if not key: return None
@@ -82,7 +84,6 @@ def call_ai_api(prompt, provider, key):
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
-            else: st.error(f"AI Error {resp.status_code}: {resp.text}")
         elif "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -118,12 +119,7 @@ def clean_json_response(text):
     except: return text
 
 def clean_extracted_name(raw_text):
-    """
-    Aggressive cleaning function. Filters junk phrases immediately.
-    """
     if not isinstance(raw_text, str): return None
-    
-    # 1. Block Junk Phrases (The "MIT Experience" Killer)
     upper = raw_text.upper()
     junk_phrases = [
         "RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "JEWELS", "SPOTLIGHT",
@@ -132,67 +128,47 @@ def clean_extracted_name(raw_text):
         "CONTENT", "FOOTER", "HEADER", "OVERVIEW", "PROJECTS", "PEOPLE",
         "PROFILE", "VIEW", "CONTACT"
     ]
-    if any(phrase in upper for phrase in junk_phrases):
-        return None
-
-    # 2. Prefix/Suffix Removal
-    # Remove text before colons (e.g. "Spotlight: Josh")
+    if any(phrase in upper for phrase in junk_phrases): return None
     if ":" in raw_text: raw_text = raw_text.split(":")[-1]
-    
-    # Split on common dividers
     clean = re.split(r'[|,\-–—»\(\)]', raw_text)[0]
     clean = " ".join(clean.split())
-    
-    # 3. Validations
-    if len(clean.split()) > 5: return None # Too long to be a name
+    if len(clean.split()) > 5: return None 
     if len(clean) < 3: return None
-    
     return clean.strip()
 
 def ai_janitor_clean_names(raw_list, provider, key):
     if not raw_list or not key: return []
     clean_results = []
     chunk_size = 30
-    
-    # DEBUG: Show progress
     progress_bar = st.progress(0)
     
     for i in range(0, len(raw_list), chunk_size):
         batch = raw_list[i:i + chunk_size]
         prompt = f"""
         You are a Data Cleaning Expert.
-        
         INPUT LIST: {json.dumps(batch)}
-
         RULES:
         1. Extract ONLY valid PERSON names. 
-        2. DELETE entries that are products (e.g. "Colar", "Edition"), titles (e.g. "Spotlight", "Profile"), or junk.
-        3. Remove prefixes/suffixes (e.g. "Dr. Name" -> "Name", "Name, PhD" -> "Name").
-        4. Fix spacing (e.g. "MariaSilva" -> "Maria Silva").
-        
+        2. DELETE entries that are products, titles, or junk.
+        3. Remove prefixes/suffixes.
+        4. Fix spacing.
         RETURN JSON: {{ "cleaned_names": ["Name 1", "Name 2"] }}
         """
-        
         try:
             resp_text = call_ai_api(prompt, provider, key)
             if not resp_text: 
                 clean_results.extend(batch)
                 continue
-            
             clean_text = clean_json_response(resp_text)
             data = json.loads(clean_text)
-            
             if isinstance(data, dict) and "cleaned_names" in data:
                 clean_results.extend(data["cleaned_names"])
             elif isinstance(data, list):
                 clean_results.extend(data)
             else:
                 clean_results.extend(batch)
-                
-        except Exception as e:
-            st.warning(f"Batch {i//chunk_size + 1} Failed: {e}")
+        except:
             clean_results.extend(batch)
-        
         progress_bar.progress(min((i + chunk_size) / len(raw_list), 1.0))
             
     return list(set(clean_results))
@@ -215,7 +191,6 @@ def clean_html_for_ai(html_text):
 def fetch_ibge_data(limit_first, limit_surname):
     IBGE_FIRST = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
     IBGE_SURNAME = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
-    
     def _fetch(url, limit):
         data_map = {} 
         page = 1
@@ -246,7 +221,7 @@ except Exception as e:
     st.stop()
 
 # =========================================================
-#             PART 3: DRIVERS (CLOUD/LOCAL)
+#             PART 3: DRIVERS
 # =========================================================
 def fetch_native(session, url, method="GET", data=None):
     try:
@@ -262,7 +237,6 @@ def get_driver(headless=True):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    
     try:
         if os.name == 'posix':
             return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
@@ -284,11 +258,10 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE & TEMPLATES
+#             PART 4: INTELLIGENCE
 # =========================================================
 def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
     if len(html_content) < 500: return None
-    
     if task_type == "SEARCH_BOX":
         task_desc = '2. Identify CSS for SEARCH INPUT.\n3. Identify CSS for SUBMIT BUTTON.'
         json_desc = '"search_input": "input[name=q]", "search_button": "button[type=submit]"'
@@ -312,7 +285,6 @@ def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGI
 def fast_extract_mode(html_content, selectors):
     soup = BeautifulSoup(html_content, "html.parser")
     extracted_names = []
-    
     if selectors.get("name_element"):
         elements = soup.select(selectors["name_element"])
         for el in elements:
@@ -321,7 +293,6 @@ def fast_extract_mode(html_content, selectors):
             
     nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
     next_selector = selectors.get("next_element") or selectors.get("next_link")
-    
     if next_selector:
         element = soup.select_one(next_selector)
         if element:
@@ -346,28 +317,18 @@ def match_names_detailed(names, source):
     for n in names:
         clean_n = clean_extracted_name(n)
         if not clean_n or clean_n in seen: continue
-        
         parts = clean_n.strip().split()
         if len(parts) < 2: continue 
-        
         f, l = normalize_token(parts[0]), normalize_token(parts[-1])
         if l in BLOCKLIST_SURNAMES or f in BLOCKLIST_SURNAMES: continue
-        
         rank_f = first_name_ranks.get(f, 0)
         rank_l = surname_ranks.get(l, 0)
-        
         score = 0
         if rank_f > 0: score += ((limit_first - rank_f)/limit_first)*50
         if rank_l > 0: score += ((limit_surname - rank_l)/limit_surname)*50
-        
         if score > 0:
             m_type = "Strong" if (rank_f > 0 and rank_l > 0) else ("First Only" if rank_f > 0 else "Surname Only")
-            found.append({
-                "Full Name": clean_n, 
-                "Brazil Score": round(score, 1),
-                "Match Type": m_type, 
-                "Source": source
-            })
+            found.append({"Full Name": clean_n, "Brazil Score": round(score, 1), "Match Type": m_type, "Source": source})
             seen.add(clean_n)
     return found
 
@@ -411,9 +372,9 @@ if st.session_state.running:
     all_matches = []
     learned_selectors = None
     
-    # ==========================================================
-    # BRANCH A: CLASSIC & INFINITE SCROLL
-    # ==========================================================
+    # ------------------------------------------------------------------
+    # BRANCH A: CLASSIC & INFINITE SCROLL (Robust Edition)
+    # ------------------------------------------------------------------
     if "Search Injection" not in mode:
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"})
@@ -441,6 +402,10 @@ if st.session_state.running:
                     if resp and resp.status_code == 200: raw_html = resp.text
                 else:
                     raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
+                    # Screenshot Debug for Infinite Mode
+                    if page == 1:
+                        with st.sidebar.expander("📸 Page 1 Screenshot", expanded=True):
+                            st.image(driver.get_screenshot_as_png())
             except: pass
             
             if not raw_html: break
@@ -478,15 +443,29 @@ if st.session_state.running:
                          try: detected_limit = int(data["total_pages"]); status_log.info(f"Limit: {detected_limit}")
                          except: pass
                     if selectors.get("name_element"): learned_selectors = selectors
-                else: break
+                
+                # --- UNIVERSAL FALLBACK (IF AI FAILS) ---
+                if not learned_selectors or len(names) == 0:
+                    status_log.warning("⚠️ AI missed names. Trying standard list tags...")
+                    soup = BeautifulSoup(raw_html, "html.parser")
+                    fallback_names = []
+                    # Try common directory patterns
+                    for tag in ["h3", "h4", "strong", "b", "td a", "li a"]:
+                        els = soup.select(tag)
+                        for e in els:
+                            clean = clean_extracted_name(e.get_text(" ", strip=True))
+                            if clean: fallback_names.append(clean)
+                    names = list(set(fallback_names))
 
-            matches = match_names_detailed(names, f"Page {page}")
-            if matches:
-                all_matches.extend(matches)
-                all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                status_log.write(f"✅ Found {len(matches)} matches.")
-            else: status_log.write("🤷 No matches.")
+            if names:
+                matches = match_names_detailed(names, f"Page {page}")
+                if matches:
+                    all_matches.extend(matches)
+                    all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                    table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
+                    status_log.write(f"✅ Found {len(matches)} matches.")
+            else:
+                status_log.write("🤷 No names found on this page.")
 
             if ai_needed:
                 if "Classic" in mode:
@@ -508,7 +487,7 @@ if st.session_state.running:
         if driver: driver.quit()
 
     # ==========================================================
-    # BRANCH B: SEARCH INJECTION (FINAL BACKUP EDITION)
+    # BRANCH B: SEARCH INJECTION
     # ==========================================================
     else:
         driver = get_driver(headless=run_headless)
@@ -522,12 +501,10 @@ if st.session_state.running:
         except: 
             status_log.error("Bad URL"); driver.quit(); st.stop()
 
-        # Cookie Killer
         try:
             driver.execute_script("document.querySelectorAll('button,a').forEach(b=>{if(/accept|agree|cookie/i.test(b.innerText))b.click()})")
         except: pass
         
-        # Find Search Box
         sel_input = None
         sel_btn = None
         if manual_search_selector: sel_input = manual_search_selector
@@ -552,7 +529,6 @@ if st.session_state.running:
             
         status_log.success(f"🎯 Target: {sel_input}")
 
-        # LOOP
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
             
@@ -572,14 +548,12 @@ if st.session_state.running:
                 driver.get(start_url); time.sleep(3)
 
             if success:
-                # Timer
                 bar = table_placeholder.progress(0)
                 for t in range(search_delay):
                     time.sleep(1)
                     bar.progress((t+1)/search_delay)
                 bar.empty()
 
-                # Extract
                 try:
                     soup = BeautifulSoup(driver.page_source, "html.parser")
                     
@@ -592,16 +566,14 @@ if st.session_state.running:
                              learned_selectors = res_data["selectors"]
                     
                     if not learned_selectors:
-                        learned_selectors = {"name_element": "h3"} # Fallback
+                        learned_selectors = {"name_element": "h3"} 
                         
                     els = soup.select(learned_selectors["name_element"])
                     if not els and learned_selectors["name_element"] == "h3":
                         els = soup.select("h4, h2, .result-title, a")
                     
-                    # RAW EXTRACTION (We clean it later)
                     raw_names = []
                     for e in els:
-                        # Clean aggressive FIRST
                         clean = clean_extracted_name(e.get_text(" ", strip=True))
                         if clean: raw_names.append(clean)
 
@@ -609,7 +581,6 @@ if st.session_state.running:
                         matches = match_names_detailed(raw_names, f"Search: {surname}")
                         if matches:
                             all_matches.extend(matches)
-                            # De-dupe by name
                             all_matches = [dict(t) for t in {tuple(d.items()) for d in all_matches}]
                             table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
                             status_log.write(f"✅ Found {len(matches)} results.")
@@ -622,18 +593,18 @@ if st.session_state.running:
         
         driver.quit()
 
-        # BATCH CLEAN
-        if use_ai_cleaning and all_matches:
-            status_log.write(f"🧹 AI Cleaning {len(all_matches)} items...")
-            raw_list = [m["Full Name"] for m in all_matches]
-            clean = ai_janitor_clean_names(list(set(raw_list)), ai_provider, api_key)
-            
-            if clean:
-                all_matches = match_names_detailed(clean, "Batch Processed")
-                status_log.success(f"✨ Final: {len(all_matches)} Unique Names")
-                table_placeholder.dataframe(pd.DataFrame(all_matches), height=500)
-            else:
-                status_log.warning("⚠️ Cleanup failed. Saving original data.")
+    # --- BATCH CLEANING (APPLIES TO ALL MODES) ---
+    if use_ai_cleaning and all_matches:
+        status_log.write(f"🧹 AI Cleaning {len(all_matches)} items...")
+        raw_list = [m["Full Name"] for m in all_matches]
+        clean = ai_janitor_clean_names(list(set(raw_list)), ai_provider, api_key)
+        
+        if clean:
+            all_matches = match_names_detailed(clean, "Batch Processed")
+            status_log.success(f"✨ Final: {len(all_matches)} Unique Names")
+            table_placeholder.dataframe(pd.DataFrame(all_matches), height=500)
+        else:
+            status_log.warning("⚠️ Cleanup failed. Saving original data.")
 
     status_log.update(label="Done!", state="complete")
     st.session_state.running = False
