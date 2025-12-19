@@ -57,7 +57,7 @@ if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.sidebar.warning("Mission Aborted.")
     st.stop()
 
-# --- BLOCKLIST (Aggressive Filter) ---
+# --- BLOCKLIST ---
 BLOCKLIST_SURNAMES = {
     "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
     "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
@@ -103,8 +103,7 @@ def call_ai_api(prompt, provider, key):
             payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
-    except Exception as e: 
-        return None
+    except: return None
     return None
 
 def clean_json_response(text):
@@ -244,45 +243,43 @@ def fetch_selenium(driver, url, scroll_count=0):
     except: return None
 
 # =========================================================
-#             PART 4: INTELLIGENCE (FORM AWARE)
+#             PART 4: INTELLIGENCE (RESTORED LOGIC)
 # =========================================================
-def agent_learn_pattern(html_content, current_url, provider, key, task_type="PAGINATION"):
+def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
     if len(html_content) < 500: return None
     
     if task_type == "SEARCH_BOX":
-        task_desc = """
-        2. Identify CSS for SEARCH INPUT.
-        3. Identify CSS for SUBMIT BUTTON.
+        # Specific prompt for search
+        prompt = f"""
+        Analyze HTML from {current_url}.
+        1. Identify CSS for SEARCH INPUT.
+        2. Identify CSS for SUBMIT BUTTON.
+        Return JSON: {{ "selectors": {{ "search_input": "...", "search_button": "..." }} }}
+        HTML: {clean_html_for_ai(html_content)}
         """
-        json_desc = '"search_input": "input[name=q]", "search_button": "button[type=submit]"'
     else:
-        # **RESTORED: Explicitly asks for the "Next" element selector**
-        task_desc = """
+        # Full Navigation Prompt (Restored)
+        prompt = f"""
+        You are a web scraping expert. Analyze the HTML from {current_url}.
+        
+        1. Identify the CSS Selector for NAMES.
         2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT.
            - It might be an <a> tag (link).
            - It might be an <input type="submit"> or <button> inside a form.
+        
+        Return JSON:
+        {{
+          "names": ["Name 1", "Name 2"],
+          "selectors": {{
+             "name_element": "div.alumni-name",
+             "next_element": "a.next"
+          }},
+          "navigation": {{ "type": "LINK" or "FORM", "url": "...", "form_data": {{...}} }}
+        }}
+        
+        HTML:
+        {clean_html_for_ai(html_content)} 
         """
-        json_desc = '"next_element": "a.next"'
-
-    prompt = f"""
-    You are a web scraping expert. Analyze the HTML from {current_url}.
-    
-    1. Identify the CSS Selector for NAMES.
-    {task_desc}
-    
-    Return JSON:
-    {{
-      "names": ["Name 1", "Name 2"],
-      "selectors": {{
-         "name_element": "div.alumni-name",
-         {json_desc}
-      }},
-      "navigation": {{ "type": "LINK" or "FORM", "url": "...", "form_data": {{...}} }}
-    }}
-    
-    HTML:
-    {clean_html_for_ai(html_content)} 
-    """
     
     for _ in range(2): 
         raw = call_ai_api(prompt, provider, key)
@@ -291,9 +288,6 @@ def agent_learn_pattern(html_content, current_url, provider, key, task_type="PAG
     return None
 
 def fast_extract_mode(html_content, selectors):
-    """
-    Form-Aware Extractor. Can find Links OR submit Forms.
-    """
     soup = BeautifulSoup(html_content, "html.parser")
     extracted_names = []
     
@@ -303,6 +297,7 @@ def fast_extract_mode(html_content, selectors):
             clean = clean_extracted_name(el.get_text(" ", strip=True))
             if clean: extracted_names.append(clean)
             
+    # Navigation Extraction
     nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
     next_selector = selectors.get("next_element") or selectors.get("next_link")
     
@@ -386,7 +381,7 @@ if st.session_state.running:
     learned_selectors = None
     
     # ==========================================================
-    # BRANCH A: CLASSIC & INFINITE SCROLL (HYBRID EDITION)
+    # BRANCH A: CLASSIC & INFINITE SCROLL (RESTORED LOGIC)
     # ==========================================================
     if "Search Injection" not in mode:
         session = requests.Session()
@@ -405,7 +400,6 @@ if st.session_state.running:
         page = 0
         while page < max_pages and st.session_state.running:
             page += 1
-            if detected_limit and page > detected_limit: break
             status_log.update(label=f"Scanning Page {page}...", state="running")
             
             raw_html = None
@@ -424,56 +418,49 @@ if st.session_state.running:
 
             names = []
             nav_data = {}
-            ai_needed = False
+            ai_needed = True
             
-            # --- 1. VACUUM MODE (Heuristic check for NAMES only) ---
-            # We vacuum names first to populate the list, but we still need navigation info.
-            status_log.write("🧹 Running Vacuum (Dumb Scraper)...")
-            soup = BeautifulSoup(raw_html, "html.parser")
-            raw_set = set()
-            for tag in ["h3", "h4", "h2", "h5", "li", "tr", "div.name", "span.name", "a"]:
-                for el in soup.select(tag):
-                    txt = el.get_text(" ", strip=True)
-                    if 5 < len(txt) < 40 and len(txt.split()) in [2,3,4]:
-                        clean = clean_extracted_name(txt)
-                        if clean: raw_set.add(clean)
-            vacuum_names = list(raw_set)
-            
-            # --- 2. TEMPLATE / AI CHECK (For Navigation & Better Names) ---
+            # --- MANUAL OVERRIDE ---
+            if manual_name_selector and not learned_selectors:
+                learned_selectors = {"name_element": manual_name_selector}
+                status_log.success(f"🔧 Using Manual Selector: {manual_name_selector}")
+
+            # 1. FAST MODE (Template)
             if learned_selectors:
                 status_log.write("⚡ Using Fast Template")
                 fast_res = fast_extract_mode(raw_html, learned_selectors)
                 names = fast_res["names"]
                 nav_data = fast_res["nav"]
                 
-                # If template fails (0 names), retry with AI
-                if len(names) == 0:
-                    status_log.warning("⚠️ Template failed. Retrying with AI...")
-                    ai_needed = True
-                else:
-                    # Merge Vacuum names (safety) with Template names
-                    names = list(set(names + vacuum_names))
-            else:
-                ai_needed = True
-
-            # --- 3. AI ARCHITECT (The Fallback for Structure/Nav) ---
+                if len(names) > 0 and nav_data["type"] != "NONE":
+                    ai_needed = False
+                    if nav_data["type"] == "LINK":
+                        l = nav_data["next_url"]
+                        current_url = urljoin(current_url, l) if "http" not in l else l
+                        next_method, next_data = "GET", None
+                    elif nav_data["type"] == "FORM":
+                        next_method, next_data = "POST", nav_data["form_data"]
+                        if nav_data.get("next_url"): 
+                            act = nav_data["next_url"]
+                            current_url = urljoin(current_url, act) if "http" not in act else act
+                elif len(names) == 0: 
+                    status_log.warning("⚠️ Template failed (0 names). Retrying with AI...")
+                    ai_needed = True 
+            
+            # 2. AI ARCHITECT (If needed)
             if ai_needed:
                 status_log.write(f"🧠 {ai_provider.split()[0]} Analyzing Page Structure...")
-                data = agent_learn_pattern(raw_html, current_url, ai_provider, api_key, "PAGINATION")
+                data = agent_analyze_page(raw_html, current_url, ai_provider, api_key, "PAGINATION")
                 
                 if data:
-                    ai_names = data.get("names", [])
+                    names = data.get("names", [])
                     selectors = data.get("selectors", {})
                     nav_data = data.get("navigation", {})
                     
                     if selectors.get("name_element"): 
                         learned_selectors = selectors
                         status_log.success(f"🎓 Learned Selector: {selectors['name_element']}")
-                    
-                    # Merge ALL names found
-                    names = list(set(vacuum_names + ai_names))
             
-            # --- PROCESS NAMES ---
             if names:
                 matches = match_names_detailed(names, f"Page {page}")
                 if matches:
@@ -482,13 +469,13 @@ if st.session_state.running:
                     table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
                     status_log.write(f"✅ Found {len(matches)} matches.")
             else:
-                status_log.write("🤷 Empty page.")
+                status_log.write("🤷 No names found on this page.")
 
-            # --- NAVIGATION LOGIC (Restored from your working version) ---
-            if "Classic" in mode:
+            # 3. APPLY AI NAVIGATION (Classic Only)
+            if ai_needed and "Classic" in mode:
                 ntype = nav_data.get("type", "NONE")
-                if ntype == "LINK" and nav_data.get("next_url"):
-                    l = nav_data["next_url"]
+                if ntype == "LINK" and nav_data.get("url"):
+                    l = nav_data["url"]
                     current_url = urljoin(current_url, l) if "http" not in l else l
                     next_method, next_data = "GET", None
                     status_log.write(f"🔗 AI Found Link: {l}")
@@ -503,10 +490,8 @@ if st.session_state.running:
                             break
                         visited_fps.add(fp)
                         status_log.write("📝 AI Found Form (POST).")
-                    else: 
-                        status_log.info("🏁 No form data found.")
-                        break
-                elif ntype == "NONE":
+                    else: break
+                else:
                     status_log.info("🏁 No more pages detected.")
                     break
             
@@ -539,7 +524,7 @@ if st.session_state.running:
         
         if not sel_input:
             status_log.write("🧠 AI Finding Search Box...")
-            data = agent_learn_pattern(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
+            data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
                 sel_input = data["selectors"]["search_input"]
                 sel_btn = data["selectors"].get("search_button")
@@ -589,7 +574,7 @@ if st.session_state.running:
                     
                     if not learned_selectors:
                          status_log.write("🧠 AI Learning Structure...")
-                         res_data = agent_learn_pattern(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
+                         res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
                          if res_data and res_data.get("selectors", {}).get("name_element"):
                              learned_selectors = res_data["selectors"]
                     
@@ -621,7 +606,7 @@ if st.session_state.running:
         
         driver.quit()
 
-    # --- BATCH CLEANING (APPLIES TO ALL MODES) ---
+    # --- BATCH CLEANING ---
     if use_ai_cleaning and all_matches:
         status_log.write(f"🧹 AI Cleaning {len(all_matches)} items...")
         raw_list = [m["Full Name"] for m in all_matches]
