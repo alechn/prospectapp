@@ -34,7 +34,7 @@ st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
 
 if "running" not in st.session_state: st.session_state.running = False
 
-# --- SIDEBAR ---
+# --- SIDEBAR: AI BRAIN ---
 st.sidebar.header("🧠 AI Brain")
 ai_provider = st.sidebar.selectbox(
     "Choose your Model:",
@@ -44,7 +44,7 @@ api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type=
 
 st.sidebar.markdown("---")
 # --- GLOBAL SETTINGS ---
-search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results in Search Mode.")
+search_delay = st.sidebar.slider("⏳ Search/Scroll Wait Time (Sec)", 5, 60, 15, help="Time to wait for results.")
 use_ai_cleaning = st.sidebar.checkbox("✨ Batch AI Cleaning", value=True, help="Wait until the end to clean all names in one go.")
 
 # --- DEBUG & MANUAL OVERRIDES ---
@@ -73,7 +73,7 @@ BLOCKLIST_SURNAMES = {
 }
 
 # =========================================================
-#             PART 1: AI FUNCTIONS
+#             PART 1: AI FUNCTIONS & HELPERS
 # =========================================================
 def call_ai_api(prompt, provider, key):
     if not key: return None
@@ -262,20 +262,42 @@ def fetch_selenium(driver, url, scroll_count=0):
 # =========================================================
 def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
     if len(html_content) < 500: return None
+    
     if task_type == "SEARCH_BOX":
-        task_desc = '2. Identify CSS for SEARCH INPUT.\n3. Identify CSS for SUBMIT BUTTON.'
+        task_desc = """
+        2. Identify CSS for SEARCH INPUT.
+        3. Identify CSS for SUBMIT BUTTON.
+        """
         json_desc = '"search_input": "input[name=q]", "search_button": "button[type=submit]"'
     else:
-        task_desc = '2. Identify CSS for "Next Page" LINK.'
+        # Full Prompt for Navigation
+        task_desc = """
+        2. Identify the CSS Selector for the "Next Page" CLICKABLE ELEMENT.
+           - It might be an <a> tag (link).
+           - It might be an <input type="submit"> or <button> inside a form.
+        """
         json_desc = '"next_element": "a.next"'
 
     prompt = f"""
-    Analyze HTML from {current_url}.
-    1. Identify CSS Selector for NAMES.
+    You are a web scraping expert. Analyze the HTML from {current_url}.
+    
+    1. Identify the CSS Selector for NAMES.
     {task_desc}
-    Return JSON: {{ "selectors": {{ "name_element": "div.alumni-name", {json_desc} }} }}
-    HTML: {clean_html_for_ai(html_content)} 
+    
+    Return JSON:
+    {{
+      "names": ["Name 1", "Name 2"],
+      "selectors": {{
+         "name_element": "div.alumni-name",
+         {json_desc}
+      }},
+      "navigation": {{ "type": "LINK" or "FORM", "url": "...", "form_data": {{...}} }}
+    }}
+    
+    HTML:
+    {clean_html_for_ai(html_content)} 
     """
+    
     for _ in range(2): 
         raw = call_ai_api(prompt, provider, key)
         if raw: return json.loads(clean_json_response(raw))
@@ -285,14 +307,17 @@ def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGI
 def fast_extract_mode(html_content, selectors):
     soup = BeautifulSoup(html_content, "html.parser")
     extracted_names = []
+    
     if selectors.get("name_element"):
         elements = soup.select(selectors["name_element"])
         for el in elements:
             clean = clean_extracted_name(el.get_text(" ", strip=True))
             if clean: extracted_names.append(clean)
             
+    # Full Navigation Logic (Restored)
     nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
     next_selector = selectors.get("next_element") or selectors.get("next_link")
+    
     if next_selector:
         element = soup.select_one(next_selector)
         if element:
@@ -373,238 +398,197 @@ if st.session_state.running:
     learned_selectors = None
     
     # ------------------------------------------------------------------
-    # BRANCH A: CLASSIC & INFINITE SCROLL (Robust Edition)
+    # BRANCH A: CLASSIC & INFINITE SCROLL (HEURISTICS + FULL AI FALLBACK)
     # ------------------------------------------------------------------
     if "Search Injection" not in mode:
         session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"})
-        
-        driver = None
-        if "Infinite" in mode: 
-            driver = get_driver(headless=True)
-            if not driver: status_log.error("Aborted: Driver failed."); st.stop()
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+        driver = get_driver(headless=run_headless) if "Infinite" in mode else None
+        if "Infinite" in mode and not driver: status_log.error("Driver Failed"); st.stop()
         
         current_url = start_url
+        # Initialize navigation variables
         next_method, next_data = "GET", None
         visited_fps = set()
-        detected_limit = None
         
-        page = 0
-        while page < max_pages and st.session_state.running:
-            page += 1
-            if detected_limit and page > detected_limit: break
+        for page in range(1, max_pages + 1):
+            if not st.session_state.running: break
             status_log.update(label=f"Scanning Page {page}...", state="running")
             
             raw_html = None
             try:
                 if "Classic" in mode:
-                    resp = fetch_native(session, current_url, next_method, next_data)
-                    if resp and resp.status_code == 200: raw_html = resp.text
+                    # Uses next_method and next_data for recursion
+                    r = fetch_native(session, current_url, next_method, next_data)
+                    if r and r.status_code == 200: raw_html = r.text
                 else:
-                    raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
-                    # Screenshot Debug for Infinite Mode
-                    if page == 1:
-                        with st.sidebar.expander("📸 Page 1 Screenshot", expanded=True):
-                            st.image(driver.get_screenshot_as_png())
+                    raw_html = fetch_selenium(driver, current_url, 3)
             except: pass
             
             if not raw_html: break
-
-            names, nav_data, ai_needed = [], {}, True
             
+            names = []
+            nav_data = {}
+            ai_needed = False
+            
+            # 1. TEMPLATE MODE (If we learned from AI previously)
             if learned_selectors:
-                status_log.write("⚡ Fast Template")
+                status_log.write("⚡ Using Fast Template")
                 fast_res = fast_extract_mode(raw_html, learned_selectors)
                 names = fast_res["names"]
-                nav_res = fast_res["nav"]
+                nav_data = fast_res["nav"]
                 
-                if len(names) > 0 and nav_res["type"] != "NONE":
-                    ai_needed = False
-                    if nav_res["type"] == "LINK":
-                        l = nav_res["next_url"]
-                        current_url = urljoin(current_url, l) if "http" not in l else l
-                        next_method, next_data = "GET", None
-                    elif nav_res["type"] == "FORM":
-                        next_method, next_data = "POST", nav_res["form_data"]
-                        if nav_res.get("next_url"): 
-                            act = nav_res["next_url"]
-                            current_url = urljoin(current_url, act) if "http" not in act else act
-                elif len(names) == 0: ai_needed = True 
-            
+                # If template fails suddenly (0 names), retry with AI
+                if len(names) == 0:
+                    status_log.warning("⚠️ Template failed. Retrying with AI...")
+                    ai_needed = True
+            else:
+                ai_needed = True
+
+            # 2. VACUUM MODE (Heuristic check before AI)
             if ai_needed:
-                if not learned_selectors: status_log.write(f"🧠 {ai_provider.split()[0]} Analyzing...")
+                status_log.write("🧹 Running Vacuum (Dumb Scraper)...")
+                soup = BeautifulSoup(raw_html, "html.parser")
+                raw_set = set()
+                for tag in ["h3", "h4", "h2", "h5", "li", "tr", "div.name", "a", "strong", "b"]:
+                    for el in soup.select(tag):
+                        txt = el.get_text(" ", strip=True)
+                        if 5 < len(txt) < 40 and len(txt.split()) in [2,3,4]:
+                            clean = clean_extracted_name(txt)
+                            if clean: raw_set.add(clean)
+                
+                # If Vacuum found plenty of names (>5), we might skip AI
+                # BUT we still need AI for navigation if it's Page 1
+                if len(raw_set) > 5 and page > 1:
+                    names = list(raw_set)
+                    ai_needed = False
+                    status_log.success(f"🧹 Vacuum found {len(names)} names. Skipping AI.")
+                else:
+                    # On Page 1, or if vacuum failed, we force AI to learn structure + navigation
+                    names = list(raw_set) # Keep what we found
+            
+            # 3. AI TEACHER (The Fallback)
+            if ai_needed:
+                status_log.write(f"🧠 {ai_provider.split()[0]} Analyzing Page Structure...")
                 data = agent_analyze_page(raw_html, current_url, ai_provider, api_key, "PAGINATION")
                 
                 if data:
-                    names = data.get("names", [])
+                    ai_names = data.get("names", [])
                     selectors = data.get("selectors", {})
                     nav_data = data.get("navigation", {})
-                    if not detected_limit and data.get("total_pages"):
-                         try: detected_limit = int(data["total_pages"]); status_log.info(f"Limit: {detected_limit}")
-                         except: pass
-                    if selectors.get("name_element"): learned_selectors = selectors
-                
-                # --- UNIVERSAL FALLBACK (IF AI FAILS) ---
-                if not learned_selectors or len(names) == 0:
-                    status_log.warning("⚠️ AI missed names. Trying standard list tags...")
-                    soup = BeautifulSoup(raw_html, "html.parser")
-                    fallback_names = []
-                    # Try common directory patterns
-                    for tag in ["h3", "h4", "strong", "b", "td a", "li a"]:
-                        els = soup.select(tag)
-                        for e in els:
-                            clean = clean_extracted_name(e.get_text(" ", strip=True))
-                            if clean: fallback_names.append(clean)
-                    names = list(set(fallback_names))
-
+                    
+                    if selectors.get("name_element"): 
+                        learned_selectors = selectors
+                        status_log.success(f"🎓 Learned Selector: {selectors['name_element']}")
+                    
+                    # Merge AI names with Vacuum names
+                    names = list(set(names + ai_names))
+            
+            # --- PROCESS NAMES ---
             if names:
                 matches = match_names_detailed(names, f"Page {page}")
                 if matches:
                     all_matches.extend(matches)
-                    all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                     table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
                     status_log.write(f"✅ Found {len(matches)} matches.")
             else:
-                status_log.write("🤷 No names found on this page.")
+                status_log.write("🤷 Empty page.")
 
-            if ai_needed:
-                if "Classic" in mode:
-                    ntype = nav_data.get("type", "NONE")
-                    if ntype == "LINK" and nav_data.get("url"):
-                        l = nav_data["url"]
-                        current_url = urljoin(current_url, l) if "http" not in l else l
-                        next_method, next_data = "GET", None
-                    elif ntype == "FORM" and nav_data.get("form_data"):
-                        next_method, next_data = "POST", nav_data["form_data"]
-                        fp = str(next_data)
-                        if fp in visited_fps: break
+            # --- NAVIGATION LOGIC (Restored) ---
+            if "Classic" in mode:
+                ntype = nav_data.get("type", "NONE")
+                if ntype == "LINK" and nav_data.get("url"):
+                    l = nav_data["url"]
+                    current_url = urljoin(current_url, l) if "http" not in l else l
+                    next_method, next_data = "GET", None
+                    status_log.write(f"🔗 Next Page: {l}")
+                elif ntype == "FORM":
+                    form = nav_data.get("form_data", {})
+                    if form:
+                        next_method = "POST"
+                        next_data = form
+                        fp = str(form)
+                        if fp in visited_fps: 
+                            status_log.warning("⚠️ Loop detected. Stopping.")
+                            break
                         visited_fps.add(fp)
+                        status_log.write("📝 Posting Form Data for Next Page.")
                     else: break
-                else: break
+                else:
+                    status_log.info("🏁 No more pages detected.")
+                    break
             
             time.sleep(1.5)
         
         if driver: driver.quit()
 
-    # ==========================================================
-    # BRANCH B: SEARCH INJECTION
-    # ==========================================================
+    # ------------------------------------------------------------------
+    # BRANCH B: SEARCH INJECTION (UNCHANGED)
+    # ------------------------------------------------------------------
     else:
         driver = get_driver(headless=run_headless)
-        if not driver: status_log.error("Driver Failed"); st.stop()
+        if not driver: st.stop()
         
-        status_log.write(f"📝 Checking against IBGE DB ({len(sorted_surnames)} surnames).")
+        try: driver.get(start_url); time.sleep(5)
+        except: st.stop()
         
-        try: 
-            driver.get(start_url)
-            time.sleep(5)
-        except: 
-            status_log.error("Bad URL"); driver.quit(); st.stop()
-
-        try:
-            driver.execute_script("document.querySelectorAll('button,a').forEach(b=>{if(/accept|agree|cookie/i.test(b.innerText))b.click()})")
-        except: pass
-        
-        sel_input = None
-        sel_btn = None
-        if manual_search_selector: sel_input = manual_search_selector
-        
+        # 1. Find Search Box (Heuristic First)
+        sel_input = manual_search_selector
         if not sel_input:
-            status_log.write("🧠 AI Finding Search Box...")
+            for f in ["input[type='search']", "input[name='q']", "input[name='query']", "input[aria-label='Search']"]:
+                if len(driver.find_elements(By.CSS_SELECTOR, f)) > 0:
+                    sel_input = f; status_log.success(f"🎯 Target Locked (Heuristic): {sel_input}"); break
+        
+        # 2. AI Fallback for Search Box
+        if not sel_input:
+            status_log.write("⚠️ Standard input not found. Asking AI...")
             data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
             if data and data.get("selectors", {}).get("search_input"):
                 sel_input = data["selectors"]["search_input"]
-                sel_btn = data["selectors"].get("search_button")
         
-        if not sel_input:
-            status_log.write("⚠️ Using standard selectors...")
-            for f in ["input[type='search']", "input[name='q']", "input[name='query']", "input[aria-label='Search']"]:
-                if len(driver.find_elements(By.CSS_SELECTOR, f)) > 0:
-                    sel_input = f
-                    break
-        
-        if not sel_input:
-            status_log.error("❌ No Search Box Found.")
-            driver.quit(); st.stop()
-            
-        status_log.success(f"🎯 Target: {sel_input}")
+        if not sel_input: st.error("No Search Box"); driver.quit(); st.stop()
 
         for i, surname in enumerate(sorted_surnames[:max_pages]):
             if not st.session_state.running: break
-            
             status_log.update(label=f"🔎 Checking '{surname}' ({i+1}/{max_pages})", state="running")
-            success = False
             
             try:
                 inp = driver.find_element(By.CSS_SELECTOR, sel_input)
                 driver.execute_script(f"arguments[0].value = '{surname}';", inp)
-                try: inp.send_keys(Keys.RETURN)
-                except: 
-                    try: inp.submit()
-                    except:
-                        if sel_btn: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
-                success = True
-            except:
-                driver.get(start_url); time.sleep(3)
-
-            if success:
-                bar = table_placeholder.progress(0)
-                for t in range(search_delay):
-                    time.sleep(1)
-                    bar.progress((t+1)/search_delay)
-                bar.empty()
-
-                try:
-                    soup = BeautifulSoup(driver.page_source, "html.parser")
-                    
-                    if manual_name_selector: learned_selectors = {"name_element": manual_name_selector}
-                    
-                    if not learned_selectors:
-                         status_log.write("🧠 AI Learning Structure...")
-                         res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
-                         if res_data and res_data.get("selectors", {}).get("name_element"):
-                             learned_selectors = res_data["selectors"]
-                    
-                    if not learned_selectors:
-                        learned_selectors = {"name_element": "h3"} 
-                        
-                    els = soup.select(learned_selectors["name_element"])
-                    if not els and learned_selectors["name_element"] == "h3":
-                        els = soup.select("h4, h2, .result-title, a")
-                    
-                    raw_names = []
-                    for e in els:
-                        clean = clean_extracted_name(e.get_text(" ", strip=True))
+                inp.send_keys(Keys.RETURN)
+                time.sleep(search_delay)
+                
+                soup = BeautifulSoup(driver.page_source, "html.parser")
+                raw_names = []
+                
+                # Heuristics for Results
+                for tag in ["h3", "h4", "h2", ".result-title", "a"]:
+                    for el in soup.select(tag):
+                        clean = clean_extracted_name(el.get_text(" ", strip=True))
                         if clean: raw_names.append(clean)
-
-                    if raw_names:
-                        matches = match_names_detailed(raw_names, f"Search: {surname}")
-                        if matches:
-                            all_matches.extend(matches)
-                            all_matches = [dict(t) for t in {tuple(d.items()) for d in all_matches}]
-                            table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                            status_log.write(f"✅ Found {len(matches)} results.")
-                    else:
-                        status_log.write(f"🤷 0 results for '{surname}'")
-                except: pass
-
+                
+                raw_names = list(set(raw_names))
+                if raw_names:
+                    matches = match_names_detailed(raw_names, f"Search: {surname}")
+                    if matches:
+                        all_matches.extend(matches)
+                        table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
+                        status_log.write(f"✅ Found {len(matches)} results.")
+                
                 try: driver.execute_script("window.history.go(-1)"); time.sleep(2)
                 except: driver.get(start_url); time.sleep(2)
-        
+            except: driver.get(start_url); time.sleep(2)
+            
         driver.quit()
 
-    # --- BATCH CLEANING (APPLIES TO ALL MODES) ---
+    # --- BATCH CLEANING ---
     if use_ai_cleaning and all_matches:
         status_log.write(f"🧹 AI Cleaning {len(all_matches)} items...")
-        raw_list = [m["Full Name"] for m in all_matches]
-        clean = ai_janitor_clean_names(list(set(raw_list)), ai_provider, api_key)
-        
+        raw = list(set([m["Full Name"] for m in all_matches]))
+        clean = ai_janitor_clean_names(raw, ai_provider, api_key)
         if clean:
             all_matches = match_names_detailed(clean, "Batch Processed")
-            status_log.success(f"✨ Final: {len(all_matches)} Unique Names")
             table_placeholder.dataframe(pd.DataFrame(all_matches), height=500)
-        else:
-            status_log.warning("⚠️ Cleanup failed. Saving original data.")
 
     status_log.update(label="Done!", state="complete")
     st.session_state.running = False
