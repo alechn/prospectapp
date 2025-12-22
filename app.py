@@ -22,7 +22,7 @@ try:
 except Exception:
     HAS_CURL = False
 
-# --- Selenium & Webdriver Manager (Fix for SessionNotCreatedException) ---
+# --- Selenium & Webdriver Manager ---
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -48,7 +48,7 @@ except Exception:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Universal Scraper • Parallel Active Search • AI Cleaning • Auto-Driver Fix")
+st.caption("Universal Scraper • Parallel Active Search • IBGE Scoring • Auto-Driver Fix")
 
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -71,11 +71,11 @@ api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type=
 
 st.sidebar.markdown("---")
 st.sidebar.header("🚀 Performance")
-# ADDED: Parallel Browsers Slider
+# ADDED: Parallel Slider
 num_browsers = st.sidebar.slider("⚡ Parallel Browsers (Active Search)", 1, 5, 1, 
     help="Opens multiple Chrome instances to search different surnames simultaneously.")
 
-search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 30, 15)
+search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 30, 10)
 use_browserlike_tls = st.sidebar.checkbox("Use browser-like requests (curl_cffi)", value=False)
 if use_browserlike_tls and not HAS_CURL:
     st.sidebar.warning("curl_cffi not installed; falling back to requests.")
@@ -92,7 +92,7 @@ with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
     manual_search_button = st.text_input("Manual Search Button Selector", placeholder="e.g. button[type='submit']")
     manual_search_param = st.text_input("Manual Search Param (URL mode)", placeholder="e.g. q or query")
-    # ADDED: No Results Text Selector
+    # ADDED: No Results Logic
     manual_no_results = st.text_input("No Results Text", placeholder="e.g. 'No matching records found'")
     debug_show_candidates = st.checkbox("Debug: show extracted candidates", value=False)
 
@@ -129,7 +129,9 @@ BLOCKLIST_SURNAMES = {
     # Generic Web Words
     "RESULTS","WEBSITE","SEARCH","MENU","SKIP","CONTENT","FOOTER","HEADER",
     "OVERVIEW","PROJECTS","PEOPLE","PROFILE","VIEW","CONTACT","SPOTLIGHT",
-    "PDF","LOGIN","SIGNUP","HOME","ABOUT","CAREERS","NEWS","EVENTS"
+    "PDF","LOGIN","SIGNUP","HOME","ABOUT","CAREERS","NEWS","EVENTS",
+    "EDUCATION","INNOVATION","CAMPUS","LIFELONG","GIVE","VISIT","MAP",
+    "JOBS","PRIVACY","ACCESSIBILITY","TERMS","COPYRIGHT"
 }
 
 NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,6}$")
@@ -140,9 +142,6 @@ def normalize_token(s: str) -> str:
     return "".join(ch for ch in s if "A" <= ch <= "Z")
 
 def clean_extracted_name(raw_text):
-    """
-    Cleaner with expanded Blacklist for nav items (Education, Campus, etc.)
-    """
     if not isinstance(raw_text, str): return None
     
     # 1. Whitespace
@@ -151,56 +150,39 @@ def clean_extracted_name(raw_text):
 
     upper = raw_text.upper()
 
-    # 2. Universal Junk Phrases (Titles, Locations, Web UI)
+    # 2. Expanded Junk Phrases
     junk_phrases = [
         "RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "SPOTLIGHT",
         "EXPERIENCE", "CALCULATION", "LIVING WAGE", "GOING FAST",
         "GUIDE TO", "LOG OF", "REVIEW OF", "MENU", "SKIP TO",
         "CONTENT", "FOOTER", "HEADER", "OVERVIEW", "PROJECTS", "PEOPLE",
         "PROFILE", "VIEW", "CONTACT", "READ MORE", "LEARN MORE",
-        # Organizational / Academic Terms (Generic)
         "UNIVERSITY", "INSTITUTE", "SCHOOL", "DEPARTMENT", "COLLEGE",
         "PROGRAM", "INITIATIVE", "LABORATORY", "CENTER FOR", "CENTRE FOR",
         "ALUMNI", "DIRECTORY", "REAP", "MBA", "PHD", "MSC", "CLASS OF",
-        # NEW: Navigation Junk found in logs
         "EDUCATION", "INNOVATION", "CAMPUS LIFE", "LIFELONG LEARNING",
         "GIVE", "HOME", "VISIT", "MAP", "EVENTS", "JOBS", "PRIVACY",
         "ACCESSIBILITY", "SOCIAL MEDIA", "TERMS OF USE", "COPYRIGHT",
-        # Locations (Generic)
         "BRASIL", "BRAZIL", "PERU", "ARGENTINA", "CHILE", "USA", "UNITED STATES",
         "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
         "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"
     ]
     
-    if any(phrase in upper for phrase in junk_phrases):
-        return None
-
-    # 3. Safety check for "MIT"
+    if any(phrase in upper for phrase in junk_phrases): return None
     if re.search(r'\bMIT\b', upper): return None
 
-    # 4. Handle "Last, First"
     if "," in raw_text:
         parts = [p.strip() for p in raw_text.split(",") if p.strip()]
-        if len(parts) >= 2:
-            raw_text = f"{parts[1]} {parts[0]}"
+        if len(parts) >= 2: raw_text = f"{parts[1]} {parts[0]}"
 
-    if ":" in raw_text:
-        raw_text = raw_text.split(":")[-1].strip()
+    if ":" in raw_text: raw_text = raw_text.split(":")[-1].strip()
 
-    # 5. Split on common non-name delimiters
     clean = re.split(r"[|–—»\(\)]|\s-\s", raw_text)[0].strip()
     clean = " ".join(clean.split()).strip()
 
-    # 6. Validation
-    if len(clean) < 3 or len(clean.split()) > 7:
-        return None
-    
-    # Reject emails/filenames/urls
-    if any(x in clean for x in ["@", ".com", ".org", ".edu", ".net", "http", "www"]):
-        return None
-
-    if not NAME_REGEX.match(clean):
-        return None
+    if len(clean) < 3 or len(clean.split()) > 7: return None
+    if any(x in clean for x in ["@", ".com", ".org", ".edu", ".net", "http", "www"]): return None
+    if not NAME_REGEX.match(clean): return None
 
     return clean
 
@@ -470,7 +452,7 @@ def selenium_wait_document_ready(driver, timeout: int = 10):
         pass
 
 # =========================================================
-#             SMART WAIT LOGIC (NEW)
+#             SMART WAIT LOGIC (NEW - REPLACES OLD WAIT)
 # =========================================================
 def smart_search_wait(driver, timeout: int, name_selector: Optional[str] = None):
     """
@@ -521,11 +503,10 @@ def smart_search_wait(driver, timeout: int, name_selector: Optional[str] = None)
         except: pass
 
         time.sleep(0.5)
-    
     return False
 
 def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = None):
-    # Wrapper for legacy calls, mapped to new smart wait
+    # Remap old call to new smart logic
     smart_search_wait(driver, timeout, name_selector)
 
 # =========================================================
@@ -570,6 +551,74 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
     except Exception:
         return False
 
+# =========================================================
+#             WORKER FUNCTION (PARALLEL)
+# =========================================================
+def worker_search_batch(surnames_chunk, url, selector, search_sel, headless):
+    """
+    Independent worker that opens one browser and processes a list of surnames
+    """
+    driver = get_driver(headless=headless)
+    if not driver: 
+        return []
+    
+    results = []
+    seen = set()
+    
+    try:
+        for surname in surnames_chunk:
+            html = None
+            try:
+                driver.get(url)
+                
+                # 1. Find & Fill Search
+                inp = None
+                search_selectors = [search_sel] if search_sel else ["input[type='search']", "input[name='q']", "input[name='search']", "input[aria-label='Search']"]
+                
+                for s in search_selectors:
+                    if not s: continue
+                    try:
+                        inp = driver.find_element(By.CSS_SELECTOR, s)
+                        if inp: break
+                    except: pass
+                
+                if inp:
+                    # Clear and type
+                    driver.execute_script("arguments[0].value = '';", inp)
+                    inp.send_keys(surname)
+                    inp.send_keys(Keys.RETURN)
+                    
+                    # 2. Smart Wait (The upgraded logic)
+                    found_something = smart_search_wait(driver, timeout=20, name_selector=selector)
+                    
+                    # 3. Extract
+                    html = driver.page_source
+            except Exception:
+                pass # Continue to next surname even if one crashes
+            
+            # --- FALLBACK REQUESTS IF SELENIUM FAILED TO GET HTML ---
+            if not html:
+                try:
+                    u = urlparse(url)
+                    qs = parse_qs(u.query)
+                    qs[manual_search_param or "q"] = [surname]
+                    cand = u._replace(query=urlencode(qs, doseq=True)).geturl()
+                    r = requests.get(cand, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                    if r.status_code == 200: html = r.text
+                except: pass
+
+            if html:
+                raw_names = extract_names_multi(html, selector)
+                matches = match_names(raw_names, f"Search: {surname}")
+                for m in matches:
+                    if m["Full Name"] not in seen:
+                        seen.add(m["Full Name"])
+                        results.append(m)
+    finally:
+        try: driver.quit()
+        except: pass
+        
+    return results
 
 # =========================================================
 #             AI CLEANING AGENT
@@ -685,77 +734,6 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
 
 
 # =========================================================
-#             WORKER FUNCTION (PARALLEL)
-# =========================================================
-def worker_search_batch(surnames_chunk, url, selector, search_sel, headless):
-    """
-    Independent worker that opens one browser and processes a list of surnames
-    """
-    driver = get_driver(headless=headless)
-    if not driver: 
-        # Selenium failed, return empty to trigger fallback logic if needed
-        return []
-    
-    results = []
-    seen = set()
-    
-    try:
-        for surname in surnames_chunk:
-            html = None
-            try:
-                driver.get(url)
-                
-                # 1. Find & Fill Search
-                inp = None
-                search_selectors = [search_sel] if search_sel else ["input[type='search']", "input[name='q']", "input[name='search']", "input[aria-label='Search']"]
-                
-                for s in search_selectors:
-                    if not s: continue
-                    try:
-                        inp = driver.find_element(By.CSS_SELECTOR, s)
-                        if inp: break
-                    except: pass
-                
-                if inp:
-                    # Clear and type
-                    driver.execute_script("arguments[0].value = '';", inp)
-                    inp.send_keys(surname)
-                    inp.send_keys(Keys.RETURN)
-                    
-                    # 2. Smart Wait (The upgraded logic)
-                    found_something = smart_search_wait(driver, timeout=20, name_selector=selector)
-                    
-                    # 3. Extract
-                    html = driver.page_source
-            except Exception:
-                pass # Continue to next surname even if one crashes
-            
-            # --- FALLBACK REQUESTS IF SELENIUM FAILED TO GET HTML ---
-            if not html:
-                try:
-                    u = urlparse(url)
-                    qs = parse_qs(u.query)
-                    qs[manual_search_param or "q"] = [surname]
-                    cand = u._replace(query=urlencode(qs, doseq=True)).geturl()
-                    r = requests.get(cand, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-                    if r.status_code == 200: html = r.text
-                except: pass
-
-            if html:
-                raw_names = extract_names_multi(html, selector)
-                matches = match_names(raw_names, f"Search: {surname}")
-                for m in matches:
-                    if m["Full Name"] not in seen:
-                        seen.add(m["Full Name"])
-                        results.append(m)
-    finally:
-        try: driver.quit()
-        except: pass
-        
-    return results
-
-
-# =========================================================
 #             MAIN UI & EXECUTION
 # =========================================================
 st.markdown("### 🤖 Auto-Pilot Control Center")
@@ -833,7 +811,7 @@ if st.button("🚀 Start Mission", type="primary"):
                 driver.quit()
 
     # ---------------------------
-    # ACTIVE SEARCH MODE (PARALLEL)
+    # ACTIVE SEARCH MODE (PARALLEL UPDATED)
     # ---------------------------
     elif mode.startswith("Active"):
         if not sorted_surnames:
@@ -850,6 +828,7 @@ if st.button("🚀 Start Mission", type="primary"):
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_browsers) as executor:
             futures = []
             for i, chunk in enumerate(chunks):
+                if not chunk: continue
                 status_log.write(f"Browser {i+1}: Checking {len(chunk)} surnames ({chunk[0]}...)")
                 futures.append(
                     executor.submit(worker_search_batch, chunk, start_url, manual_name_selector, manual_search_selector, run_headless)
