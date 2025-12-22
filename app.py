@@ -360,6 +360,15 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
 def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
 
+    def regex_last_first(text: str) -> List[str]:
+        pattern = re.compile(r"[A-ZÀ-ÖØ-öø-ÿ'’`´\-.]+,\s+[A-ZÀ-ÖØ-öø-ÿ'’`´\-.]+(?:\s+[A-ZÀ-ÖØ-öø-ÿ'’`´\-.]+){0,3}")
+        out: List[str] = []
+        for m in pattern.findall(text):
+            c = clean_extracted_name(m)
+            if c:
+                out.append(c)
+        return out
+
     def fallback_from_text(text: str) -> List[str]:
         out: List[str] = []
         for raw in text.splitlines():
@@ -396,6 +405,10 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
     if not out:
         text_blob = soup.get_text("\n", strip=True)
         out = fallback_from_text(text_blob)
+
+    if len(out) < 5:
+        text_blob = soup.get_text(" ", strip=True)
+        out.extend(regex_last_first(text_blob))
 
     return list(dict.fromkeys(out))
 
@@ -814,12 +827,28 @@ if st.session_state.running:
         wait_for_results = max(3, min(12, int(selenium_wait)))
 
         def requests_urlparam_search(term: str) -> Optional[str]:
+            base_qs = parse_qs(urlparse(start_url).query)
             for p in param_candidates:
                 if not p:
                     continue
                 u = urlparse(start_url)
-                qs = parse_qs(u.query)
+                qs = dict(base_qs)
                 qs[p] = [term]
+                cand = u._replace(query=urlencode(qs, doseq=True)).geturl()
+                rr = fetch_native("GET", cand, None)
+                if rr and getattr(rr, "status_code", None) == 200 and rr.text and len(rr.text) > 400:
+                    return rr.text
+            # If the simple param loop failed, try common two-param fallbacks (e.g., MIT directory needs search=search).
+            extra_param_sets = [
+                {"query": term, "search": "search"},
+                {"query": term, "search": ""},
+                {"q": term, "search": "search"},
+            ]
+            u = urlparse(start_url)
+            for extra in extra_param_sets:
+                qs = dict(base_qs)
+                for k, v in extra.items():
+                    qs[k] = [v]
                 cand = u._replace(query=urlencode(qs, doseq=True)).geturl()
                 rr = fetch_native("GET", cand, None)
                 if rr and getattr(rr, "status_code", None) == 200 and rr.text and len(rr.text) > 400:
