@@ -27,6 +27,7 @@ try:
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
     HAS_SELENIUM = True
 except Exception:
     HAS_SELENIUM = False
@@ -70,7 +71,7 @@ if use_browserlike_tls and not HAS_CURL:
 st.sidebar.markdown("---")
 st.sidebar.header("🧪 Selenium")
 run_headless = st.sidebar.checkbox("Run Selenium headless", value=True)
-selenium_wait = st.sidebar.slider("Selenium wait timeout", 3, 30, 10)
+selenium_wait = st.sidebar.slider("Selenium wait timeout", 3, 45, 12)
 
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3, table td.name")
@@ -174,7 +175,6 @@ def clean_extracted_name(raw_text):
     if len(clean) < 3 or len(clean.split()) > 6:
         return None
 
-    # quick name-ish test (allows 1 token too; we decide later if we accept it)
     if not NAME_REGEX.match(clean):
         return None
 
@@ -364,12 +364,11 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
     if manual_sel:
         selectors.append(manual_sel.strip())
 
-    # common directory patterns (ordered from more precise to more broad)
     selectors += [
         "td.name", "td:first-child", "td:nth-child(1)",
         "h3", "h4", "h2",
         ".person .name", ".person-name", ".profile-name", ".result-title", ".result__title",
-        "a", "span", "div"
+        "a"
     ]
 
     out: List[str] = []
@@ -380,7 +379,6 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
             if c:
                 out.append(c)
 
-        # stop early if we already have enough candidates from a precise selector
         if len(out) >= 80 and sel in ("td:first-child", "h3", "h4", "td:nth-child(1)"):
             break
 
@@ -436,12 +434,10 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
                 if req:
                     return req
 
-    # rel=next
     el = soup.select_one("a[rel='next'][href]")
     if el:
         return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
 
-    # link text
     next_texts = {"next", "next page", "older", ">", "›", "»", "more"}
     for a in soup.select("a[href]"):
         t = (a.get_text(" ", strip=True) or "").strip().lower()
@@ -449,7 +445,6 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
         if t in next_texts or aria in next_texts or "next" in aria:
             return {"method": "GET", "url": urljoin(base_url, a["href"]), "data": None}
 
-    # form buttons
     def looks_like_next(s: str) -> bool:
         s = (s or "").strip().lower()
         return (s in next_texts) or ("next" in s) or ("more" in s)
@@ -467,7 +462,6 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
                 if req:
                     return req
 
-    # url params fallback
     u = urlparse(base_url)
     qs = parse_qs(u.query)
     for k in ["page", "p", "pg", "start", "offset"]:
@@ -529,6 +523,65 @@ def get_driver(headless: bool = True):
 
 
 # =========================================================
+#             SELENIUM WAIT (FIXED)
+# =========================================================
+def selenium_wait_document_ready(driver, timeout: int = 10):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        pass
+
+def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = None):
+    """
+    More reliable wait:
+      1) document.readyState complete
+      2) if name_selector: wait for at least 1 match
+      3) else: wait for common result containers
+      4) fallback: wait for DOM node count to increase
+    """
+    selenium_wait_document_ready(driver, min(8, timeout))
+
+    if name_selector:
+        try:
+            WebDriverWait(driver, timeout).until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, name_selector)) > 0
+            )
+            return
+        except Exception:
+            pass
+
+    common = [
+        "main a",
+        "article a",
+        "table tbody tr",
+        "ul li a",
+        "ol li a",
+        ".search-results *",
+        "#search-results *",
+        ".results *",
+        "#results *",
+    ]
+    for sel in common:
+        try:
+            WebDriverWait(driver, max(3, timeout // 2)).until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, sel)) > 0
+            )
+            return
+        except Exception:
+            continue
+
+    try:
+        before = driver.execute_script("return document.getElementsByTagName('*').length") or 0
+        WebDriverWait(driver, timeout).until(
+            lambda d: (d.execute_script("return document.getElementsByTagName('*').length") or 0) > before + 30
+        )
+    except Exception:
+        pass
+
+
+# =========================================================
 #             ACTIVE SEARCH: FIXED LOGIC
 # =========================================================
 def selenium_find_search_input(driver) -> Optional[str]:
@@ -585,17 +638,6 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
         return True
     except Exception:
         return False
-
-def selenium_wait_for_results(driver, before_url: str, before_len: int, timeout: int) -> None:
-    def changed(d):
-        try:
-            if d.current_url != before_url:
-                return True
-            html = d.page_source or ""
-            return abs(len(html) - before_len) > 300
-        except Exception:
-            return False
-    WebDriverWait(driver, timeout).until(changed)
 
 
 # =========================================================
@@ -661,6 +703,8 @@ if st.session_state.running:
 
             status_log.write(f"🧩 Extracted {len(names)} candidates.")
             if debug_show_candidates:
+                st.write("URL:", current_req["url"])
+                st.write("HTML length:", len(raw_html))
                 st.write("Sample extracted candidates:", names[:30])
 
             matches = match_names(names, f"Page {page}")
@@ -710,11 +754,12 @@ if st.session_state.running:
 
         try:
             driver.get(start_url)
-            time.sleep(3)
+            selenium_wait_document_ready(driver, timeout=int(selenium_wait))
             for k in range(int(max_pages)):
                 status_log.update(label=f"Scroll batch {k+1}/{int(max_pages)}...", state="running")
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(max(1, search_delay))
+                selenium_wait_results(driver, timeout=int(selenium_wait), name_selector=(manual_name_selector.strip() if manual_name_selector else None))
 
                 html = driver.page_source
                 names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
@@ -769,8 +814,9 @@ if st.session_state.running:
             if driver:
                 try:
                     driver.get(start_url)
-                    time.sleep(2)
+                    selenium_wait_document_ready(driver, timeout=int(selenium_wait))
 
+                    # cookie click best-effort
                     try:
                         driver.execute_script(
                             "document.querySelectorAll('button,a').forEach(b=>{if(/accept|agree|cookie/i.test(b.innerText))b.click()})"
@@ -782,15 +828,13 @@ if st.session_state.running:
                     if not sel_input:
                         status_log.warning("No search input found by Selenium; using requests fallback.")
                     else:
-                        before_url = driver.current_url
-                        before_len = len(driver.page_source or "")
-
                         ok = selenium_submit_search(driver, sel_input, surname)
                         if ok:
-                            try:
-                                selenium_wait_for_results(driver, before_url, before_len, timeout=int(selenium_wait))
-                            except Exception:
-                                pass
+                            selenium_wait_results(
+                                driver,
+                                timeout=int(selenium_wait),
+                                name_selector=(manual_name_selector.strip() if manual_name_selector else None),
+                            )
                             html = driver.page_source
                 except Exception as e:
                     status_log.warning(f"Selenium search failed: {repr(e)}")
@@ -806,6 +850,8 @@ if st.session_state.running:
 
             names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
             if debug_show_candidates:
+                st.write(f"URL after search: {(driver.current_url if driver else 'requests-mode')}")
+                st.write("HTML length:", len(html))
                 st.write(f"Sample extracted candidates for {surname}:", names[:30])
 
             if not names:
