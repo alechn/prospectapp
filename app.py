@@ -32,6 +32,8 @@ import time
 import re
 import io
 import subprocess
+import tempfile
+import shutil
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
@@ -517,11 +519,15 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
 # =========================================================
 #             PART 6: SELENIUM DRIVER (LOUD WHEN FORCED)
 # =========================================================
+import tempfile
+import shutil
+
+# ... [keep your existing imports] ...
+
 def get_driver(headless: bool = True, fail_loud: bool = False):
     """
     Streamlit Cloud-friendly Selenium setup.
-    Uses system Chromium + system chromedriver.
-    If fail_loud=True, raises and also shows the exception in the UI.
+    Creates a unique user-data-dir for every session to prevent 'SessionNotCreatedException' / 'DevToolsActivePort' crashes.
     """
     if not HAS_SELENIUM:
         return None
@@ -530,38 +536,55 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
     if headless:
         options.add_argument("--headless=new")
 
-    # Cloud/container flags
+    # Critical Cloud Flags
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--remote-allow-origins=*")
-
-    # Extra flags for Streamlit Cloud / Debian containers
-    options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-background-timer-throttling")
-    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--remote-allow-origins=*")
+    options.add_argument("--start-maximized")
+    options.add_argument("--window-size=1920,1080")
 
-    # Writable dirs
-    options.add_argument("--user-data-dir=/tmp/chrome-user-data")
-    options.add_argument("--data-path=/tmp/chrome-data-path")
-    options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
+    # --- FIX: UNIQUE USER PROFILE ---
+    # Create a fresh temporary directory for this specific driver instance
+    user_data_dir = tempfile.mkdtemp()
+    options.add_argument(f"--user-data-dir={user_data_dir}")
+    options.add_argument(f"--data-path={user_data_dir}/data")
+    options.add_argument(f"--disk-cache-dir={user_data_dir}/cache")
 
-    # Explicit Chromium binary (your diagnostics confirm this exists)
-    options.binary_location = "/usr/bin/chromium"
+    # Explicit Binary Location (Matches your diagnostics)
+    if os.path.exists("/usr/bin/chromium"):
+        options.binary_location = "/usr/bin/chromium"
+    elif os.path.exists("/usr/bin/chromium-browser"):
+        options.binary_location = "/usr/bin/chromium-browser"
 
-    # Prefer system driver (your diagnostics confirm this exists)
-    service = Service("/usr/bin/chromedriver")
+    # Prefer System Driver (Matches your diagnostics)
+    service = None
+    if os.path.exists("/usr/bin/chromedriver"):
+        service = Service("/usr/bin/chromedriver")
+    else:
+        # Fallback to webdriver_manager if system driver is missing
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from webdriver_manager.core.os_manager import ChromeType
+            service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+        except Exception:
+            pass
 
     try:
-        return webdriver.Chrome(service=service, options=options)
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
     except Exception as e:
-        st.error(f"Selenium failed to start: {repr(e)}")
+        # Clean up the temp dir if startup fails
+        try:
+            shutil.rmtree(user_data_dir)
+        except:
+            pass
+            
         if fail_loud:
-            raise
+            st.error(f"Selenium failed to start: {repr(e)}")
+            # Raise so we can see the full traceback in the 'Manage App' logs if needed
+            raise e
         return None
 
 
