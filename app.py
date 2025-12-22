@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
+import google.generativeai as genai  # ADDED: For AI Cleaning
 
 # --- Optional curl_cffi for better TLS fingerprint (free) ---
 try:
@@ -38,7 +39,7 @@ except Exception:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Free Engines • Universal Pagination • Optional AI • IBGE File→API Fallback")
+st.caption("Free Engines • Universal Pagination • AI Cleaning • IBGE Scoring")
 st.info("Reminder: only scrape directories you have permission to process. Respect robots.txt, rate limits, and site terms.")
 
 if "running" not in st.session_state:
@@ -53,7 +54,7 @@ if "visited_urls" not in st.session_state:
 # =========================================================
 #             SIDEBAR
 # =========================================================
-st.sidebar.header("🧠 AI Brain (optional)")
+st.sidebar.header("🧠 AI Brain (Cleaning)")
 ai_provider = st.sidebar.selectbox(
     "Choose your Model:",
     ["Google Gemini (Flash 2.0)", "OpenAI (GPT-4o)", "Anthropic (Claude 3.5)", "DeepSeek (V3)"]
@@ -140,25 +141,45 @@ def normalize_token(s: str) -> str:
     s = unidecode(str(s).strip().upper())
     return "".join(ch for ch in s if "A" <= ch <= "Z")
 
-NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,5}$")
+NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,6}$")
 
 def clean_extracted_name(raw_text):
+    """
+    UPDATED: Robust Universal Cleaner to filter out junk titles/locations.
+    """
     if not isinstance(raw_text, str):
         return None
+    
+    # 1. Clean whitespace
     raw_text = " ".join(raw_text.split()).strip()
     if not raw_text:
         return None
 
     upper = raw_text.upper()
+
+    # 2. Expanded Junk Phrases (Universal Blocklist)
     junk_phrases = [
         "RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "SPOTLIGHT",
-        "EXPERIENCE IN", "CALCULATION FOR", "LIVING WAGE", "GOING FAST",
+        "EXPERIENCE", "CALCULATION", "LIVING WAGE", "GOING FAST",
         "GUIDE TO", "LOG OF", "REVIEW OF", "MENU", "SKIP TO",
         "CONTENT", "FOOTER", "HEADER", "OVERVIEW", "PROJECTS", "PEOPLE",
-        "PROFILE", "VIEW", "CONTACT"
+        "PROFILE", "VIEW", "CONTACT", "READ MORE", "LEARN MORE",
+        # Organizational / Academic Terms (Generic)
+        "UNIVERSITY", "INSTITUTE", "SCHOOL", "DEPARTMENT", "COLLEGE",
+        "PROGRAM", "INITIATIVE", "LABORATORY", "CENTER FOR", "CENTRE FOR",
+        "ALUMNI", "DIRECTORY", "REAP", "MBA", "PHD", "MSC", "CLASS OF",
+        # Locations (Generic)
+        "BRASIL", "BRAZIL", "PERU", "ARGENTINA", "CHILE", "USA", "UNITED STATES",
+        "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+        "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"
     ]
+    
     if any(phrase in upper for phrase in junk_phrases):
         return None
+
+    # 3. Safety check for "MIT" (Whole word only)
+    if re.search(r'\bMIT\b', upper):
+         return None
 
     # convert "LAST, FIRST" -> "FIRST LAST"
     if "," in raw_text:
@@ -169,10 +190,15 @@ def clean_extracted_name(raw_text):
     if ":" in raw_text:
         raw_text = raw_text.split(":")[-1].strip()
 
-    clean = re.split(r"[|–—»\(\)]", raw_text)[0].strip()
+    # 4. Split on common non-name delimiters (e.g., "Name - Title")
+    clean = re.split(r"[|–—»\(\)]|\s-\s", raw_text)[0].strip()
     clean = " ".join(clean.split()).strip()
 
-    if len(clean) < 3 or len(clean.split()) > 6:
+    if len(clean) < 3 or len(clean.split()) > 7:
+        return None
+
+    # Reject emails/filenames/urls
+    if any(x in clean for x in ["@", ".com", ".org", ".edu", ".net", "http", "www"]):
         return None
 
     if not NAME_REGEX.match(clean):
@@ -220,7 +246,7 @@ def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str
         page = 1
         while True:
             r = requests.get(url, params={"page": page}, timeout=30)
-            r.raise_for_status()
+            if r.status_code != 200: break
             items = r.json().get("items", [])
             if not items:
                 break
@@ -229,6 +255,7 @@ def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str
                 if n:
                     out[n] = int(it.get("rank", 0) or 0)
             page += 1
+            if len(out) > 20000: break # Safety cap
             time.sleep(0.08)
         return out
 
@@ -286,10 +313,11 @@ with st.sidebar.status("Loading IBGE...", expanded=False) as s:
 # =========================================================
 #             MATCHING
 # =========================================================
-def rank_score(rank: int, top_n: int, max_points: int = 50) -> int:
-    if rank <= 0 or top_n <= 0:
+def calculate_score(rank: int, top_n: int, max_points: int = 50) -> int:
+    """ UPDATED: More linear scoring decay (rank 1 = max, rank N = 0) """
+    if not rank or rank > top_n or top_n <= 0:
         return 0
-    return max(1, int(max_points * (top_n - rank + 1) / top_n))
+    return max_points * (1 - (rank / top_n))
 
 def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
     found = []
@@ -313,14 +341,15 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
 
             rl = surname_ranks.get(tok, 0)
             if rl > 0:
-                score = rank_score(rl, int(limit_surname), 50)
+                score = calculate_score(rl, int(limit_surname), 50)
                 found.append({
                     "Full Name": n,
-                    "Brazil Score": score,
+                    "Brazil Score": round(score, 1),
                     "First Rank": None,
                     "Surname Rank": rl,
                     "Source": source,
-                    "Match Type": "Surname Only (weak)"
+                    "Match Type": "Surname Only (weak)",
+                    "Status": "Valid" # ADDED Status
                 })
             continue
 
@@ -335,20 +364,20 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
         rf = first_name_ranks.get(f, 0)
         rl = surname_ranks.get(l, 0)
 
-        score = 0
-        if rf > 0:
-            score += rank_score(rf, int(limit_first), 50)
-        if rl > 0:
-            score += rank_score(rl, int(limit_surname), 50)
+        score_f = calculate_score(rf, int(limit_first), 50)
+        score_l = calculate_score(rl, int(limit_surname), 50)
+        
+        total_score = round(score_f + score_l, 1)
 
-        if score > 0:
+        if total_score > 5: # Threshold
             found.append({
                 "Full Name": n,
-                "Brazil Score": score,
+                "Brazil Score": total_score,
                 "First Rank": rf if rf > 0 else None,
                 "Surname Rank": rl if rl > 0 else None,
                 "Source": source,
-                "Match Type": "Strong" if (rf > 0 and rl > 0) else ("First Only" if rf > 0 else "Surname Only")
+                "Match Type": "Strong" if (rf > 0 and rl > 0) else ("First Only" if rf > 0 else "Surname Only"),
+                "Status": "Valid" # ADDED Status
             })
 
     return found
@@ -641,12 +670,71 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
 
 
 # =========================================================
+#             AI CLEANING AGENT (NEW)
+# =========================================================
+def batch_clean_with_ai(matches, api_key):
+    """
+    Sends names to LLM to identify non-names.
+    Returns the list with updated 'Status'.
+    """
+    if not api_key:
+        st.error("API Key required for AI Cleaning.")
+        return matches
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-2.0-flash')
+
+    names = [m["Full Name"] for m in matches]
+    junk_names = []
+    
+    batch_size = 50
+    progress_bar = st.progress(0)
+    
+    for i in range(0, len(names), batch_size):
+        batch = names[i:i+batch_size]
+        prompt = f"""
+        You are a data cleaning assistant. I have a list of strings extracted from a website directory that are SUPPOSED to be names of people.
+        However, some of them are titles, organization names, partial text, or locations (junk).
+        
+        Identify the strings that are **NOT** valid full names of people.
+        
+        List:
+        {json.dumps(batch)}
+        
+        Return ONLY a JSON list of the strings you think are JUNK/INVALID. 
+        Example: ["MIT Program", "Director of Sales", "Peru - Lima"]
+        If all are valid, return [].
+        """
+        try:
+            response = model.generate_content(prompt)
+            text = response.text.replace("```json", "").replace("```", "")
+            found_junk = json.loads(text)
+            junk_names.extend(found_junk)
+        except Exception:
+            pass
+        
+        progress_bar.progress(min((i + batch_size) / len(names), 1.0))
+        time.sleep(1) 
+
+    # Update matches
+    for m in matches:
+        if m["Full Name"] in junk_names:
+            m["Status"] = "Junk (AI Flagged)"
+            m["Brazil Score"] = -1 # Move to bottom
+        else:
+            m["Status"] = "Verified"
+            
+    return matches
+
+
+# =========================================================
 #             MAIN UI
 # =========================================================
 st.markdown("### 🤖 Auto-Pilot Control Center")
 c1, c2 = st.columns([3, 1])
 start_url = c1.text_input("Target URL", placeholder="https://directory.example.com")
-max_pages = c2.number_input("Max Pages / Search Cycles", 1, 500, 10)
+# UPDATED: Increased limit to 10,000 to allow full list processing
+max_pages = c2.number_input("Max Pages / Search Cycles", 1, 10000, 500)
 
 st.write("---")
 mode = st.radio(
@@ -713,6 +801,7 @@ if st.session_state.running:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
                         all_matches.append(m)
+                # UPDATED: Sorting by Score
                 all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                 st.session_state.matches = all_matches
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
@@ -769,6 +858,7 @@ if st.session_state.running:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
                         all_matches.append(m)
+                # UPDATED: Sorting by Score
                 all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                 st.session_state.matches = all_matches
 
@@ -865,6 +955,7 @@ if st.session_state.running:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
                         all_matches.append(m)
+                # UPDATED: Sorting by Score
                 all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                 st.session_state.matches = all_matches
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
@@ -883,14 +974,44 @@ if st.session_state.running:
     status_log.update(label="Scanning Complete", state="complete")
     st.session_state.running = False
 
-    if st.session_state.matches:
+
+# =========================================================
+#             POST-PROCESSING UI (NEW)
+# =========================================================
+if st.session_state.matches:
+    st.markdown("---")
+    col1, col2 = st.columns([1, 4])
+    
+    with col1:
+        st.subheader("🧹 Cleaning")
+        if st.button("✨ AI Clean & Sort Results", type="primary"):
+            if not api_key:
+                st.error("Please provide an API Key in the sidebar.")
+            else:
+                with st.spinner("🤖 AI is reviewing every name..."):
+                    cleaned = batch_clean_with_ai(st.session_state.matches, api_key)
+                    # Sort: Valid (High Score -> Low) THEN Junk
+                    cleaned.sort(key=lambda x: (x.get("Status") == "Junk (AI Flagged)", -x["Brazil Score"]))
+                    st.session_state.matches = cleaned
+                    st.success("Cleaning Complete! Junk moved to bottom.")
+                    st.rerun()
+
+    with col2:
         df = pd.DataFrame(st.session_state.matches)
-        st.markdown("---")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("📥 CSV", df.to_csv(index=False).encode("utf-8"), "results.csv")
-        with c2:
-            b = io.BytesIO()
-            with pd.ExcelWriter(b, engine="xlsxwriter") as w:
-                df.to_excel(w, index=False)
-            st.download_button("📥 Excel", b.getvalue(), "results.xlsx")
+        
+        # Configure columns for better visibility
+        cols_config = {
+            "Brazil Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.1f"),
+            "Status": st.column_config.TextColumn("Status"),
+        }
+        
+        st.dataframe(df, column_config=cols_config, use_container_width=True)
+        
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("📥 CSV", df.to_csv(index=False).encode("utf-8"), "results.csv")
+    with c2:
+        b = io.BytesIO()
+        with pd.ExcelWriter(b, engine="xlsxwriter") as w:
+            df.to_excel(w, index=False)
+        st.download_button("📥 Excel", b.getvalue(), "results.xlsx")
