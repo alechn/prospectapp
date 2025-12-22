@@ -519,15 +519,10 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
 # =========================================================
 #             PART 6: SELENIUM DRIVER (LOUD WHEN FORCED)
 # =========================================================
-import tempfile
-import shutil
-
-# ... [keep your existing imports] ...
-
 def get_driver(headless: bool = True, fail_loud: bool = False):
     """
     Streamlit Cloud-friendly Selenium setup.
-    Creates a unique user-data-dir for every session to prevent 'SessionNotCreatedException' / 'DevToolsActivePort' crashes.
+    Creates a unique user-data-dir for every session to prevent 'SessionNotCreatedException' crashes.
     """
     if not HAS_SELENIUM:
         return None
@@ -547,6 +542,7 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
 
     # --- FIX: UNIQUE USER PROFILE ---
     # Create a fresh temporary directory for this specific driver instance
+    # This prevents the "SessionNotCreatedException" caused by stale locks
     user_data_dir = tempfile.mkdtemp()
     options.add_argument(f"--user-data-dir={user_data_dir}")
     options.add_argument(f"--data-path={user_data_dir}/data")
@@ -581,12 +577,11 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
         except:
             pass
             
+        # In "Force" mode, show the real error. In "Auto" mode, stay silent.
         if fail_loud:
             st.error(f"Selenium failed to start: {repr(e)}")
-            # Raise so we can see the full traceback in the 'Manage App' logs if needed
             raise e
         return None
-
 
 # =========================================================
 #             PART 7: PAGINATION HELPERS
