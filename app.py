@@ -85,8 +85,15 @@ def vlog(status, msg: str):
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
 
 # "Lastname, Firstname" OR "Firstname Lastname"
-NAME_COMMA_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+,\s*[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,3}$")
-NAME_SPACE_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){1,4}$")
+NAME_COMMA_RE = re.compile(
+    r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,4},\s*"
+    r"[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,4}$"
+)
+NAME_SPACE_RE = re.compile(
+    r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+(?:da|de|do|dos|das|del|della|di|van|von|bin|ibn))?"
+    r"(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){1,5}$",
+    re.I
+)
 
 PEOPLE_KEYWORDS = [
     "people", "person", "directory", "staff", "faculty", "students", "student",
