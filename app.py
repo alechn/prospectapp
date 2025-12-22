@@ -131,6 +131,16 @@ BLOCKLIST_SURNAMES = {
     "CALCULATION","EXPERIENCE","WAGE","LIVING","GOING","FAST"
 }
 
+# Words that strongly indicate non-person results (titles, locations, orgs)
+TRASH_TOKENS = {
+    "EXPERIENCIA",
+    "EXPERIENCE",
+    "MIT",
+    "REAP",
+    "PERU",
+    "UNIVERSITY",
+}
+
 # =========================================================
 #             HELPERS
 # =========================================================
@@ -173,6 +183,15 @@ def clean_extracted_name(raw_text):
     clean = " ".join(clean.split()).strip()
 
     if len(clean) < 3 or len(clean.split()) > 6:
+        return None
+
+    normalized_tokens = []
+    for tok in clean.split():
+        nt = normalize_token(tok)
+        if nt:
+            normalized_tokens.append(nt)
+
+    if any(tok in TRASH_TOKENS for tok in normalized_tokens):
         return None
 
     if not NAME_REGEX.match(clean):
