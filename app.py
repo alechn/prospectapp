@@ -5,15 +5,15 @@ Universal Brazilian Alumni Finder (Streamlit Cloud friendly)
 ✅ Infinite scroll (Selenium)
 ✅ Optional AI: learn selectors once (name + next)
 ✅ IBGE: load from data/ibge_rank_cache.json if present; else fetch from API; can save
-✅ Fixes:
-   - Selenium now fails loudly when forced (shows real exception)
+
+✅ Fixes included:
+   - Selenium hardened for Streamlit Cloud:
+       * Forces headless (Streamlit Cloud has no X server / $DISPLAY)
+       * Uses --remote-debugging-pipe (recommended by ChromeDriver)
+       * Uses /tmp profile dirs and cleans up after quitting
+       * Optional ChromeDriver log tail display (last 200 lines)
+   - Selenium fails loudly when forced (shows real exception + log tail)
    - Name cleaner handles "LAST, FIRST" (MIT-style) instead of truncating at comma
-✅ NEW Selenium hardening (Streamlit Cloud):
-   - Uses --headless=new
-   - Adds --remote-debugging-port=9222
-   - Uses /tmp profile dir
-   - Optional ChromeDriver verbose log to /tmp/chromedriver.log
-   - Cleans up temp profile directory on quit (success or failure)
 
 STREAMLIT CLOUD SETUP (FREE)
 1) packages.txt (repo root):
@@ -164,11 +164,11 @@ with st.sidebar.expander("🛠️ Advanced / Debug"):
         help="If you know the query parameter name for URL-based search."
     )
     show_debug_ai_payload = st.sidebar.checkbox("Show AI Debug Errors", value=True)
-    run_headless = st.sidebar.checkbox("Selenium Headless", value=True)
 
-    # ✅ NEW: Optional ChromeDriver verbose logging
+    # Selenium options
+    st.sidebar.caption("Selenium note: Streamlit Cloud has no X server; headless is forced.")
     enable_chromedriver_log = st.sidebar.checkbox(
-        "Write ChromeDriver verbose log (/tmp/chromedriver.log)", value=True
+        "Write ChromeDriver log (/tmp/chromedriver.log)", value=True
     )
     show_chromedriver_log_on_error = st.sidebar.checkbox(
         "Show last 200 lines of ChromeDriver log on error", value=True
@@ -231,7 +231,7 @@ def normalize_token(s: str) -> str:
 def clean_extracted_name(raw_text):
     """
     Improved cleaner:
-    - converts "LAST, FIRST ..." -> "FIRST ..." + "LAST"
+    - converts "LAST, FIRST ..." -> "FIRST ... LAST"
     - does NOT truncate at comma before conversion (MIT fix)
     """
     if not isinstance(raw_text, str):
@@ -531,36 +531,37 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
 
 
 # =========================================================
-#             PART 6: SELENIUM DRIVER (LOUD WHEN FORCED)
+#             PART 6: SELENIUM DRIVER (FIXED FOR CLOUD)
 # =========================================================
 def _maybe_show_chromedriver_log():
+    if not show_chromedriver_log_on_error:
+        return
     path = "/tmp/chromedriver.log"
     if os.path.exists(path):
         try:
             tail = open(path, "r", encoding="utf-8", errors="ignore").read().splitlines()[-200:]
+            st.subheader("ChromeDriver log (tail)")
             st.code("\n".join(tail))
         except Exception:
             pass
 
-def get_driver(headless: bool = True, fail_loud: bool = False):
+def get_driver(_headless_flag_from_ui: bool = True, fail_loud: bool = False):
     """
-    Streamlit Cloud-friendly Selenium setup (hardened).
-    Key changes:
-      - --headless=new
-      - --remote-debugging-port=9222
-      - user-data-dir under /tmp
-      - optional chromedriver verbose log to /tmp/chromedriver.log
-      - returns (driver, profile_dir) so caller can cleanup on success too
+    IMPORTANT:
+      Streamlit Cloud has NO X server. If Chromium is not headless, it WILL crash with:
+      'Missing X server or $DISPLAY'.
+
+    Therefore: we FORCE headless here unconditionally.
     """
     if not HAS_SELENIUM:
         return None, None
 
     options = Options()
 
-    if headless:
-        options.add_argument("--headless=new")
+    # ✅ FORCE headless in Streamlit Cloud
+    options.add_argument("--headless=new")
 
-    # Container-safe flags
+    # ✅ Container-safe flags
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -568,8 +569,10 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
     options.add_argument("--no-zygote")
     options.add_argument("--window-size=1920,1080")
 
-    # Common “Chrome exits instantly” fixes
-    options.add_argument("--remote-debugging-port=9222")
+    # ✅ Recommended by ChromeDriver: pipe mode (avoids port binding issues)
+    options.add_argument("--remote-debugging-pipe")
+
+    # Extra stability flags
     options.add_argument("--disable-background-networking")
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-renderer-backgrounding")
@@ -580,22 +583,21 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--remote-allow-origins=*")
 
-    # Use short writable profile path
-    user_data_dir = tempfile.mkdtemp(prefix="selenium_profile_", dir="/tmp")
-    options.add_argument(f"--user-data-dir={user_data_dir}")
+    # ✅ Unique /tmp profile per session
+    profile_dir = tempfile.mkdtemp(prefix="selenium_profile_", dir="/tmp")
+    options.add_argument(f"--user-data-dir={profile_dir}")
 
-    # Explicit Chromium binary
+    # ✅ Explicit binary
     if os.path.exists("/usr/bin/chromium"):
         options.binary_location = "/usr/bin/chromium"
     elif os.path.exists("/usr/bin/chromium-browser"):
         options.binary_location = "/usr/bin/chromium-browser"
 
-    # Service / Driver
+    # ✅ Prefer system chromedriver
     service = None
     if os.path.exists("/usr/bin/chromedriver"):
         if enable_chromedriver_log:
             try:
-                # overwrite each run
                 try:
                     os.remove("/tmp/chromedriver.log")
                 except Exception:
@@ -606,6 +608,7 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
         else:
             service = Service("/usr/bin/chromedriver")
     else:
+        # fallback webdriver_manager (rarely needed on Streamlit Cloud)
         try:
             service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
         except Exception:
@@ -614,17 +617,17 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
     try:
         driver = webdriver.Chrome(service=service, options=options)
         driver.set_page_load_timeout(45)
-        return driver, user_data_dir
+        return driver, profile_dir
+
     except Exception as e:
         try:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+            shutil.rmtree(profile_dir, ignore_errors=True)
         except Exception:
             pass
 
         if fail_loud:
             st.error(f"Selenium Startup Failed: {repr(e)}")
-            if show_chromedriver_log_on_error:
-                _maybe_show_chromedriver_log()
+            _maybe_show_chromedriver_log()
             raise
         return None, None
 
@@ -848,7 +851,14 @@ def rank_score(rank: int, top_n: int, max_points: int = 50) -> int:
         return 0
     return max(1, int(max_points * (top_n - rank + 1) / top_n))
 
-def match_names_detailed(names: List[str], source: str, top_first: int, top_surname: int) -> List[Dict[str, Any]]:
+def match_names_detailed(
+    names: List[str],
+    source: str,
+    top_first: int,
+    top_surname: int,
+    first_name_ranks: Dict[str, int],
+    surname_ranks: Dict[str, int],
+) -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
     seen = set()
 
@@ -1012,10 +1022,10 @@ def build_url_param_search(url: str, term: str, forced_param: Optional[str] = No
         out.append(u._replace(query=urlencode(qs, doseq=True)).geturl())
     return out
 
-def try_requests_form_search(start_url: str, term: str, cached_form: Optional[Dict[str, Any]]) -> Optional[requests.Response]:
+def try_requests_form_search(start_url: str, term: str, cached_form: Optional[Dict[str, Any]], use_tls: bool) -> Optional[requests.Response]:
     form = cached_form
     if not form:
-        r0 = fetch_native("GET", start_url, None, tls_impersonation=use_browserlike_tls)
+        r0 = fetch_native("GET", start_url, None, tls_impersonation=use_tls)
         if not r0 or getattr(r0, "status_code", None) != 200:
             return None
         form = detect_search_form(r0.text, start_url)
@@ -1033,13 +1043,13 @@ def try_requests_form_search(start_url: str, term: str, cached_form: Optional[Di
         for k, v in data.items():
             qs[k] = [v]
         url2 = u._replace(query=urlencode(qs, doseq=True)).geturl()
-        return fetch_native("GET", url2, None, tls_impersonation=use_browserlike_tls)
+        return fetch_native("GET", url2, None, tls_impersonation=use_tls)
 
-    return fetch_native("POST", action_url, data, tls_impersonation=use_browserlike_tls)
+    return fetch_native("POST", action_url, data, tls_impersonation=use_tls)
 
-def try_requests_urlparam_search(start_url: str, term: str, forced_param: Optional[str] = None) -> Optional[requests.Response]:
+def try_requests_urlparam_search(start_url: str, term: str, forced_param: Optional[str], use_tls: bool) -> Optional[requests.Response]:
     for candidate in build_url_param_search(start_url, term, forced_param=forced_param):
-        r = fetch_native("GET", candidate, None, tls_impersonation=use_browserlike_tls)
+        r = fetch_native("GET", candidate, None, tls_impersonation=use_tls)
         if r and getattr(r, "status_code", None) == 200 and r.text and len(r.text) > 300:
             return r
     return None
@@ -1190,7 +1200,14 @@ if st.session_state.running:
                         next_req = find_next_request_heuristic(raw_html, current_req["url"])
 
             if names:
-                matches = match_names_detailed(names, f"Page {page}", int(limit_first), int(limit_surname))
+                matches = match_names_detailed(
+                    names,
+                    f"Page {page}",
+                    int(limit_first),
+                    int(limit_surname),
+                    first_name_ranks=first_name_ranks,
+                    surname_ranks=surname_ranks,
+                )
                 if matches:
                     st.session_state.matches.extend(matches)
                     table_placeholder.dataframe(pd.DataFrame(st.session_state.matches), height=320, use_container_width=True)
@@ -1217,13 +1234,13 @@ if st.session_state.running:
     # B) INFINITE SCROLLER (SELENIUM)
     # -----------------------------
     elif mode.startswith("Infinite"):
-        status_log.write("🧭 Infinite Scroller: Selenium best-effort (may fail on Streamlit Cloud)")
+        status_log.write("🧭 Infinite Scroller: Selenium best-effort (headless forced in Cloud)")
         if not HAS_SELENIUM:
             st.error("Selenium not installed. Use Classic or Active Search modes.")
             st.session_state.running = False
             st.stop()
 
-        driver, profile_dir = get_driver(headless=run_headless, fail_loud=True)
+        driver, profile_dir = get_driver(True, fail_loud=True)
         try:
             driver.get(start_url)
             time.sleep(3)
@@ -1237,7 +1254,14 @@ if st.session_state.running:
                 html = driver.page_source
                 names = heuristic_extract_names(html, manual_name_selector.strip() if manual_name_selector else None)
                 if names:
-                    matches = match_names_detailed(names, f"Scroll batch {k+1}", int(limit_first), int(limit_surname))
+                    matches = match_names_detailed(
+                        names,
+                        f"Scroll batch {k+1}",
+                        int(limit_first),
+                        int(limit_surname),
+                        first_name_ranks=first_name_ranks,
+                        surname_ranks=surname_ranks,
+                    )
                     if matches:
                         st.session_state.matches.extend(matches)
                         table_placeholder.dataframe(pd.DataFrame(st.session_state.matches), height=320, use_container_width=True)
@@ -1284,7 +1308,7 @@ if st.session_state.running:
                     st.session_state.running = False
                     st.stop()
             else:
-                driver, profile_dir = get_driver(headless=run_headless, fail_loud=force_selenium)
+                driver, profile_dir = get_driver(True, fail_loud=force_selenium)
                 if not driver and not force_selenium:
                     status_log.warning("Selenium could not start here. Will use requests engines only.")
 
@@ -1299,7 +1323,14 @@ if st.session_state.running:
             raw_names = heuristic_extract_names(html, manual_name_selector.strip() if manual_name_selector else None)
             if not raw_names:
                 return 0
-            matches = match_names_detailed(raw_names, source, int(limit_first), int(limit_surname))
+            matches = match_names_detailed(
+                raw_names,
+                source,
+                int(limit_first),
+                int(limit_surname),
+                first_name_ranks=first_name_ranks,
+                surname_ranks=surname_ranks,
+            )
             if matches:
                 st.session_state.matches.extend(matches)
                 table_placeholder.dataframe(pd.DataFrame(st.session_state.matches), height=320, use_container_width=True)
@@ -1309,11 +1340,11 @@ if st.session_state.running:
             forced_param = manual_search_param.strip() if manual_search_param.strip() else None
 
             if active_search_engine == "Requests: Form submit (no Selenium)":
-                r = try_requests_form_search(start_url, term, cached_form)
+                r = try_requests_form_search(start_url, term, cached_form, use_tls=use_browserlike_tls)
                 return r.text if r and getattr(r, "status_code", None) == 200 else None
 
             if active_search_engine == "Requests: URL params (no Selenium)":
-                r = try_requests_urlparam_search(start_url, term, forced_param=forced_param)
+                r = try_requests_urlparam_search(start_url, term, forced_param=forced_param, use_tls=use_browserlike_tls)
                 return r.text if r and getattr(r, "status_code", None) == 200 else None
 
             if force_selenium:
@@ -1321,11 +1352,11 @@ if st.session_state.running:
 
             # AUTO pipeline
             if cached_form:
-                r = try_requests_form_search(start_url, term, cached_form)
+                r = try_requests_form_search(start_url, term, cached_form, use_tls=use_browserlike_tls)
                 if r and getattr(r, "status_code", None) == 200 and r.text:
                     return r.text
 
-            r = try_requests_urlparam_search(start_url, term, forced_param=forced_param)
+            r = try_requests_urlparam_search(start_url, term, forced_param=forced_param, use_tls=use_browserlike_tls)
             if r and getattr(r, "status_code", None) == 200 and r.text:
                 return r.text
 
