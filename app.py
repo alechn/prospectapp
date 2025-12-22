@@ -28,7 +28,7 @@ st.set_page_config(
 )
 
 st.title("🧪 Universal Active Search Debugger")
-st.caption("Probe → Detect → Decide → Extract")
+st.caption("Probe → Detect → Decide → Extract (Query-aware)")
 
 TARGET_URL = st.text_input(
     "Target URL",
@@ -45,71 +45,46 @@ TIMEOUT = st.slider("Timeout (seconds)", 5, 30, 15)
 RUN = st.button("▶ Run Debugger", type="primary")
 
 # ================================
-# Utilities
+# Logging
+# ================================
+def log(status, msg):
+    status.write(msg)
+
+# ================================
+# Name heuristics (kept simple for now)
 # ================================
 NAME_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\\-\\. ]{3,}$")
 
 BAD_TOKENS = {
-    "MIT", "HOME", "NEWS", "EVENTS", "MAP", "SEARCH",
-    "ALUMNI", "PEOPLE", "JOBS", "PRIVACY", "ACCESSIBILITY",
-    "INNOVATION", "CAMPUS", "LIFE", "GIVE", "VISIT",
-    "SOCIAL", "MEDIA"
+    "MIT","HOME","NEWS","EVENTS","MAP","SEARCH","ALUMNI",
+    "PEOPLE","JOBS","PRIVACY","ACCESSIBILITY","INNOVATION",
+    "CAMPUS","LIFE","GIVE","VISIT","MEDIA","SOCIAL"
 }
 
 def looks_like_person_name(txt: str) -> bool:
     if not txt:
         return False
-
     txt = " ".join(txt.split())
     if not NAME_RE.match(txt):
         return False
-
     words = txt.split()
     if not (2 <= len(words) <= 4):
         return False
-
     if any(w.upper() in BAD_TOKENS for w in words):
         return False
-
     return all(w[0].isupper() for w in words if w.isalpha())
-
-def find_result_containers(soup: BeautifulSoup):
-    selectors = [
-        "#results",
-        "#results-page",
-        ".results",
-        ".results-mod",
-        ".search-results",
-        ".search__results",
-        "[role='main']",
-        "main",
-    ]
-
-    containers = []
-    for sel in selectors:
-        containers.extend(soup.select(sel))
-
-    return containers or [soup]
 
 def extract_names_multi(html: str) -> List[str]:
     soup = BeautifulSoup(html or "", "html.parser")
     out = []
-
-    containers = find_result_containers(soup)
-
-    for c in containers:
-        for el in c.select("a, h2, h3, h4, strong"):
-            txt = el.get_text(" ", strip=True)
-            if looks_like_person_name(txt):
-                out.append(txt)
-
+    for el in soup.select("a, h2, h3, h4, strong"):
+        txt = el.get_text(" ", strip=True)
+        if looks_like_person_name(txt):
+            out.append(txt)
     return list(dict.fromkeys(out))
 
-def log(status, msg):
-    status.write(msg)
-
 # ================================
-# Frontend Detection
+# Frontend detection
 # ================================
 def detect_frontend(html: str) -> dict:
     h = html.lower()
@@ -129,10 +104,7 @@ def try_server_search(url: str, term: str, status) -> List[str]:
         u = urlparse(url)
         qs = parse_qs(u.query)
         qs[p] = [term]
-
-        test_url = u._replace(
-            query=urlencode(qs, doseq=True)
-        ).geturl()
+        test_url = u._replace(query=urlencode(qs, doseq=True)).geturl()
 
         log(status, f"🔍 Trying server search: {test_url}")
 
@@ -141,7 +113,7 @@ def try_server_search(url: str, term: str, status) -> List[str]:
             if r.status_code == 200:
                 names = extract_names_multi(r.text)
                 if names:
-                    log(status, f"✅ Server search worked via param '{p}'")
+                    log(status, f"✅ Server search worked via '{p}'")
                     return names
         except Exception as e:
             log(status, f"⚠ Server search error: {e}")
@@ -161,7 +133,6 @@ def get_driver():
     service = Service(
         ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
     )
-
     return webdriver.Chrome(service=service, options=opts)
 
 def selenium_wait_ready(driver, timeout=10):
@@ -186,7 +157,48 @@ def selenium_submit_search(driver, inp, term):
     inp.send_keys(Keys.RETURN)
 
 # ================================
-# Strategy 4: Selenium DOM
+# 🔑 QUERY-AWARE WAIT (THIS FIXES YOUR ISSUE)
+# ================================
+def selenium_wait_for_results(
+    driver,
+    surname: str,
+    timeout: int,
+    status,
+    poll: float = 0.3
+):
+    def fingerprint(html: str) -> int:
+        return hash("".join(html.split()))
+
+    start = time.time()
+    baseline_html = driver.page_source or ""
+    baseline_fp = fingerprint(baseline_html)
+
+    log(status, f"🧪 Waiting for results for '{surname}'")
+
+    while time.time() - start < timeout:
+        html = driver.page_source or ""
+        fp = fingerprint(html)
+        elapsed = round(time.time() - start, 1)
+
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True).upper()
+
+        if any(x in text for x in ["NO RESULTS", "NO MATCH", "0 RESULTS"]):
+            log(status, f"🧪 t={elapsed}s → no results signal")
+            return "no_results", html
+
+        if surname.upper() in text and fp != baseline_fp:
+            log(status, f"🧪 t={elapsed}s → results updated for surname")
+            return "results", html
+
+        log(status, f"🧪 t={elapsed}s → waiting…")
+        time.sleep(poll)
+
+    log(status, "🧪 TIMEOUT waiting for results")
+    return "timeout", driver.page_source
+
+# ================================
+# Strategy 4: Selenium
 # ================================
 def try_selenium_dom(url: str, term: str, status, timeout: int) -> List[str]:
     log(status, "🤖 Launching Selenium fallback")
@@ -203,21 +215,22 @@ def try_selenium_dom(url: str, term: str, status, timeout: int) -> List[str]:
 
     selenium_submit_search(driver, inp, term)
 
-    start = time.time()
-    while time.time() - start < timeout:
-        html = driver.page_source or ""
-        names = extract_names_multi(html)
-        if names:
-            log(status, "✅ Selenium DOM extraction worked")
-            driver.quit()
-            return names
-        time.sleep(0.5)
+    state, html = selenium_wait_for_results(
+        driver,
+        term,
+        timeout,
+        status
+    )
 
     driver.quit()
+
+    if state in ("results", "no_results"):
+        return extract_names_multi(html)
+
     return []
 
 # ================================
-# UNIVERSAL ACTIVE SEARCH ENGINE
+# UNIVERSAL ENGINE
 # ================================
 def universal_active_search(
     url: str,
@@ -226,12 +239,10 @@ def universal_active_search(
     status
 ) -> Tuple[str, List[str]]:
 
-    # 1️⃣ Server-side HTML search
     names = try_server_search(url, term, status)
     if names:
         return "server_html_search", names
 
-    # 2️⃣ Load base page
     log(status, "🌐 Fetching base page")
     try:
         r = requests.get(url, timeout=15)
@@ -242,23 +253,6 @@ def universal_active_search(
     caps = detect_frontend(html)
     log(status, f"🧠 Frontend detected: {caps}")
 
-    # 3️⃣ Known frontend server endpoint (MIT-style)
-    if caps["vue"] or caps["react"]:
-        if "mit.edu" in url.lower():
-            log(status, "🧪 Trying MIT /search endpoint")
-            try:
-                r = requests.get(
-                    "https://www.mit.edu/search/",
-                    params={"q": term, "tab": "directory"},
-                    timeout=15
-                )
-                names = extract_names_multi(r.text)
-                if names:
-                    return "frontend_server_endpoint", names
-            except Exception:
-                pass
-
-    # 4️⃣ Selenium fallback
     names = try_selenium_dom(url, term, status, timeout)
     if names:
         return "selenium_dom", names
