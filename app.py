@@ -38,11 +38,11 @@ except Exception:
 # =========================================================
 st.set_page_config(page_title="Universal Active Search Debugger", layout="wide", page_icon="🧪")
 st.title("🧪 Universal Active Search Debugger")
-st.caption("Probe → Detect → Decide → Extract (universal, log-heavy, tab-aware)")
+st.caption("Probe → Detect → Decide → Extract (universal, log-heavy, tabpanel-locked)")
 
 c1, c2, c3 = st.columns([3, 1, 1])
 TARGET_URL = c1.text_input("Target URL", "https://web.mit.edu/directory/")
-TERM = c2.text_input("Test term (surname)", "oliveira")
+TERM = c2.text_input("Test term", "oliveira")
 TIMEOUT = c3.slider("Timeout (seconds)", 5, 60, 20)
 
 st.markdown("### Controls")
@@ -60,7 +60,7 @@ MANUAL_RESULTS_ROOT = a3.text_input("Manual results root CSS", "")
 
 st.markdown("### “Working logic” fallback")
 b1, b2 = st.columns(2)
-FALLBACK_SLEEP = b1.slider("Fallback sleep after submit (seconds)", 0, 30, 5)
+FALLBACK_SLEEP = b1.slider("Fallback sleep after submit (seconds)", 0, 30, 15)
 TRY_TAB_CLICK = b2.checkbox("Try to click People/Directory tab/filter", value=True)
 
 RUN = st.button("▶ Run Debugger", type="primary")
@@ -79,9 +79,11 @@ def vlog(status, msg: str):
 
 
 # =========================================================
-# Text helpers / extraction
+# Extraction helpers
 # =========================================================
-NAMEISH_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){1,5}$")
+NAMEISH_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){1,6}$")
+EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+
 NO_RESULTS_PHRASES = [
     "no results", "0 results", "zero results", "no matches", "nothing found",
     "did not match", "try a different", "no records", "no entries"
@@ -95,40 +97,41 @@ def clean_candidate_text(t: str) -> Optional[str]:
     if not t:
         return None
     t = " ".join(str(t).split()).strip()
-    if len(t) < 3 or len(t) > 120:
+    if len(t) < 3 or len(t) > 140:
         return None
-
     lt = t.lower()
+    # light junk filter (universal)
     junk = [
-        "privacy", "accessibility", "cookie", "terms", "login", "sign up", "signup",
-        "home", "about", "contact", "menu", "skip to", "search results"
+        "privacy", "accessibility", "cookie", "terms", "login", "sign up",
+        "skip to", "search results", "jobs", "events", "map"
     ]
     if any(j in lt for j in junk):
         return None
     return t
 
 def extract_candidates_generic(html: str) -> List[str]:
-    """
-    Generic candidate extraction from HTML (debugger-grade).
-    """
     soup = BeautifulSoup(html or "", "html.parser")
     out: List[str] = []
 
-    # Prefer result-title-ish patterns first
-    for sel in [
+    # Prefer common "result title" / name spots first
+    selectors = [
         "[class*='result' i] h3",
         "[class*='result' i] h2",
+        "[class*='profile' i] h3",
+        "[class*='person' i] h3",
         "h3", "h2", "h4",
         "strong",
         "a",
         "li",
-        "td"
-    ]:
+        "td",
+    ]
+
+    for sel in selectors:
         for el in soup.select(sel):
             txt = clean_candidate_text(el.get_text(" ", strip=True))
             if txt:
                 out.append(txt)
-        if len(out) >= 300:
+        if len(out) >= 400:
             break
 
     # de-dupe preserving order
@@ -141,25 +144,54 @@ def extract_candidates_generic(html: str) -> List[str]:
     return uniq
 
 def filter_nameish(cands: List[str]) -> List[str]:
-    """
-    A "person-ish" filter (still universal): must look like 2-6 word name.
-    """
     out = []
     for c in cands:
         cc = c.strip()
-        if NAMEISH_RE.match(cc):
-            # kill obvious non-person titles
-            low = cc.lower()
-            if any(k in low for k in ["massachusetts institute of technology", "search", "results", "map", "events"]):
-                continue
-            out.append(cc)
-    # de-dupe
+        if not NAMEISH_RE.match(cc):
+            continue
+        low = cc.lower()
+        # common non-person headings
+        if any(k in low for k in ["massachusetts institute", "search", "results for", "websites results", "locations results"]):
+            continue
+        out.append(cc)
+
     seen = set()
     uniq = []
     for x in out:
         if x not in seen:
             seen.add(x)
             uniq.append(x)
+    return uniq
+
+def extract_people_like_records_from_text(block_text: str) -> List[Dict[str, str]]:
+    """
+    Universal “people-ish” parsing from text:
+    - picks lines that look like names
+    - tries to attach an email nearby
+    """
+    lines = [l.strip() for l in (block_text or "").splitlines() if l.strip()]
+    records: List[Dict[str, str]] = []
+
+    # Build a rolling window to associate emails
+    for i, line in enumerate(lines):
+        if NAMEISH_RE.match(line) and not any(x in line.lower() for x in ["results for", "website", "locations", "people results"]):
+            # search for email in same/next few lines
+            email = ""
+            for j in range(i, min(i + 6, len(lines))):
+                m = EMAIL_RE.search(lines[j])
+                if m:
+                    email = m.group(0)
+                    break
+            records.append({"name": line, "email": email})
+
+    # de-dupe by (name,email)
+    seen = set()
+    uniq = []
+    for r in records:
+        key = (r["name"], r["email"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(r)
     return uniq
 
 
@@ -205,7 +237,6 @@ def requests_probe_server_search(base_url: str, term: str, status) -> Optional[D
             changed = (fp != base_fp)
             vlog(status, f"🧪 server_probe sc={sc} changed={changed} term_present={term_present} fp={fp}")
 
-            # Only count as success if term appears in HTML (non-JS pages)
             if term_present and changed:
                 cands = extract_candidates_generic(html)
                 return {
@@ -266,6 +297,29 @@ def selenium_wait_ready(driver, timeout=10):
     except Exception:
         pass
 
+def safe_body_inner_text(driver, max_chars=200000) -> str:
+    try:
+        t = driver.execute_script("return document.body ? (document.body.innerText || '') : '';") or ""
+        return t[:max_chars]
+    except Exception:
+        return ""
+
+def safe_element_text_by_id(driver, element_id: str, max_chars=200000) -> str:
+    try:
+        el = driver.find_element("id", element_id)
+        t = el.text or ""
+        return t[:max_chars]
+    except Exception:
+        return ""
+
+def safe_element_html_by_id(driver, element_id: str, max_chars=500000) -> str:
+    try:
+        el = driver.find_element("id", element_id)
+        html = el.get_attribute("innerHTML") or ""
+        return html[:max_chars]
+    except Exception:
+        return ""
+
 
 # =========================================================
 # Universal: find search input + submit
@@ -299,7 +353,6 @@ def find_search_input(driver) -> Optional[Any]:
             except Exception:
                 continue
 
-    # last resort: any visible input not obviously wrong type
     for e in driver.find_elements(By.TAG_NAME, "input"):
         try:
             t = (e.get_attribute("type") or "").lower()
@@ -348,7 +401,6 @@ def submit_query(driver, inp, term: str, status) -> bool:
     except Exception:
         pass
 
-    # clear
     try:
         inp.send_keys(Keys.CONTROL + "a")
         inp.send_keys(Keys.BACKSPACE)
@@ -359,13 +411,11 @@ def submit_query(driver, inp, term: str, status) -> bool:
     except Exception:
         pass
 
-    # type term
     try:
         inp.send_keys(term)
     except Exception:
         return False
 
-    # Enter
     try:
         inp.send_keys(Keys.RETURN)
         vlog(status, "⌨️ Submitted with ENTER")
@@ -373,12 +423,10 @@ def submit_query(driver, inp, term: str, status) -> bool:
     except Exception:
         pass
 
-    # click submit
     if click_submit_if_possible(driver):
         vlog(status, "🖱️ Submitted by clicking submit")
         return True
 
-    # submit form
     try:
         inp.submit()
         vlog(status, "📨 Submitted by form submit()")
@@ -388,10 +436,9 @@ def submit_query(driver, inp, term: str, status) -> bool:
 
 
 # =========================================================
-# KEY FIX: Use the “working logic” + tab switching
+# Tab clicking (tabpanel locked) — THE IMPORTANT PART
 # =========================================================
 TAB_PRIORITIES = [
-    # strongest intent
     r"\bpeople\b",
     r"\bperson\b",
     r"\bdirectory\b",
@@ -399,20 +446,18 @@ TAB_PRIORITIES = [
     r"\bfaculty\b",
     r"\bstudent\b",
     r"\bprofiles?\b",
-    # weaker but sometimes used
     r"\bcontacts?\b",
-    r"\bmembers?\b",
 ]
 
-def click_best_people_tab(driver, status) -> Optional[str]:
+def click_best_people_tab(driver, status) -> Dict[str, Optional[str]]:
     """
     Universal heuristic:
-    - look for clickable elements that look like tabs/filters (role=tab, buttons, links)
-    - choose the one whose visible text matches "people/directory/person/..."
+    - find tab-like clickables
+    - click best match (People/Directory)
+    - capture aria-controls / data-target / href#id as "tabpanel id"
     """
     patterns = [re.compile(p, re.I) for p in TAB_PRIORITIES]
 
-    # collect clickables
     elems = []
     try:
         elems.extend(driver.find_elements(By.CSS_SELECTOR, "[role='tab']"))
@@ -423,15 +468,14 @@ def click_best_people_tab(driver, status) -> Optional[str]:
     except Exception:
         pass
 
-    # score by text match priority
     best = None
     best_score = -1
     best_txt = None
+    best_panel = None
 
     seen_ids = set()
     for el in elems:
         try:
-            # dedupe by internal id if possible
             eid = el.id
             if eid in seen_ids:
                 continue
@@ -446,100 +490,116 @@ def click_best_people_tab(driver, status) -> Optional[str]:
             score = None
             for i, pat in enumerate(patterns):
                 if pat.search(txt):
-                    score = (len(patterns) - i)  # earlier pattern => higher score
+                    score = (len(patterns) - i)
                     break
             if score is None:
                 continue
 
-            # tiny boost if element is tab-like
             role = (el.get_attribute("role") or "").lower()
             cls = (el.get_attribute("class") or "").lower()
             if role == "tab" or "tab" in cls or "filter" in cls:
                 score += 1
 
+            # try to determine panel target
+            aria_controls = (el.get_attribute("aria-controls") or "").strip() or None
+            data_target = (el.get_attribute("data-target") or "").strip() or None
+            href = (el.get_attribute("href") or "").strip()
+            href_hash = None
+            if href and "#" in href:
+                href_hash = href.split("#", 1)[-1].strip() or None
+
+            panel = aria_controls or data_target or href_hash
+
             if score > best_score:
                 best_score = score
                 best = el
                 best_txt = txt
+                best_panel = panel
         except Exception:
             continue
 
     if best is None:
-        vlog(status, "ℹ️ No People/Directory tab/filter detected to click.")
-        return None
+        vlog(status, "ℹ️ No People/Directory tab/filter detected.")
+        return {"clicked_text": None, "panel_id": None}
 
     try:
-        vlog(status, f"🧭 Clicking best tab/filter: '{best_txt}' (score={best_score})")
+        vlog(status, f"🧭 Clicking best tab/filter: '{best_txt}' (score={best_score}) panel_id={best_panel}")
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", best)
         best.click()
-        return best_txt
+        return {"clicked_text": best_txt, "panel_id": best_panel}
     except Exception as e:
         vlog(status, f"⚠ Tab click failed: {e}")
-        return None
+        return {"clicked_text": best_txt, "panel_id": best_panel}
 
-def safe_page_text(driver, max_chars=200000) -> str:
-    try:
-        t = driver.execute_script("return document.body ? (document.body.innerText || '') : '';") or ""
-        return t[:max_chars]
-    except Exception:
-        return ""
 
-def wait_like_working_logic(driver, term: str, timeout: int, status) -> Dict[str, Any]:
-    """
-    This is the “working logic” expanded:
-    - Loop: sleep/poll
-    - Decide "done" when:
-        - page has "no results" signal OR
-        - term appears in body text OR
-        - candidate set changes materially (page_source parse)
-    """
+# =========================================================
+# “Working logic” waiter BUT SCOPED TO TABPANEL (if we have one)
+# =========================================================
+def wait_scoped_outcome(driver, term: str, timeout: int, status, panel_id: Optional[str]) -> Dict[str, Any]:
     start = time.time()
     term_l = term.lower()
 
-    base_html = driver.page_source or ""
+    def get_scope_text_and_html() -> Tuple[str, str]:
+        if MANUAL_RESULTS_ROOT.strip():
+            # if user provides manual root CSS, use that first
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, MANUAL_RESULTS_ROOT.strip())
+                txt = (el.text or "")[:200000]
+                html = (el.get_attribute("innerHTML") or "")[:500000]
+                return txt, html
+            except Exception:
+                pass
+
+        if panel_id:
+            txt = safe_element_text_by_id(driver, panel_id, max_chars=200000)
+            html = safe_element_html_by_id(driver, panel_id, max_chars=500000)
+            if txt or html:
+                return txt, html
+
+        # fallback: full body
+        txt = safe_body_inner_text(driver, max_chars=200000)
+        html = driver.page_source or ""
+        return txt, html
+
+    base_txt, base_html = get_scope_text_and_html()
+    base_fp = hash(base_html or "")
     base_cands = extract_candidates_generic(base_html)
-    base_fp = hash(base_html)
-    base_set = set(base_cands)
+    vlog(status, f"🧪 baseline scope panel_id={panel_id} fp={base_fp} candidates={len(base_cands)}")
 
-    vlog(status, f"🧪 baseline fp={base_fp} candidates={len(base_cands)}")
-
-    last_set = set(base_set)
+    last_cset = set(base_cands)
 
     while time.time() - start < timeout:
         elapsed = round(time.time() - start, 1)
+        txt, html = get_scope_text_and_html()
 
-        txt = safe_page_text(driver, max_chars=50000).lower()
-        if html_has_no_results_signal(txt):
-            vlog(status, f"🧪 t={elapsed}s → no-results detected in page text")
-            html = driver.page_source or ""
+        if html_has_no_results_signal(txt) or html_has_no_results_signal(html):
+            vlog(status, f"🧪 t={elapsed}s → no-results detected (scoped)")
             cands = extract_candidates_generic(html)
-            return {"state": "no_results", "elapsed": elapsed, "candidates": cands}
+            return {"state": "no_results", "elapsed": elapsed, "candidates": cands, "scope_panel": panel_id}
 
-        if term_l in txt:
-            vlog(status, f"🧪 t={elapsed}s → term '{term}' appears in page text")
-            html = driver.page_source or ""
+        if term_l in (txt or "").lower():
+            vlog(status, f"🧪 t={elapsed}s → term '{term}' appears in scoped text")
             cands = extract_candidates_generic(html)
-            return {"state": "term_seen", "elapsed": elapsed, "candidates": cands}
+            return {"state": "term_seen", "elapsed": elapsed, "candidates": cands, "scope_panel": panel_id}
 
-        html = driver.page_source or ""
         cands = extract_candidates_generic(html)
         cset = set(cands)
 
-        changed = (cset != last_set)
-        delta = len(cset - last_set)
-        last_set = cset
+        changed = (cset != last_cset)
+        delta = len(cset - last_cset)
+        last_cset = cset
 
-        vlog(status, f"🧪 t={elapsed}s candidates={len(cands)} changed={changed} delta={delta}")
+        vlog(status, f"🧪 t={elapsed}s scoped_candidates={len(cands)} changed={changed} delta={delta}")
 
-        # material change threshold
         if delta >= 5:
-            return {"state": "results_changed", "elapsed": elapsed, "candidates": cands}
+            return {"state": "results_changed", "elapsed": elapsed, "candidates": cands, "scope_panel": panel_id}
 
         time.sleep(0.4)
 
-    html = driver.page_source or ""
+    # timeout
+    txt, html = get_scope_text_and_html()
     cands = extract_candidates_generic(html)
-    return {"state": "timeout", "elapsed": round(time.time() - start, 1), "candidates": cands}
+    return {"state": "timeout", "elapsed": round(time.time() - start, 1), "candidates": cands, "scope_panel": panel_id, "scoped_text_preview": (txt or "")[:2500]}
 
 
 # =========================================================
@@ -586,6 +646,9 @@ if RUN:
         st.error("Could not start Selenium driver (SessionNotCreatedException / driver mismatch).")
         st.stop()
 
+    clicked_tab_text = None
+    panel_id = None
+
     try:
         driver.get(TARGET_URL)
         selenium_wait_ready(driver, timeout=12)
@@ -606,36 +669,51 @@ if RUN:
             st.error("Failed to submit query. Try manual submit selector.")
             st.stop()
 
-        # --- “Working logic” small initial sleep (what your older code did) ---
+        # working logic sleep (from the code that "worked")
         if FALLBACK_SLEEP > 0:
             vlog(status, f"⏳ Working-logic initial sleep: {FALLBACK_SLEEP}s")
             time.sleep(float(FALLBACK_SLEEP))
 
-        # --- Tab/Filter switching to People/Directory (universal heuristic) ---
-        clicked_tab = None
+        # click People/Directory and LOCK to its panel
         if TRY_TAB_CLICK:
-            clicked_tab = click_best_people_tab(driver, status)
-            if clicked_tab:
-                # give the UI a moment, then wait again
+            tab_res = click_best_people_tab(driver, status)
+            clicked_tab_text = tab_res.get("clicked_text")
+            panel_id = tab_res.get("panel_id")
+            if clicked_tab_text:
                 time.sleep(0.8)
 
-        # Now wait using the working-style waiter (page_source + body text)
-        log(status, f"🧪 Waiting for outcome for '{TERM}' (timeout={TIMEOUT}s)")
-        res = wait_like_working_logic(driver, TERM, timeout=int(TIMEOUT), status=status)
+        log(status, f"🧪 Waiting for outcome for '{TERM}' (timeout={TIMEOUT}s) scoped_panel={panel_id}")
+        res = wait_scoped_outcome(driver, TERM, timeout=int(TIMEOUT), status=status, panel_id=panel_id)
 
         cands = res["candidates"]
         nameish = filter_nameish(cands)
 
+        # additionally: parse people-like records from *scoped text* if we have it
+        scoped_text = ""
+        if panel_id:
+            scoped_text = safe_element_text_by_id(driver, panel_id, max_chars=200000)
+        else:
+            scoped_text = safe_body_inner_text(driver, max_chars=200000)
+
+        people_records = extract_people_like_records_from_text(scoped_text)
+
         status.update(label="Done", state="complete")
 
         st.subheader("🧠 Result")
-        st.write("Strategy used: `selenium_working_logic_tab_aware`")
-        st.write(f"Clicked tab/filter: `{clicked_tab}`")
+        st.write("Strategy used: `selenium_tabpanel_scoped_working_logic`")
+        st.write(f"Clicked tab/filter: `{clicked_tab_text}`")
+        st.write(f"Locked panel_id: `{panel_id}`")
         st.write(f"Outcome state: `{res['state']}`")
         st.write(f"Elapsed: {res['elapsed']}s")
         st.write(f"Current URL: {driver.current_url}")
-        st.write(f"Candidates extracted: {len(cands)}")
-        st.write(f"Name-ish extracted: {len(nameish)}")
+
+        st.markdown("#### Scoped extraction counts")
+        st.write(f"Candidates (scoped): {len(cands)}")
+        st.write(f"Name-ish (scoped): {len(nameish)}")
+        st.write(f"People-like records (name + optional email): {len(people_records)}")
+
+        st.markdown("#### People-like records (first 50)")
+        st.dataframe(people_records[:50])
 
         st.markdown("#### Candidates (first 60)")
         st.dataframe({"Candidates": cands[:60]})
@@ -643,8 +721,8 @@ if RUN:
         st.markdown("#### Name-ish (first 60)")
         st.dataframe({"Name-ish": nameish[:60]})
 
-        with st.expander("🔎 Debug: page text preview", expanded=False):
-            preview = safe_page_text(driver, max_chars=2500)
+        with st.expander("🔎 Debug: scoped text preview", expanded=False):
+            preview = (scoped_text or "")[:2500]
             st.code(preview if preview else "(empty)")
 
     except WebDriverException as e:
