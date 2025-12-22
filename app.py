@@ -127,6 +127,15 @@ BLOCKLIST_SURNAMES = {
 
 NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,6}$")
 
+# --- NEW: name patterns that fix the Tiago/Matheus issue (commas + particles) ---
+NAME_COMMA_RE = re.compile(
+    r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\. ]{2,},\s*[A-Za-zÀ-ÖØ-öø-ÿ'\-\. ]{2,}$"
+)
+# "First [Middle...] Last" (loose)
+NAME_SPACE_RE = re.compile(
+    r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){1,6}$"
+)
+
 def normalize_token(s: str) -> str:
     if not s: return ""
     s = unidecode(str(s).strip().upper())
@@ -155,11 +164,11 @@ def clean_extracted_name(raw_text):
         "UNIVERSITY", "INSTITUTE", "SCHOOL", "DEPARTMENT", "COLLEGE",
         "PROGRAM", "INITIATIVE", "LABORATORY", "CENTER FOR", "CENTRE FOR",
         "ALUMNI", "DIRECTORY", "REAP", "MBA", "PHD", "MSC", "CLASS OF",
-        # NEW: Navigation Junk found in logs
+        # Navigation Junk
         "EDUCATION", "INNOVATION", "CAMPUS LIFE", "LIFELONG LEARNING",
         "GIVE", "HOME", "VISIT", "MAP", "EVENTS", "JOBS", "PRIVACY",
         "ACCESSIBILITY", "SOCIAL MEDIA", "TERMS OF USE", "COPYRIGHT",
-        # Locations (Generic)
+        # Months / locations
         "BRASIL", "BRAZIL", "PERU", "ARGENTINA", "CHILE", "USA", "UNITED STATES",
         "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
         "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"
@@ -169,6 +178,7 @@ def clean_extracted_name(raw_text):
         return None
 
     # 3. Safety check for "MIT"
+    # NOTE: This is NOT universal. Consider removing/toggling for non-MIT usage.
     if re.search(r'\bMIT\b', upper): return None
 
     # 4. Handle "Last, First"
@@ -505,7 +515,6 @@ def get_driver(headless: bool = True):
     if not HAS_SELENIUM:
         return None
 
-    # 1. Setup Options
     options = Options()
     if headless:
         options.add_argument("--headless=new")
@@ -513,25 +522,20 @@ def get_driver(headless: bool = True):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # These often help with session creation issues
     options.add_argument("--remote-allow-origins=*")
     options.add_argument("--disable-extensions")
 
-    # 2. Try Standard Path (Linux/Streamlit Cloud)
     service = None
     if os.path.exists("/usr/bin/chromedriver"):
         service = Service("/usr/bin/chromedriver")
 
-    # 3. Attempt to initialize
     try:
         if service:
             return webdriver.Chrome(service=service, options=options)
         return webdriver.Chrome(options=options)
     except Exception as e_native:
-        # 4. FALLBACK: WebDriver Manager (Fixes SessionNotCreatedException)
         if HAS_WEBDRIVER_MANAGER:
             try:
-                # Installs matching driver for the browser
                 return webdriver.Chrome(
                     service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
                     options=options
@@ -543,7 +547,6 @@ def get_driver(headless: bool = True):
             st.error(f"Selenium Driver Error (and webdriver_manager not found): {e_native}")
             return None
 
-
 def selenium_wait_document_ready(driver, timeout: int = 10):
     try:
         WebDriverWait(driver, timeout).until(
@@ -553,12 +556,8 @@ def selenium_wait_document_ready(driver, timeout: int = 10):
         pass
 
 def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = None):
-    """
-    Kept for backwards-compat, but Active Search Injection now uses
-    selenium_wait_for_search_outcome() to avoid false positives.
-    """
     selenium_wait_document_ready(driver, min(5, timeout))
-    time.sleep(1.5) # Forced pause for JS rendering
+    time.sleep(1.5)
 
     if name_selector:
         try:
@@ -569,17 +568,15 @@ def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = N
         except Exception:
             pass
 
-    # Generic result waiter
     common = [".search-results", "#search-results", "table tr", "ul li", ".result", ".person", ".profile"]
     for s in common:
         if len(driver.find_elements(By.CSS_SELECTOR, s)) > 0:
             return
-
     time.sleep(1.5)
 
 
 # =========================================================
-#             ACTIVE SEARCH: FIXED LOGIC
+#             ACTIVE SEARCH: REPLACED WITH WORKING UNIVERSAL LOGIC
 # =========================================================
 def selenium_find_search_input(driver) -> Optional[str]:
     if manual_search_selector and len(driver.find_elements(By.CSS_SELECTOR, manual_search_selector)) > 0:
@@ -608,10 +605,9 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
             pass
 
         inp.send_keys(query)
-        time.sleep(0.3)
+        time.sleep(0.2)
         inp.send_keys(Keys.RETURN)
 
-        # Click manual button if exists
         if manual_search_button:
             try:
                 driver.find_element(By.CSS_SELECTOR, manual_search_button).click()
@@ -623,14 +619,10 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
         return False
 
 def page_has_no_results_signal(html: str) -> bool:
-    """
-    Heuristics to detect "no results" screens across common directory UIs.
-    """
     if not html:
         return False
 
     soup = BeautifulSoup(html, "html.parser")
-    # Common "no results" CSS patterns
     no_sel = [
         ".no-results", ".noresult", ".no-result", "#no-results",
         ".empty-state", ".empty", ".nothing-found",
@@ -641,8 +633,6 @@ def page_has_no_results_signal(html: str) -> bool:
             return True
 
     text = soup.get_text(" ", strip=True).lower()
-
-    # Common phrases (add more as you encounter them)
     phrases = [
         "no results",
         "0 results",
@@ -661,74 +651,283 @@ def page_has_no_results_signal(html: str) -> bool:
     ]
     return any(p in text for p in phrases)
 
-def selenium_wait_for_search_outcome(
-    driver,
-    timeout: int,
-    manual_sel: Optional[str] = None,
-    poll_s: float = 0.35
-) -> Tuple[str, str, List[str]]:
-    """
-    STRICT waiter:
-    - snapshot DOM BEFORE search
-    - wait until DOM ACTUALLY changes
-    - only then detect names OR no-results
-    """
+def _text_signature(txt: str) -> str:
+    txt = (txt or "").strip()
+    if len(txt) > 4000:
+        txt = txt[:4000]
+    return str(hash(txt))
 
+def _score_people_block(text: str) -> Dict[str, Any]:
+    t = (text or "")
+    tlow = t.lower()
+
+    emails = len(re.findall(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", t, re.I))
+    mailtos = len(re.findall(r"mailto:", t, re.I))
+
+    # Count “person-ish” lines
+    nameish = 0
+    for line in [ln.strip() for ln in t.splitlines() if ln.strip()]:
+        # allow "Last, First ..." or "First Last ..."
+        if NAME_COMMA_RE.match(line) or NAME_SPACE_RE.match(line):
+            # don't count if it's obviously UI junk
+            if not clean_extracted_name(line.replace(",", " ")):
+                # clean_extracted_name converts "Last, First" to "First Last" but if it returns None,
+                # this may still be a legit comma-form name; keep a small allowance:
+                if NAME_COMMA_RE.match(line) and len(line.split()) <= 8:
+                    nameish += 1
+                continue
+            nameish += 1
+
+    # Prefer containers that explicitly mention "people" in a results header
+    people_hint = 1 if ("people results" in tlow or re.search(r"\bpeople\b", tlow)) else 0
+
+    score = (emails * 12) + (mailtos * 18) + (nameish * 8) + (people_hint * 10)
+
+    return {
+        "score": score,
+        "emails": emails,
+        "mailtos": mailtos,
+        "nameish": nameish,
+        "people_hint": people_hint,
+        "title": "",
+        "text": t
+    }
+
+def _best_people_container_html(driver) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Universal approach:
+    - sample a set of container-like elements
+    - choose the one that looks most like a people/results list (emails + name lines)
+    Returns: (container_html_or_none, debug_info)
+    """
+    # Broad but not insane: main/section/div/article/ul/ol/table
+    css_candidates = [
+        "main", "section", "article", "div", "ul", "ol", "table"
+    ]
+
+    best = {"score": -1, "text": "", "emails": 0, "mailtos": 0, "nameish": 0, "people_hint": 0, "title": ""}
+    best_html = None
+
+    for tag in css_candidates:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, tag)
+        except Exception:
+            continue
+
+        # sample first N elements to avoid huge DOM cost
+        for el in els[:80]:
+            try:
+                txt = el.text or ""
+            except Exception:
+                continue
+
+            if len(txt.strip()) < 120:
+                continue
+
+            metrics = _score_people_block(txt)
+
+            # Make sure it's not only nav chrome
+            if metrics["emails"] == 0 and metrics["mailtos"] == 0 and metrics["nameish"] < 2:
+                continue
+
+            if metrics["score"] > best["score"]:
+                best = metrics
+                try:
+                    best_html = el.get_attribute("outerHTML")
+                except Exception:
+                    best_html = None
+
+    return best_html, best
+
+def _click_best_people_tab_if_any(driver) -> Optional[str]:
+    """
+    UNIVERSAL:
+    tries to click any obvious "People" / "Directory" / "Staff" / "Faculty" tab/filter buttons.
+    Returns clicked label or None.
+    """
+    targets = [
+        ("people", 10),
+        ("directory", 7),
+        ("staff", 6),
+        ("faculty", 6),
+        ("students", 5),
+        ("profiles", 5),
+        ("employees", 5),
+    ]
+
+    best_el = None
+    best_score = -1
+    best_label = None
+
+    # look at buttons + links (tabs are often <a>)
+    for css in ["a", "button", "[role='tab']", "[role='button']"]:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, css)
+        except Exception:
+            continue
+        for el in els[:250]:
+            try:
+                label = (el.text or "").strip()
+                if not label:
+                    label = (el.get_attribute("aria-label") or "").strip()
+            except Exception:
+                continue
+            if not label:
+                continue
+            low = label.lower()
+            score = 0
+            for word, wscore in targets:
+                if word in low:
+                    score = max(score, wscore)
+
+            if score > best_score:
+                # must be visible/clickable-ish
+                try:
+                    if not el.is_displayed():
+                        continue
+                except Exception:
+                    continue
+                best_el = el
+                best_score = score
+                best_label = label
+
+    if best_el and best_score >= 8:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", best_el)
+            best_el.click()
+            return best_label
+        except Exception:
+            return None
+    return None
+
+def _extract_people_like_names(container_html: str) -> List[str]:
+    """
+    Extract “people-like” names from the chosen people container.
+    This is the “working logic” you validated:
+    - prefer comma-form names (Last, First Middle)
+    - also accept space-form names
+    """
+    if not container_html:
+        return []
+
+    soup = BeautifulSoup(container_html, "html.parser")
+
+    # pull text lines
+    text = soup.get_text("\n", strip=True)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    out: List[str] = []
+
+    for ln in lines:
+        # common: "Last, First Middle"
+        if NAME_COMMA_RE.match(ln):
+            # convert to "First Middle Last"
+            parts = [p.strip() for p in ln.split(",") if p.strip()]
+            if len(parts) >= 2:
+                candidate = f"{parts[1]} {parts[0]}".strip()
+                candidate = " ".join(candidate.split())
+                c = clean_extracted_name(candidate)
+                # If cleaner rejects due to MIT/nav rules, still allow if it looks like a real name
+                if c:
+                    out.append(c)
+                else:
+                    # keep a fallback version if it looks like 2-6 tokens
+                    toks = candidate.split()
+                    if 2 <= len(toks) <= 7:
+                        out.append(candidate)
+            continue
+
+        # "First ... Last"
+        if NAME_SPACE_RE.match(ln):
+            c = clean_extracted_name(ln)
+            if c:
+                out.append(c)
+
+    # also try mailto anchors: sometimes name is the anchor text
+    for a in soup.select("a[href^='mailto:']"):
+        t = a.get_text(" ", strip=True)
+        if t:
+            c = clean_extracted_name(t)
+            if c:
+                out.append(c)
+
+    # de-dupe preserve order
+    seen = set()
+    dedup = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            dedup.append(x)
+    return dedup
+
+def selenium_wait_for_people_results(
+    driver,
+    term: str,
+    timeout: int,
+    poll_s: float = 0.35
+) -> Tuple[str, Optional[str], Dict[str, Any]]:
+    """
+    Universal "waiter" that DOESN'T get tricked by the page chrome:
+    - finds the best people-like container
+    - waits until that container changes or becomes populated for the new term
+    Returns: (state, container_html, debug)
+      state in {"results", "no_results", "timeout"}
+    """
     start = time.time()
 
-    # === BASELINE SNAPSHOT (THIS WAS MISSING BEFORE) ===
-    try:
-        baseline_html = driver.page_source or ""
-    except Exception:
-        baseline_html = ""
-    baseline_fp = hash(baseline_html)
+    # baseline container
+    base_html, base_dbg = _best_people_container_html(driver)
+    base_text = ""
+    if base_html:
+        base_text = BeautifulSoup(base_html, "html.parser").get_text(" ", strip=True)
+    base_sig = _text_signature(base_text)
 
-    selenium_wait_document_ready(driver, min(5, timeout))
-    time.sleep(0.3)
-
-    dom_changed = False
-    last_fp = baseline_fp
+    debug = {
+        "baseline": {
+            "sig": base_sig,
+            "metrics": base_dbg
+        },
+        "ticks": []
+    }
 
     while (time.time() - start) < timeout:
+        selenium_wait_document_ready(driver, timeout=3)
         try:
-            html = driver.page_source or ""
+            page_html = driver.page_source or ""
         except Exception:
-            html = ""
+            page_html = ""
 
-        fp = hash(html)
+        # if a real "no results" signal appears on the page, honor it
+        if page_has_no_results_signal(page_html):
+            return "no_results", None, debug
 
-        # detect real DOM change
-        if fp != last_fp:
-            last_fp = fp
-        if fp != baseline_fp:
-            dom_changed = True
+        cont_html, cont_dbg = _best_people_container_html(driver)
+        cont_text = ""
+        if cont_html:
+            cont_text = BeautifulSoup(cont_html, "html.parser").get_text(" ", strip=True)
 
-        if dom_changed:
-            # 1️⃣ explicit "no results"
-            if page_has_no_results_signal(html):
-                return "no_results", html, []
+        sig = _text_signature(cont_text)
+        elapsed = round(time.time() - start, 1)
 
-            # 2️⃣ real extracted names
-            names = extract_names_multi(
-                html,
-                manual_sel.strip() if manual_sel else None
-            )
-            if names:
-                return "names", html, names
+        term_seen = (term.lower() in (page_html or "").lower()) or (term.lower() in (cont_text or "").lower())
+        people_names = _extract_people_like_names(cont_html or "")
+        debug["ticks"].append({
+            "t": elapsed,
+            "sig": sig,
+            "term_seen": bool(term_seen),
+            "metrics": cont_dbg,
+            "people_names": len(people_names)
+        })
+
+        # "changed" OR "people names appear"
+        if (sig != base_sig and cont_dbg.get("score", -1) >= 20) or len(people_names) > 0:
+            # one more guard: if container is still mostly nav, require at least 2 names or 1 email
+            if len(people_names) > 0 or cont_dbg.get("emails", 0) > 0 or cont_dbg.get("mailtos", 0) > 0:
+                return "results", cont_html, debug
 
         time.sleep(poll_s)
 
-    # timeout fallback
-    try:
-        html = driver.page_source or ""
-    except Exception:
-        html = ""
-    names = extract_names_multi(
-        html,
-        manual_sel.strip() if manual_sel else None
-    ) if html else []
-
-    return "timeout", html, names
+    return "timeout", None, debug
 
 
 # =========================================================
@@ -766,7 +965,6 @@ def batch_clean_with_ai(matches, api_key):
         progress_bar.progress(min((i + batch_size) / len(names), 1.0))
         time.sleep(1)
 
-    # Update matches
     for m in matches:
         if m["Full Name"] in junk_names:
             m["Status"] = "Junk (AI Flagged)"
@@ -841,7 +1039,6 @@ if st.session_state.running:
                     all_seen.add(m["Full Name"])
                     all_matches.append(m)
 
-            # Sort by Score
             all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
             st.session_state.matches = all_matches
             table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
@@ -901,74 +1098,89 @@ if st.session_state.running:
             driver.quit()
 
     # ---------------------------
-    # ACTIVE SEARCH INJECTION MODE
+    # ACTIVE SEARCH INJECTION MODE (REPLACED)
     # ---------------------------
     else:
-        status_log.write("🔎 Active Search Injection (Requests + Selenium)")
+        status_log.write("🔎 Active Search Injection (Universal Selenium People-Container logic)")
 
         driver = get_driver(headless=run_headless)
         if not driver:
-            status_log.warning("Selenium could not start. Using Requests Fallback.")
-
-        # Fallback function
-        def requests_urlparam_search(term: str) -> Optional[str]:
-            for p in (manual_search_param or "q,query,search").split(","):
-                u = urlparse(start_url)
-                qs = parse_qs(u.query)
-                qs[p] = [term]
-                cand = u._replace(query=urlencode(qs, doseq=True)).geturl()
-                rr = fetch_native("GET", cand, None)
-                if rr and getattr(rr, "status_code", None) == 200:
-                    return rr.text
-            return None
+            status_log.error("Selenium could not start; Active Search Injection needs Selenium.")
+            st.stop()
 
         manual_sel = manual_name_selector.strip() if manual_name_selector else None
 
-        for i, surname in enumerate(sorted_surnames[: int(max_pages)]):
-            status_log.update(label=f"🔎 Searching '{surname}' ({i+1}/{int(max_pages)})", state="running")
-            html = None
+        try:
+            driver.get(start_url)
+            selenium_wait_document_ready(driver, timeout=min(10, int(selenium_wait)))
 
-            # 1. Try Selenium
-            if driver:
+            sel_input = selenium_find_search_input(driver)
+            if not sel_input:
+                status_log.error("❌ Could not find a search input on the target page. Try Manual Search Box Selector.")
+                st.stop()
+
+            status_log.success(f"🎯 Search input selector: {sel_input}")
+
+            # Main surname loop
+            for i, surname in enumerate(sorted_surnames[: int(max_pages)]):
+                status_log.update(label=f"🔎 Searching '{surname}' ({i+1}/{int(max_pages)})", state="running")
+
+                # If we lost the search input (navigated away), reset.
                 try:
-                    driver.get(start_url)
-                    selenium_wait_document_ready(driver, timeout=min(6, int(selenium_wait)))
-
-                    sel_input = selenium_find_search_input(driver)
-                    if sel_input:
-                        if selenium_submit_search(driver, sel_input, surname):
-                            outcome, html_out, names_out = selenium_wait_for_search_outcome(
-                                driver,
-                                timeout=int(selenium_wait),
-                                manual_sel=manual_sel,
-                                poll_s=0.35
-                            )
-                            html = html_out
-
-                            if outcome == "no_results":
-                                status_log.write(f"🚫 '{surname}': no results detected.")
-                            elif outcome == "timeout":
-                                status_log.write(f"⏱️ '{surname}': timeout waiting for results (parsing whatever loaded).")
-                            else:
-                                status_log.write(f"✅ '{surname}': results detected ({len(names_out)} candidate name strings).")
-
+                    if len(driver.find_elements(By.CSS_SELECTOR, sel_input)) == 0:
+                        driver.get(start_url)
+                        selenium_wait_document_ready(driver, timeout=min(10, int(selenium_wait)))
                 except Exception:
-                    # If it crashes, continue to fallback
-                    html = None
+                    driver.get(start_url)
+                    selenium_wait_document_ready(driver, timeout=min(10, int(selenium_wait)))
 
-            # 2. Try Requests if no HTML
-            if not html:
-                html = requests_urlparam_search(surname)
-                if html and page_has_no_results_signal(html):
-                    status_log.write(f"🚫 '{surname}': no results detected (requests).")
+                ok = selenium_submit_search(driver, sel_input, surname)
+                if not ok:
+                    status_log.write(f"⚠️ Could not submit '{surname}'. Retrying from start_url.")
+                    driver.get(start_url)
+                    selenium_wait_document_ready(driver, timeout=min(10, int(selenium_wait)))
+                    ok = selenium_submit_search(driver, sel_input, surname)
 
-            # 3. Process
-            if html:
-                names = extract_names_multi(html, manual_sel)
+                if not ok:
+                    status_log.write(f"❌ Failed submit for '{surname}'. Skipping.")
+                    time.sleep(search_delay)
+                    continue
+
+                # Give UI a beat, then try clicking “People”-like tab if present
+                time.sleep(0.4)
+                clicked = _click_best_people_tab_if_any(driver)
+                if clicked:
+                    status_log.write(f"🧭 Clicked tab/filter: {clicked}")
+
+                # Wait for people-like results container to update/populate
+                state, people_container_html, dbg = selenium_wait_for_people_results(
+                    driver=driver,
+                    term=surname,
+                    timeout=int(selenium_wait),
+                    poll_s=0.35
+                )
+
+                if state == "no_results":
+                    status_log.write(f"🚫 '{surname}': no results detected.")
+                    time.sleep(search_delay)
+                    continue
+
+                if state == "timeout":
+                    status_log.write(f"⏱️ '{surname}': timeout waiting for people results.")
+                    # fallback: still try extracting from best container at timeout moment
+                    people_container_html, _ = _best_people_container_html(driver)
+
+                # Extract people-like names from the chosen people container
+                people_names = _extract_people_like_names(people_container_html or "")
                 if debug_show_candidates:
-                    st.write(f"Candidates for {surname}: {names[:10]}")
+                    st.write(f"[{surname}] People-like candidates (first 30):", people_names[:30])
 
-                matches = match_names(names, f"Search: {surname}")
+                # If we got nothing, last resort: old HTML-wide extraction (keeps compatibility)
+                if not people_names:
+                    html = driver.page_source
+                    people_names = extract_names_multi(html, manual_sel)
+
+                matches = match_names(people_names, f"Search: {surname}")
                 for m in matches:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
@@ -976,11 +1188,13 @@ if st.session_state.running:
 
                 all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                 st.session_state.matches = all_matches
-                table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
+                if matches:
+                    table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
+                    status_log.write(f"✅ '{surname}': added {len(matches)} matches (people-candidates={len(people_names)}).")
 
-            time.sleep(search_delay)
+                time.sleep(search_delay)
 
-        if driver:
+        finally:
             try:
                 driver.quit()
             except Exception:
@@ -1005,7 +1219,6 @@ if st.session_state.matches:
             else:
                 with st.spinner("🤖 AI is reviewing every name..."):
                     cleaned = batch_clean_with_ai(st.session_state.matches, api_key)
-                    # Sort: Valid (High Score -> Low) THEN Junk
                     cleaned.sort(key=lambda x: (x.get("Status") == "Junk (AI Flagged)", -x["Brazil Score"]))
                     st.session_state.matches = cleaned
                     st.success("Cleaning Complete!")
