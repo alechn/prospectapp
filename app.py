@@ -522,44 +522,44 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
 def get_driver(headless: bool = True, fail_loud: bool = False):
     """
     Streamlit Cloud-friendly Selenium setup.
-    Includes fixes for 'SessionNotCreatedException' (Port 9222 + Classic Headless).
+    Includes 'Nuclear Option' flags to prevent 'Chrome instance exited' crashes.
     """
     if not HAS_SELENIUM:
         return None
 
     options = Options()
     
-    # 1. USE CLASSIC HEADLESS (More stable on limited-RAM cloud containers than 'new')
+    # 1. HEADLESS MODE
     if headless:
-        options.add_argument("--headless") 
+        options.add_argument("--headless")
 
-    # 2. CRITICAL CONTAINER FLAGS
+    # 2. CRITICAL CONTAINER FLAGS (The "Nuclear" Set)
     options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage") # Fixes shared memory crashes
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--remote-allow-origins=*")
+    options.add_argument("--disable-software-rasterizer")  # Crucial for cloud
+    options.add_argument("--disable-features=VizDisplayCompositor") # Disables complex rendering
+    options.add_argument("--no-zygote") # Disables the zygote process (often causes crashes)
     options.add_argument("--window-size=1920,1080")
-    
-    # 3. PORT FIX (Fixes 'DevToolsActivePort file doesn't exist' crashes)
-    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--remote-allow-origins=*")
 
-    # 4. PROFILE MANAGEMENT (Prevents locking conflicts)
+    # 3. PROFILE MANAGEMENT (Unique per session)
     user_data_dir = tempfile.mkdtemp()
     options.add_argument(f"--user-data-dir={user_data_dir}")
     options.add_argument(f"--data-path={user_data_dir}/data")
     options.add_argument(f"--disk-cache-dir={user_data_dir}/cache")
 
-    # 5. BINARY LOCATION
+    # 4. BINARY LOCATION (Explicitly point to system Chromium)
     if os.path.exists("/usr/bin/chromium"):
         options.binary_location = "/usr/bin/chromium"
     elif os.path.exists("/usr/bin/chromium-browser"):
         options.binary_location = "/usr/bin/chromium-browser"
 
-    # 6. SERVICE SETUP
+    # 5. SERVICE SETUP
     service = None
     if os.path.exists("/usr/bin/chromedriver"):
-        # Use system driver (fastest)
+        # Use system driver (fastest & matches binary)
         service = Service("/usr/bin/chromedriver")
     else:
         # Fallback to webdriver_manager
@@ -571,11 +571,11 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
             pass
 
     try:
-        # Try to launch
+        # Launch
         driver = webdriver.Chrome(service=service, options=options)
         return driver
     except Exception as e:
-        # Cleanup if failed
+        # Cleanup
         try:
             shutil.rmtree(user_data_dir)
         except:
