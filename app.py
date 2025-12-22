@@ -27,7 +27,6 @@ try:
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
     HAS_SELENIUM = True
 except Exception:
     HAS_SELENIUM = False
@@ -49,9 +48,6 @@ if "visited_fps" not in st.session_state:
     st.session_state.visited_fps = set()
 if "visited_urls" not in st.session_state:
     st.session_state.visited_urls = set()
-if "learned_selectors" not in st.session_state:
-    st.session_state.learned_selectors = {}  # per-site selectors cache
-
 
 # =========================================================
 #             SIDEBAR
@@ -82,6 +78,14 @@ with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
     manual_search_button = st.text_input("Manual Search Button Selector", placeholder="e.g. button[type='submit']")
     manual_search_param = st.text_input("Manual Search Param (URL mode)", placeholder="e.g. q or query")
+    debug_show_candidates = st.checkbox("Debug: show extracted candidates", value=False)
+
+st.sidebar.markdown("---")
+allow_surname_only = st.sidebar.checkbox(
+    "Allow single-token surname matches (low confidence)",
+    value=True,
+    help="If a result is just 'Santos', count it as a weak match."
+)
 
 if st.sidebar.button("🧪 Selenium diagnostics"):
     st.sidebar.write("HAS_SELENIUM:", HAS_SELENIUM)
@@ -126,7 +130,6 @@ BLOCKLIST_SURNAMES = {
     "CALCULATION","EXPERIENCE","WAGE","LIVING","GOING","FAST"
 }
 
-
 # =========================================================
 #             HELPERS
 # =========================================================
@@ -136,7 +139,7 @@ def normalize_token(s: str) -> str:
     s = unidecode(str(s).strip().upper())
     return "".join(ch for ch in s if "A" <= ch <= "Z")
 
-NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){1,5}$")
+NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,5}$")
 
 def clean_extracted_name(raw_text):
     if not isinstance(raw_text, str):
@@ -171,7 +174,7 @@ def clean_extracted_name(raw_text):
     if len(clean) < 3 or len(clean.split()) > 6:
         return None
 
-    # quick name-ish test
+    # quick name-ish test (allows 1 token too; we decide later if we accept it)
     if not NAME_REGEX.match(clean):
         return None
 
@@ -206,11 +209,6 @@ limit_first = st.sidebar.number_input("Use Top N First Names", 1, 20000, 3000, 1
 limit_surname = st.sidebar.number_input("Use Top N Surnames", 1, 20000, 3000, 1)
 allow_api = st.sidebar.checkbox("If JSON missing, fetch from IBGE API", value=True)
 save_local = st.sidebar.checkbox("If fetched, save JSON locally", value=True)
-allow_unranked_names = st.sidebar.checkbox(
-    "Allow non-IBGE names (low confidence)",
-    value=False,
-    help="Keep names that are missing IBGE ranks; they'll be marked Unranked and given a minimal score."
-)
 
 @st.cache_data(ttl=60 * 60 * 24 * 30)
 def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
@@ -244,30 +242,28 @@ def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str
     }
     return first_full, surname_full, meta
 
+@st.cache_resource
 def load_ibge_full_best_effort(allow_api_fallback: bool, save_if_fetched: bool):
     if os.path.exists(IBGE_CACHE_FILE):
+        with open(IBGE_CACHE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        first_full = {str(k): int(v) for k, v in (payload.get("first_name_ranks", {}) or {}).items()}
+        surname_full = {str(k): int(v) for k, v in (payload.get("surname_ranks", {}) or {}).items()}
+        meta = payload.get("meta", {"source": "local_json"})
+        return first_full, surname_full, meta, "file"
+
+    if not allow_api_fallback:
+        raise FileNotFoundError(f"Missing {IBGE_CACHE_FILE} and API fallback disabled.")
+
+    first_full, surname_full, meta = fetch_ibge_full_from_api()
+    if save_if_fetched:
         try:
-            with open(IBGE_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data["first_name_ranks"], data["surname_ranks"], data.get("meta", {}), "cache"
+            os.makedirs(os.path.dirname(IBGE_CACHE_FILE), exist_ok=True)
+            with open(IBGE_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"meta": meta, "first_name_ranks": first_full, "surname_ranks": surname_full}, f, ensure_ascii=False)
         except Exception:
             pass
-
-    if allow_api_fallback:
-        try:
-            first_full, surname_full, meta = fetch_ibge_full_from_api()
-            if save_if_fetched:
-                try:
-                    os.makedirs(os.path.dirname(IBGE_CACHE_FILE), exist_ok=True)
-                    with open(IBGE_CACHE_FILE, "w", encoding="utf-8") as f:
-                        json.dump({"meta": meta, "first_name_ranks": first_full, "surname_ranks": surname_full}, f, ensure_ascii=False)
-                except Exception:
-                    pass
-            return first_full, surname_full, meta, "api"
-        except Exception:
-            pass
-
-    return {}, {}, {}, "none"
+    return first_full, surname_full, meta, "api"
 
 @st.cache_data
 def slice_ibge_by_rank(first_full: Dict[str, int], surname_full: Dict[str, int], n_first: int, n_surname: int):
@@ -284,10 +280,7 @@ with st.sidebar.status("Loading IBGE...", expanded=False) as s:
         ibge_first_full, ibge_surname_full, int(limit_first), int(limit_surname)
     )
     s.update(label=f"IBGE ready ({ibge_mode}) ✅", state="complete")
-    scope_label = "Allowing unranked spillover" if allow_unranked_names else "IBGE-ranked only"
-    st.sidebar.success(
-        f"✅ Using Top {int(limit_first)}/{int(limit_surname)} → {len(first_name_ranks)} first / {len(surname_ranks)} surname ({scope_label})"
-    )
+    st.sidebar.success(f"✅ Using Top {int(limit_first)}/{int(limit_surname)} → {len(first_name_ranks)} first / {len(surname_ranks)} surname")
 
 
 # =========================================================
@@ -298,20 +291,40 @@ def rank_score(rank: int, top_n: int, max_points: int = 50) -> int:
         return 0
     return max(1, int(max_points * (top_n - rank + 1) / top_n))
 
-def match_names(names: List[str], source: str, allow_unranked: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
-    found: List[Dict[str, Any]] = []
-    dropped_unranked: List[str] = []
+def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
+    found = []
     seen = set()
-    for n in names:
-        n = clean_extracted_name(n)
+
+    for raw in names:
+        n = clean_extracted_name(raw)
         if not n or n in seen:
             continue
         seen.add(n)
 
         parts = n.split()
-        if len(parts) < 2:
+
+        # --- allow single-token surname-only matches ---
+        if len(parts) == 1:
+            if not allow_surname_only:
+                continue
+            tok = normalize_token(parts[0])
+            if not tok or tok in BLOCKLIST_SURNAMES:
+                continue
+
+            rl = surname_ranks.get(tok, 0)
+            if rl > 0:
+                score = rank_score(rl, int(limit_surname), 50)
+                found.append({
+                    "Full Name": n,
+                    "Brazil Score": score,
+                    "First Rank": None,
+                    "Surname Rank": rl,
+                    "Source": source,
+                    "Match Type": "Surname Only (weak)"
+                })
             continue
 
+        # --- 2+ tokens ---
         f = normalize_token(parts[0])
         l = normalize_token(parts[-1])
         if not f or not l:
@@ -328,20 +341,17 @@ def match_names(names: List[str], source: str, allow_unranked: bool) -> Tuple[Li
         if rl > 0:
             score += rank_score(rl, int(limit_surname), 50)
 
-        if score == 0 and not allow_unranked:
-            dropped_unranked.append(n)
-            continue
+        if score > 0:
+            found.append({
+                "Full Name": n,
+                "Brazil Score": score,
+                "First Rank": rf if rf > 0 else None,
+                "Surname Rank": rl if rl > 0 else None,
+                "Source": source,
+                "Match Type": "Strong" if (rf > 0 and rl > 0) else ("First Only" if rf > 0 else "Surname Only")
+            })
 
-        first_rank_field: Optional[Any] = rf if rf > 0 else ("Unranked" if allow_unranked else None)
-        surname_rank_field: Optional[Any] = rl if rl > 0 else ("Unranked" if allow_unranked else None)
-        found.append({
-            "Full Name": n,
-            "Brazil Score": score if score > 0 else 1,
-            "First Rank": first_rank_field,
-            "Surname Rank": surname_rank_field,
-            "Source": source
-        })
-    return found, dropped_unranked
+    return found
 
 
 # =========================================================
@@ -354,11 +364,11 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
     if manual_sel:
         selectors.append(manual_sel.strip())
 
-    # common directory patterns
+    # common directory patterns (ordered from more precise to more broad)
     selectors += [
-        "td.name", "td:nth-child(1)", "td:first-child",
-        "li", "h3", "h4", "h2",
-        ".person", ".profile", ".result", ".results",
+        "td.name", "td:first-child", "td:nth-child(1)",
+        "h3", "h4", "h2",
+        ".person .name", ".person-name", ".profile-name", ".result-title", ".result__title",
         "a", "span", "div"
     ]
 
@@ -370,13 +380,11 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
             if c:
                 out.append(c)
 
-        # stop early if we already have enough high-confidence names
-        if len(out) >= 60 and sel in ("td:first-child", "h3", "h4", "td:nth-child(1)"):
+        # stop early if we already have enough candidates from a precise selector
+        if len(out) >= 80 and sel in ("td:first-child", "h3", "h4", "td:nth-child(1)"):
             break
 
-    # de-dupe preserving order
-    dedup = list(dict.fromkeys(out))
-    return dedup
+    return list(dict.fromkeys(out))
 
 
 # =========================================================
@@ -434,72 +442,139 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
         return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
 
     # link text
-    for txt in ("next", "próxima", "seguinte", ">", "»"):
-        el = soup.find("a", string=re.compile(txt, re.I))
-        if el and el.get("href"):
-            return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
+    next_texts = {"next", "next page", "older", ">", "›", "»", "more"}
+    for a in soup.select("a[href]"):
+        t = (a.get_text(" ", strip=True) or "").strip().lower()
+        aria = (a.get("aria-label") or "").strip().lower()
+        if t in next_texts or aria in next_texts or "next" in aria:
+            return {"method": "GET", "url": urljoin(base_url, a["href"]), "data": None}
 
-    # button/input
-    for txt in ("next", "próxima", "seguinte", "submit", "continuar", ">"):
-        el = soup.find(lambda tag: tag.name in ("button", "input") and txt in (tag.get("value", "") + tag.get_text(" ")).lower())
-        if el:
-            req = extract_form_request_from_element(el, base_url)
-            if req:
-                return req
+    # form buttons
+    def looks_like_next(s: str) -> bool:
+        s = (s or "").strip().lower()
+        return (s in next_texts) or ("next" in s) or ("more" in s)
+
+    for btn in soup.find_all(["button", "input"]):
+        if btn.name == "button":
+            if looks_like_next(btn.get_text(" ", strip=True)) or looks_like_next(btn.get("aria-label", "")):
+                req = extract_form_request_from_element(btn, base_url)
+                if req:
+                    return req
+        else:
+            t = btn.get("value", "") or btn.get("aria-label", "") or ""
+            if looks_like_next(t):
+                req = extract_form_request_from_element(btn, base_url)
+                if req:
+                    return req
+
+    # url params fallback
+    u = urlparse(base_url)
+    qs = parse_qs(u.query)
+    for k in ["page", "p", "pg", "start", "offset"]:
+        if k in qs:
+            try:
+                val = int(qs[k][0])
+                qs[k] = [str(val + 1)]
+                return {"method": "GET", "url": u._replace(query=urlencode(qs, doseq=True)).geturl(), "data": None}
+            except Exception:
+                pass
 
     return None
 
 
 # =========================================================
-#             SELENIUM HELPERS
+#             SELENIUM DRIVER (Streamlit Cloud-friendly)
 # =========================================================
 def get_driver(headless: bool = True):
-    try:
-        opts = Options()
-        if headless:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1280,2000")
-        service = Service("/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=opts)
-        return driver
-    except Exception:
+    if not HAS_SELENIUM:
         return None
 
-def selenium_find_search_input(driver):
-    try:
-        inputs = driver.find_elements(By.CSS_SELECTOR, "input, textarea")
-        for inp in inputs:
-            placeholder = (inp.get_attribute("placeholder") or "").lower()
-            name = (inp.get_attribute("name") or "").lower()
-            itype = (inp.get_attribute("type") or "").lower()
-            if itype in ("search", "text", "", None) and any(
-                kw in placeholder or kw in name for kw in ["search", "buscar", "nome", "name", "keyword", "term", "query"]
-            ):
-                return inp
-        return None
-    except Exception:
-        return None
-
-def selenium_submit_search(driver, elem, query: str):
-    try:
-        elem.clear()
-        elem.send_keys(query)
-        elem.send_keys(Keys.ENTER)
+    for p in ["/tmp/chrome-user-data", "/tmp/chrome-data-path", "/tmp/chrome-cache"]:
         try:
-            btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-            btn.click()
+            os.makedirs(p, exist_ok=True)
         except Exception:
             pass
 
-        if manual_search_selector:
-            try:
-                elem2 = driver.find_element(By.CSS_SELECTOR, manual_search_selector)
-                elem2.clear()
-                elem2.send_keys(query)
-            except Exception:
-                pass
+    def build_options(use_new_headless: bool):
+        options = Options()
+        if headless:
+            options.add_argument("--headless=new" if use_new_headless else "--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--remote-allow-origins=*")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--user-data-dir=/tmp/chrome-user-data")
+        options.add_argument("--data-path=/tmp/chrome-data-path")
+        options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
+
+        if os.path.exists("/usr/bin/chromium"):
+            options.binary_location = "/usr/bin/chromium"
+        return options
+
+    service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else None
+
+    last = None
+    for use_new in ([True, False] if headless else [True]):
+        try:
+            if service:
+                return webdriver.Chrome(service=service, options=build_options(use_new))
+            return webdriver.Chrome(options=build_options(use_new))
+        except Exception as e:
+            last = e
+
+    st.warning(f"Selenium failed to start: {repr(last)}")
+    return None
+
+
+# =========================================================
+#             ACTIVE SEARCH: FIXED LOGIC
+# =========================================================
+def selenium_find_search_input(driver) -> Optional[str]:
+    if manual_search_selector and len(driver.find_elements(By.CSS_SELECTOR, manual_search_selector)) > 0:
+        return manual_search_selector
+
+    candidates = [
+        "input[type='search']",
+        "input[name='q']",
+        "input[name='query']",
+        "input[name='search']",
+        "input[aria-label='Search']",
+        "input[placeholder*='search' i]"
+    ]
+    for c in candidates:
+        if len(driver.find_elements(By.CSS_SELECTOR, c)) > 0:
+            return c
+    return None
+
+def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
+    try:
+        inp = driver.find_element(By.CSS_SELECTOR, sel_input)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+        inp.click()
+
+        try:
+            inp.send_keys(Keys.CONTROL + "a")
+            inp.send_keys(Keys.BACKSPACE)
+        except Exception:
+            pass
+        driver.execute_script("arguments[0].value = '';", inp)
+
+        driver.execute_script(
+            """
+            arguments[0].value = arguments[1];
+            arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
+            arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
+            """,
+            inp, query
+        )
+
+        try:
+            inp.send_keys(Keys.RETURN)
+        except Exception:
+            pass
+
         if manual_search_button:
             try:
                 btn = driver.find_element(By.CSS_SELECTOR, manual_search_button)
@@ -512,7 +587,6 @@ def selenium_submit_search(driver, elem, query: str):
         return False
 
 def selenium_wait_for_results(driver, before_url: str, before_len: int, timeout: int) -> None:
-    # Wait for either URL change or DOM length change (cheap & effective)
     def changed(d):
         try:
             if d.current_url != before_url:
@@ -559,7 +633,6 @@ if st.session_state.running:
     all_matches: List[Dict[str, Any]] = []
     all_seen = set()
 
-    # Show previous matches if any
     if st.session_state.matches:
         table_placeholder.dataframe(pd.DataFrame(st.session_state.matches), use_container_width=True, height=260)
 
@@ -587,9 +660,11 @@ if st.session_state.running:
             names = extract_names_multi(raw_html, manual_name_selector.strip() if manual_name_selector else None)
 
             status_log.write(f"🧩 Extracted {len(names)} candidates.")
-            matches, dropped = match_names(names, f"Page {page}", allow_unranked_names)
+            if debug_show_candidates:
+                st.write("Sample extracted candidates:", names[:30])
+
+            matches = match_names(names, f"Page {page}")
             if matches:
-                # dedupe by name
                 for m in matches:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
@@ -599,13 +674,7 @@ if st.session_state.running:
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
                 status_log.write(f"✅ Added {len(matches)} matches.")
             else:
-                if dropped:
-                    sample = ", ".join(dropped[:5])
-                    status_log.write(
-                        f"🤷 IBGE ranks filtered out {len(dropped)} names. Enable 'Allow non-IBGE names' to keep them (e.g., {sample})."
-                    )
-                else:
-                    status_log.write("🤷 No matches. Adjust IBGE scope or enable 'Allow non-IBGE names'.")
+                status_log.write("🤷 No matches.")
 
             next_req = find_next_request_heuristic(
                 raw_html,
@@ -649,7 +718,7 @@ if st.session_state.running:
 
                 html = driver.page_source
                 names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
-                matches, dropped = match_names(names, f"Scroll batch {k+1}", allow_unranked_names)
+                matches = match_names(names, f"Scroll batch {k+1}")
 
                 for m in matches:
                     if m["Full Name"] not in all_seen:
@@ -661,11 +730,6 @@ if st.session_state.running:
                 if matches:
                     table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
                     status_log.write(f"✅ Added {len(matches)} matches.")
-                elif dropped:
-                    sample = ", ".join(dropped[:5])
-                    status_log.write(
-                        f"🤷 IBGE ranks filtered out {len(dropped)} names. Enable 'Allow non-IBGE names' to keep them (e.g., {sample})."
-                    )
         finally:
             try:
                 driver.quit()
@@ -673,23 +737,15 @@ if st.session_state.running:
                 pass
 
     # ---------------------------
-    # ACTIVE SEARCH INJECTION MODE (FIXED)
+    # ACTIVE SEARCH INJECTION MODE
     # ---------------------------
     else:
         status_log.write("🔎 Active Search Injection (fixed): requests + selenium")
 
-        # Start selenium first (since you WANT it)
         driver = get_driver(headless=run_headless)
         if not driver:
             status_log.warning("Selenium could not start here. Will use requests-only fallback.")
 
-        # Requests fallback: try detect form on landing page
-        landing_html = None
-        r0 = fetch_native("GET", start_url, None)
-        if r0 and getattr(r0, "status_code", None) == 200:
-            landing_html = r0.text
-
-        # For url-param fallback
         forced_param = manual_search_param.strip() if manual_search_param.strip() else None
         param_candidates = [forced_param] if forced_param else ["q", "query", "search", "name", "keyword", "term"]
 
@@ -706,19 +762,15 @@ if st.session_state.running:
                     return rr.text
             return None
 
-        # Go
         for i, surname in enumerate(sorted_surnames[: int(max_pages)]):
             status_log.update(label=f"🔎 Searching '{surname}' ({i+1}/{int(max_pages)})", state="running")
-
             html = None
 
-            # Selenium path
             if driver:
                 try:
                     driver.get(start_url)
                     time.sleep(2)
 
-                    # cookie click best-effort
                     try:
                         driver.execute_script(
                             "document.querySelectorAll('button,a').forEach(b=>{if(/accept|agree|cookie/i.test(b.innerText))b.click()})"
@@ -738,14 +790,12 @@ if st.session_state.running:
                             try:
                                 selenium_wait_for_results(driver, before_url, before_len, timeout=int(selenium_wait))
                             except Exception:
-                                # even if wait fails, still try scrape
                                 pass
                             html = driver.page_source
                 except Exception as e:
                     status_log.warning(f"Selenium search failed: {repr(e)}")
                     html = None
 
-            # Requests fallback
             if not html:
                 html = requests_urlparam_search(surname)
 
@@ -754,14 +804,16 @@ if st.session_state.running:
                 time.sleep(search_delay)
                 continue
 
-            # Extract + match
             names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
+            if debug_show_candidates:
+                st.write(f"Sample extracted candidates for {surname}:", names[:30])
+
             if not names:
                 status_log.write("🤷 No names extracted from results page.")
                 time.sleep(search_delay)
                 continue
 
-            matches, dropped = match_names(names, f"Search: {surname}", allow_unranked_names)
+            matches = match_names(names, f"Search: {surname}")
             if matches:
                 for m in matches:
                     if m["Full Name"] not in all_seen:
@@ -772,13 +824,7 @@ if st.session_state.running:
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
                 status_log.write(f"✅ Added {len(matches)} matches.")
             else:
-                if dropped:
-                    sample = ", ".join(dropped[:5])
-                    status_log.write(
-                        f"🤷 Names found, but IBGE Top-N removed {len(dropped)} of them. Example discards: {sample}. Enable 'Allow non-IBGE names' to keep them."
-                    )
-                else:
-                    status_log.write("🤷 Names found, but none matched current IBGE Top-N filters. Try enabling 'Allow non-IBGE names'.")
+                status_log.write("🤷 Names found, but none matched current IBGE Top-N filters.")
 
             time.sleep(search_delay)
 
@@ -791,7 +837,6 @@ if st.session_state.running:
     status_log.update(label="Scanning Complete", state="complete")
     st.session_state.running = False
 
-    # exports
     if st.session_state.matches:
         df = pd.DataFrame(st.session_state.matches)
         st.markdown("---")
