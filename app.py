@@ -360,6 +360,17 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
 def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
 
+    def fallback_from_text(text: str) -> List[str]:
+        out: List[str] = []
+        for raw in text.splitlines():
+            raw = " ".join(raw.split()).strip()
+            if len(raw) < 5 or len(raw.split()) > 6:
+                continue
+            c = clean_extracted_name(raw)
+            if c:
+                out.append(c)
+        return out
+
     selectors = []
     if manual_sel:
         selectors.append(manual_sel.strip())
@@ -381,6 +392,10 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
 
         if len(out) >= 80 and sel in ("td:first-child", "h3", "h4", "td:nth-child(1)"):
             break
+
+    if not out:
+        text_blob = soup.get_text("\n", strip=True)
+        out = fallback_from_text(text_blob)
 
     return list(dict.fromkeys(out))
 
