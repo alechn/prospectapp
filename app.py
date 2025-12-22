@@ -177,39 +177,44 @@ def selenium_wait_for_search_outcome(
     start = time.time()
 
     baseline_html = driver.page_source or ""
-    baseline_fp = hash(baseline_html)
+    baseline_names = set(extract_names_multi(baseline_html))
 
-    debug_log(status_log, f"[{surname}] baseline fp={baseline_fp} len={len(baseline_html)}")
-
-    dom_changed = False
+    debug_log(
+        status_log,
+        f"[{surname}] baseline names={len(baseline_names)}"
+    )
 
     while (time.time() - start) < timeout:
         html = driver.page_source or ""
-        fp = hash(html)
         elapsed = round(time.time() - start, 1)
 
         names = extract_names_multi(html)
-        no_results = page_has_no_results_signal(html, names)
+        name_set = set(names)
 
-        if fp != baseline_fp:
-            dom_changed = True
+        names_changed = name_set != baseline_names
+        no_results = page_has_no_results_signal(html, names)
 
         debug_log(
             status_log,
-            f"[{surname}] t={elapsed}s dom_changed={dom_changed} "
-            f"len={len(html)} names={len(names)} no_results={no_results}"
+            f"[{surname}] t={elapsed}s "
+            f"names={len(names)} "
+            f"changed={names_changed} "
+            f"no_results={no_results}"
         )
 
-        if dom_changed:
-            if no_results:
-                return "no_results", html, []
-            if names:
-                return "names", html, names
+        # ✅ ONLY succeed if names CHANGE
+        if names_changed:
+            return "names_changed", html, names
+
+        # explicit empty state (rare on MIT, but keep it)
+        if no_results:
+            return "no_results", html, []
 
         time.sleep(poll_s)
 
     debug_log(status_log, f"[{surname}] TIMEOUT")
-    return "timeout", html, extract_names_multi(html)
+    return "timeout", html, names
+
 
 # =========================================================
 # UI
