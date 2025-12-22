@@ -8,6 +8,12 @@ Universal Brazilian Alumni Finder (Streamlit Cloud friendly)
 ✅ Fixes:
    - Selenium now fails loudly when forced (shows real exception)
    - Name cleaner handles "LAST, FIRST" (MIT-style) instead of truncating at comma
+✅ NEW Selenium hardening (Streamlit Cloud):
+   - Uses --headless=new
+   - Adds --remote-debugging-port=9222
+   - Uses /tmp profile dir
+   - Optional ChromeDriver verbose log to /tmp/chromedriver.log
+   - Cleans up temp profile directory on quit (success or failure)
 
 STREAMLIT CLOUD SETUP (FREE)
 1) packages.txt (repo root):
@@ -160,6 +166,14 @@ with st.sidebar.expander("🛠️ Advanced / Debug"):
     show_debug_ai_payload = st.sidebar.checkbox("Show AI Debug Errors", value=True)
     run_headless = st.sidebar.checkbox("Selenium Headless", value=True)
 
+    # ✅ NEW: Optional ChromeDriver verbose logging
+    enable_chromedriver_log = st.sidebar.checkbox(
+        "Write ChromeDriver verbose log (/tmp/chromedriver.log)", value=True
+    )
+    show_chromedriver_log_on_error = st.sidebar.checkbox(
+        "Show last 200 lines of ChromeDriver log on error", value=True
+    )
+
 if st.sidebar.button("🧪 Selenium diagnostics"):
     st.sidebar.write("HAS_SELENIUM:", HAS_SELENIUM)
     st.sidebar.write("Exists /usr/bin/chromedriver:", os.path.exists("/usr/bin/chromedriver"))
@@ -217,7 +231,7 @@ def normalize_token(s: str) -> str:
 def clean_extracted_name(raw_text):
     """
     Improved cleaner:
-    - converts "LAST, FIRST ..." -> "FIRST LAST"
+    - converts "LAST, FIRST ..." -> "FIRST ..." + "LAST"
     - does NOT truncate at comma before conversion (MIT fix)
     """
     if not isinstance(raw_text, str):
@@ -519,73 +533,102 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
 # =========================================================
 #             PART 6: SELENIUM DRIVER (LOUD WHEN FORCED)
 # =========================================================
+def _maybe_show_chromedriver_log():
+    path = "/tmp/chromedriver.log"
+    if os.path.exists(path):
+        try:
+            tail = open(path, "r", encoding="utf-8", errors="ignore").read().splitlines()[-200:]
+            st.code("\n".join(tail))
+        except Exception:
+            pass
+
 def get_driver(headless: bool = True, fail_loud: bool = False):
     """
-    Streamlit Cloud-friendly Selenium setup.
-    Includes 'Nuclear Option' flags to prevent 'Chrome instance exited' crashes.
+    Streamlit Cloud-friendly Selenium setup (hardened).
+    Key changes:
+      - --headless=new
+      - --remote-debugging-port=9222
+      - user-data-dir under /tmp
+      - optional chromedriver verbose log to /tmp/chromedriver.log
+      - returns (driver, profile_dir) so caller can cleanup on success too
     """
     if not HAS_SELENIUM:
-        return None
+        return None, None
 
     options = Options()
-    
-    # 1. HEADLESS MODE
-    if headless:
-        options.add_argument("--headless")
 
-    # 2. CRITICAL CONTAINER FLAGS (The "Nuclear" Set)
+    if headless:
+        options.add_argument("--headless=new")
+
+    # Container-safe flags
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-software-rasterizer")  # Crucial for cloud
-    options.add_argument("--disable-features=VizDisplayCompositor") # Disables complex rendering
-    options.add_argument("--no-zygote") # Disables the zygote process (often causes crashes)
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--no-zygote")
     options.add_argument("--window-size=1920,1080")
+
+    # Common “Chrome exits instantly” fixes
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-notifications")
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--remote-allow-origins=*")
 
-    # 3. PROFILE MANAGEMENT (Unique per session)
-    user_data_dir = tempfile.mkdtemp()
+    # Use short writable profile path
+    user_data_dir = tempfile.mkdtemp(prefix="selenium_profile_", dir="/tmp")
     options.add_argument(f"--user-data-dir={user_data_dir}")
-    options.add_argument(f"--data-path={user_data_dir}/data")
-    options.add_argument(f"--disk-cache-dir={user_data_dir}/cache")
 
-    # 4. BINARY LOCATION (Explicitly point to system Chromium)
+    # Explicit Chromium binary
     if os.path.exists("/usr/bin/chromium"):
         options.binary_location = "/usr/bin/chromium"
     elif os.path.exists("/usr/bin/chromium-browser"):
         options.binary_location = "/usr/bin/chromium-browser"
 
-    # 5. SERVICE SETUP
+    # Service / Driver
     service = None
     if os.path.exists("/usr/bin/chromedriver"):
-        # Use system driver (fastest & matches binary)
-        service = Service("/usr/bin/chromedriver")
+        if enable_chromedriver_log:
+            try:
+                # overwrite each run
+                try:
+                    os.remove("/tmp/chromedriver.log")
+                except Exception:
+                    pass
+                service = Service("/usr/bin/chromedriver", log_output="/tmp/chromedriver.log")
+            except Exception:
+                service = Service("/usr/bin/chromedriver")
+        else:
+            service = Service("/usr/bin/chromedriver")
     else:
-        # Fallback to webdriver_manager
         try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            from webdriver_manager.core.os_manager import ChromeType
             service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+        except Exception:
+            service = None
+
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.set_page_load_timeout(45)
+        return driver, user_data_dir
+    except Exception as e:
+        try:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
         except Exception:
             pass
 
-    try:
-        # Launch
-        driver = webdriver.Chrome(service=service, options=options)
-        return driver
-    except Exception as e:
-        # Cleanup
-        try:
-            shutil.rmtree(user_data_dir)
-        except:
-            pass
-            
         if fail_loud:
-            st.error(f"Selenium Startup Failed: {e}")
-            raise e
-        return None
-       
+            st.error(f"Selenium Startup Failed: {repr(e)}")
+            if show_chromedriver_log_on_error:
+                _maybe_show_chromedriver_log()
+            raise
+        return None, None
+
+
 # =========================================================
 #             PART 7: PAGINATION HELPERS
 # =========================================================
@@ -1180,7 +1223,7 @@ if st.session_state.running:
             st.session_state.running = False
             st.stop()
 
-        driver = get_driver(headless=run_headless, fail_loud=True)
+        driver, profile_dir = get_driver(headless=run_headless, fail_loud=True)
         try:
             driver.get(start_url)
             time.sleep(3)
@@ -1201,7 +1244,13 @@ if st.session_state.running:
                         status_log.write(f"✅ Added {len(matches)} matches.")
         finally:
             try:
-                driver.quit()
+                if driver:
+                    driver.quit()
+            except Exception:
+                pass
+            try:
+                if profile_dir:
+                    shutil.rmtree(profile_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -1222,6 +1271,7 @@ if st.session_state.running:
             status_log.write("ℹ️ No obvious search form found on landing page.")
 
         driver = None
+        profile_dir = None
         force_selenium = active_search_engine.startswith("Selenium:")
 
         if active_search_engine in (
@@ -1234,8 +1284,7 @@ if st.session_state.running:
                     st.session_state.running = False
                     st.stop()
             else:
-                # ✅ NEW: fail loudly when forced so you see the true exception
-                driver = get_driver(headless=run_headless, fail_loud=force_selenium)
+                driver, profile_dir = get_driver(headless=run_headless, fail_loud=force_selenium)
                 if not driver and not force_selenium:
                     status_log.warning("Selenium could not start here. Will use requests engines only.")
 
@@ -1311,6 +1360,11 @@ if st.session_state.running:
             try:
                 if driver:
                     driver.quit()
+            except Exception:
+                pass
+            try:
+                if profile_dir:
+                    shutil.rmtree(profile_dir, ignore_errors=True)
             except Exception:
                 pass
 
