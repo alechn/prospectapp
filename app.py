@@ -7,7 +7,7 @@ from urllib.parse import urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
 
 # ================================
-# Selenium (optional)
+# Selenium
 # ================================
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -21,13 +21,15 @@ from webdriver_manager.core.os_manager import ChromeType
 # ================================
 # Streamlit UI
 # ================================
-st.set_page_config("Universal Active Search Debugger", layout="wide")
+st.set_page_config(
+    page_title="Universal Active Search Debugger",
+    layout="wide",
+    page_icon="🧪"
+)
+
 st.title("🧪 Universal Active Search Debugger")
 st.caption("Probe → Detect → Decide → Extract")
 
-# ================================
-# Config
-# ================================
 TARGET_URL = st.text_input(
     "Target URL",
     "https://web.mit.edu/directory/"
@@ -40,51 +42,85 @@ SURNAME = st.text_input(
 
 TIMEOUT = st.slider("Timeout (seconds)", 5, 30, 15)
 
-RUN = st.button("▶ Run Debugger")
+RUN = st.button("▶ Run Debugger", type="primary")
 
 # ================================
 # Utilities
 # ================================
 NAME_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\\-\\. ]{3,}$")
 
-def clean_name(txt: str) -> Optional[str]:
+BAD_TOKENS = {
+    "MIT", "HOME", "NEWS", "EVENTS", "MAP", "SEARCH",
+    "ALUMNI", "PEOPLE", "JOBS", "PRIVACY", "ACCESSIBILITY",
+    "INNOVATION", "CAMPUS", "LIFE", "GIVE", "VISIT",
+    "SOCIAL", "MEDIA"
+}
+
+def looks_like_person_name(txt: str) -> bool:
     if not txt:
-        return None
+        return False
+
     txt = " ".join(txt.split())
     if not NAME_RE.match(txt):
-        return None
-    if any(x in txt.upper() for x in [
-        "SEARCH", "RESULT", "DIRECTORY", "LOGIN", "ABOUT",
-        "CONTACT", "HOME", "MENU", "MIT", "EDUCATION"
-    ]):
-        return None
-    return txt
+        return False
+
+    words = txt.split()
+    if not (2 <= len(words) <= 4):
+        return False
+
+    if any(w.upper() in BAD_TOKENS for w in words):
+        return False
+
+    return all(w[0].isupper() for w in words if w.isalpha())
+
+def find_result_containers(soup: BeautifulSoup):
+    selectors = [
+        "#results",
+        "#results-page",
+        ".results",
+        ".results-mod",
+        ".search-results",
+        ".search__results",
+        "[role='main']",
+        "main",
+    ]
+
+    containers = []
+    for sel in selectors:
+        containers.extend(soup.select(sel))
+
+    return containers or [soup]
 
 def extract_names_multi(html: str) -> List[str]:
     soup = BeautifulSoup(html or "", "html.parser")
     out = []
-    for el in soup.select("a, h2, h3, h4, strong"):
-        t = clean_name(el.get_text(" ", strip=True))
-        if t:
-            out.append(t)
+
+    containers = find_result_containers(soup)
+
+    for c in containers:
+        for el in c.select("a, h2, h3, h4, strong"):
+            txt = el.get_text(" ", strip=True)
+            if looks_like_person_name(txt):
+                out.append(txt)
+
     return list(dict.fromkeys(out))
 
 def log(status, msg):
     status.write(msg)
 
 # ================================
-# Detection Heuristics
+# Frontend Detection
 # ================================
 def detect_frontend(html: str) -> dict:
     h = html.lower()
     return {
         "vue": "<result-list" in h or "vue" in h,
-        "react": "reactroot" in h or "__react" in h,
-        "js_app": "<script" in h and ("search" in h),
+        "react": "__react" in h or "reactroot" in h,
+        "js_app": "<script" in h and "search" in h,
     }
 
 # ================================
-# Strategy 1: Server-side URL search
+# Strategy 1: Server-side search
 # ================================
 def try_server_search(url: str, term: str, status) -> List[str]:
     params = ["q", "query", "search", "s"]
@@ -93,7 +129,10 @@ def try_server_search(url: str, term: str, status) -> List[str]:
         u = urlparse(url)
         qs = parse_qs(u.query)
         qs[p] = [term]
-        test_url = u._replace(query=urlencode(qs, doseq=True)).geturl()
+
+        test_url = u._replace(
+            query=urlencode(qs, doseq=True)
+        ).geturl()
 
         log(status, f"🔍 Trying server search: {test_url}")
 
@@ -110,7 +149,7 @@ def try_server_search(url: str, term: str, status) -> List[str]:
     return []
 
 # ================================
-# Selenium Helpers
+# Selenium helpers
 # ================================
 def get_driver():
     opts = Options()
@@ -147,10 +186,11 @@ def selenium_submit_search(driver, inp, term):
     inp.send_keys(Keys.RETURN)
 
 # ================================
-# Strategy 4: Selenium DOM extraction
+# Strategy 4: Selenium DOM
 # ================================
 def try_selenium_dom(url: str, term: str, status, timeout: int) -> List[str]:
     log(status, "🤖 Launching Selenium fallback")
+
     driver = get_driver()
     driver.get(url)
     selenium_wait_ready(driver)
@@ -179,9 +219,14 @@ def try_selenium_dom(url: str, term: str, status, timeout: int) -> List[str]:
 # ================================
 # UNIVERSAL ACTIVE SEARCH ENGINE
 # ================================
-def universal_active_search(url: str, term: str, timeout: int, status) -> Tuple[str, List[str]]:
+def universal_active_search(
+    url: str,
+    term: str,
+    timeout: int,
+    status
+) -> Tuple[str, List[str]]:
 
-    # 1️⃣ Server-rendered HTML search
+    # 1️⃣ Server-side HTML search
     names = try_server_search(url, term, status)
     if names:
         return "server_html_search", names
@@ -197,11 +242,10 @@ def universal_active_search(url: str, term: str, timeout: int, status) -> Tuple[
     caps = detect_frontend(html)
     log(status, f"🧠 Frontend detected: {caps}")
 
-    # 3️⃣ JS frontend → try known search endpoint
+    # 3️⃣ Known frontend server endpoint (MIT-style)
     if caps["vue"] or caps["react"]:
-        mit_style = "search" in url.lower() or "mit.edu" in url.lower()
-        if mit_style:
-            log(status, "🧪 Trying MIT-style /search endpoint")
+        if "mit.edu" in url.lower():
+            log(status, "🧪 Trying MIT /search endpoint")
             try:
                 r = requests.get(
                     "https://www.mit.edu/search/",
