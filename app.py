@@ -137,7 +137,7 @@ def clean_extracted_name(raw_text):
     Cleaner with expanded Blacklist for nav items (Education, Campus, etc.)
     """
     if not isinstance(raw_text, str): return None
-    
+
     # 1. Whitespace
     raw_text = " ".join(raw_text.split()).strip()
     if not raw_text: return None
@@ -164,7 +164,7 @@ def clean_extracted_name(raw_text):
         "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
         "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"
     ]
-    
+
     if any(phrase in upper for phrase in junk_phrases):
         return None
 
@@ -187,7 +187,7 @@ def clean_extracted_name(raw_text):
     # 6. Validation
     if len(clean) < 3 or len(clean.split()) > 7:
         return None
-    
+
     # Reject emails/filenames/urls
     if any(x in clean for x in ["@", ".com", ".org", ".edu", ".net", "http", "www"]):
         return None
@@ -248,7 +248,8 @@ def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str
                 page += 1
                 if len(out) > 20000: break # Safety cap
                 time.sleep(0.08)
-            except: break
+            except:
+                break
         return out
 
     first_full = _fetch_all(IBGE_FIRST)
@@ -360,10 +361,10 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
 
         score_f = calculate_score(rf, int(limit_first), 50)
         score_l = calculate_score(rl, int(limit_surname), 50)
-        
+
         total_score = round(score_f + score_l, 1)
 
-        if total_score > 5: 
+        if total_score > 5:
             found.append({
                 "Full Name": n,
                 "Brazil Score": total_score,
@@ -481,7 +482,7 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
             if looks_like_next(t):
                 req = extract_form_request_from_element(btn, base_url)
                 if req: return req
-    
+
     # URL Query param heuristics
     u = urlparse(base_url)
     qs = parse_qs(u.query)
@@ -515,12 +516,12 @@ def get_driver(headless: bool = True):
     # These often help with session creation issues
     options.add_argument("--remote-allow-origins=*")
     options.add_argument("--disable-extensions")
-    
+
     # 2. Try Standard Path (Linux/Streamlit Cloud)
     service = None
     if os.path.exists("/usr/bin/chromedriver"):
         service = Service("/usr/bin/chromedriver")
-    
+
     # 3. Attempt to initialize
     try:
         if service:
@@ -552,9 +553,13 @@ def selenium_wait_document_ready(driver, timeout: int = 10):
         pass
 
 def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = None):
+    """
+    Kept for backwards-compat, but Active Search Injection now uses
+    selenium_wait_for_search_outcome() to avoid false positives.
+    """
     selenium_wait_document_ready(driver, min(5, timeout))
     time.sleep(1.5) # Forced pause for JS rendering
-    
+
     if name_selector:
         try:
             WebDriverWait(driver, timeout).until(
@@ -569,8 +574,8 @@ def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = N
     for s in common:
         if len(driver.find_elements(By.CSS_SELECTOR, s)) > 0:
             return
-    
-    time.sleep(1.5) 
+
+    time.sleep(1.5)
 
 
 # =========================================================
@@ -599,21 +604,113 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
             inp.send_keys(Keys.CONTROL + "a")
             inp.send_keys(Keys.BACKSPACE)
             driver.execute_script("arguments[0].value = '';", inp)
-        except: pass
+        except Exception:
+            pass
 
         inp.send_keys(query)
-        time.sleep(0.5)
+        time.sleep(0.3)
         inp.send_keys(Keys.RETURN)
-        
+
         # Click manual button if exists
         if manual_search_button:
             try:
                 driver.find_element(By.CSS_SELECTOR, manual_search_button).click()
-            except: pass
-            
+            except Exception:
+                pass
+
         return True
     except Exception:
         return False
+
+def page_has_no_results_signal(html: str) -> bool:
+    """
+    Heuristics to detect "no results" screens across common directory UIs.
+    """
+    if not html:
+        return False
+
+    soup = BeautifulSoup(html, "html.parser")
+    # Common "no results" CSS patterns
+    no_sel = [
+        ".no-results", ".noresult", ".no-result", "#no-results",
+        ".empty-state", ".empty", ".nothing-found",
+        "[data-empty='true']",
+    ]
+    for s in no_sel:
+        if soup.select_one(s):
+            return True
+
+    text = soup.get_text(" ", strip=True).lower()
+
+    # Common phrases (add more as you encounter them)
+    phrases = [
+        "no results",
+        "0 results",
+        "zero results",
+        "no matches",
+        "no match",
+        "nothing found",
+        "did not match any",
+        "we couldn't find",
+        "try a different search",
+        "no records found",
+        "no entries found",
+        "no people found",
+        "no profiles found",
+        "your search returned no results",
+    ]
+    return any(p in text for p in phrases)
+
+def selenium_wait_for_search_outcome(
+    driver,
+    timeout: int,
+    manual_sel: Optional[str] = None,
+    poll_s: float = 0.35
+) -> Tuple[str, str, List[str]]:
+    """
+    Wait until:
+      - names appear (based on extract_names_multi), OR
+      - a "no results" signal appears, OR
+      - timeout
+    Returns: (outcome, html, names)
+      outcome in {"names", "no_results", "timeout"}
+    """
+    start = time.time()
+    last_fingerprint = None
+
+    # short initial settle for JS-triggered navigation
+    selenium_wait_document_ready(driver, min(5, timeout))
+    time.sleep(0.5)
+
+    while (time.time() - start) < timeout:
+        try:
+            html = driver.page_source or ""
+        except Exception:
+            html = ""
+
+        fp = hash(html)
+        # Only re-process if DOM meaningfully changed
+        if fp != last_fingerprint:
+            last_fingerprint = fp
+
+            # 1) Check for names using your existing extraction+cleaning
+            names = extract_names_multi(html, manual_sel.strip() if manual_sel else None)
+            if names:
+                return "names", html, names
+
+            # 2) Check for explicit "no results" signals
+            if page_has_no_results_signal(html):
+                return "no_results", html, []
+
+        time.sleep(poll_s)
+
+    # Timeout fallback
+    try:
+        html = driver.page_source or ""
+    except Exception:
+        html = ""
+    names = extract_names_multi(html, manual_sel.strip() if manual_sel else None) if html else []
+    return "timeout", html, names
 
 
 # =========================================================
@@ -629,14 +726,14 @@ def batch_clean_with_ai(matches, api_key):
 
     names = [m["Full Name"] for m in matches]
     junk_names = []
-    
+
     batch_size = 50
     progress_bar = st.progress(0)
-    
+
     for i in range(0, len(names), batch_size):
         batch = names[i:i+batch_size]
         prompt = f"""
-        Identify junk strings (titles, places, nav items) in this list. 
+        Identify junk strings (titles, places, nav items) in this list.
         Return JSON list of JUNK items only.
         List: {json.dumps(batch)}
         """
@@ -647,9 +744,9 @@ def batch_clean_with_ai(matches, api_key):
             junk_names.extend(found_junk)
         except Exception:
             pass
-        
+
         progress_bar.progress(min((i + batch_size) / len(names), 1.0))
-        time.sleep(1) 
+        time.sleep(1)
 
     # Update matches
     for m in matches:
@@ -658,7 +755,7 @@ def batch_clean_with_ai(matches, api_key):
             m["Brazil Score"] = -1
         else:
             m["Status"] = "Verified"
-            
+
     return matches
 
 
@@ -720,12 +817,12 @@ if st.session_state.running:
             raw_html = r.text
             names = extract_names_multi(raw_html, manual_name_selector.strip() if manual_name_selector else None)
             matches = match_names(names, f"Page {page}")
-            
+
             for m in matches:
                 if m["Full Name"] not in all_seen:
                     all_seen.add(m["Full Name"])
                     all_matches.append(m)
-            
+
             # Sort by Score
             all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
             st.session_state.matches = all_matches
@@ -776,7 +873,7 @@ if st.session_state.running:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
                         all_matches.append(m)
-                
+
                 all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                 st.session_state.matches = all_matches
                 if matches:
@@ -803,8 +900,11 @@ if st.session_state.running:
                 qs[p] = [term]
                 cand = u._replace(query=urlencode(qs, doseq=True)).geturl()
                 rr = fetch_native("GET", cand, None)
-                if rr and getattr(rr, "status_code", None) == 200: return rr.text
+                if rr and getattr(rr, "status_code", None) == 200:
+                    return rr.text
             return None
+
+        manual_sel = manual_name_selector.strip() if manual_name_selector else None
 
         for i, surname in enumerate(sorted_surnames[: int(max_pages)]):
             status_log.update(label=f"🔎 Searching '{surname}' ({i+1}/{int(max_pages)})", state="running")
@@ -814,25 +914,39 @@ if st.session_state.running:
             if driver:
                 try:
                     driver.get(start_url)
+                    selenium_wait_document_ready(driver, timeout=min(6, int(selenium_wait)))
+
                     sel_input = selenium_find_search_input(driver)
                     if sel_input:
                         if selenium_submit_search(driver, sel_input, surname):
-                            selenium_wait_results(
-                                driver, timeout=int(selenium_wait), 
-                                name_selector=manual_name_selector
+                            outcome, html_out, names_out = selenium_wait_for_search_outcome(
+                                driver,
+                                timeout=int(selenium_wait),
+                                manual_sel=manual_sel,
+                                poll_s=0.35
                             )
-                            html = driver.page_source
-                except Exception as e:
+                            html = html_out
+
+                            if outcome == "no_results":
+                                status_log.write(f"🚫 '{surname}': no results detected.")
+                            elif outcome == "timeout":
+                                status_log.write(f"⏱️ '{surname}': timeout waiting for results (parsing whatever loaded).")
+                            else:
+                                status_log.write(f"✅ '{surname}': results detected ({len(names_out)} candidate name strings).")
+
+                except Exception:
                     # If it crashes, continue to fallback
-                    pass
+                    html = None
 
             # 2. Try Requests if no HTML
             if not html:
                 html = requests_urlparam_search(surname)
+                if html and page_has_no_results_signal(html):
+                    status_log.write(f"🚫 '{surname}': no results detected (requests).")
 
             # 3. Process
             if html:
-                names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
+                names = extract_names_multi(html, manual_sel)
                 if debug_show_candidates:
                     st.write(f"Candidates for {surname}: {names[:10]}")
 
@@ -841,7 +955,7 @@ if st.session_state.running:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
                         all_matches.append(m)
-                
+
                 all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                 st.session_state.matches = all_matches
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
@@ -849,8 +963,10 @@ if st.session_state.running:
             time.sleep(search_delay)
 
         if driver:
-            try: driver.quit()
-            except: pass
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
     status_log.update(label="Scanning Complete", state="complete")
     st.session_state.running = False
@@ -862,7 +978,7 @@ if st.session_state.running:
 if st.session_state.matches:
     st.markdown("---")
     col1, col2 = st.columns([1, 4])
-    
+
     with col1:
         st.subheader("🧹 Cleaning")
         if st.button("✨ AI Clean & Sort Results", type="primary"):
@@ -879,14 +995,14 @@ if st.session_state.matches:
 
     with col2:
         df = pd.DataFrame(st.session_state.matches)
-        
+
         cols_config = {
             "Brazil Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.1f"),
             "Status": st.column_config.TextColumn("Status"),
         }
-        
+
         st.dataframe(df, column_config=cols_config, use_container_width=True)
-        
+
     c1, c2 = st.columns(2)
     with c1:
         st.download_button("📥 CSV", df.to_csv(index=False).encode("utf-8"), "results.csv")
