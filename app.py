@@ -206,6 +206,11 @@ limit_first = st.sidebar.number_input("Use Top N First Names", 1, 20000, 3000, 1
 limit_surname = st.sidebar.number_input("Use Top N Surnames", 1, 20000, 3000, 1)
 allow_api = st.sidebar.checkbox("If JSON missing, fetch from IBGE API", value=True)
 save_local = st.sidebar.checkbox("If fetched, save JSON locally", value=True)
+allow_unranked_names = st.sidebar.checkbox(
+    "Allow non-IBGE names (low confidence)",
+    value=False,
+    help="Keep names that are missing IBGE ranks; they'll be marked Unranked and given a minimal score."
+)
 
 @st.cache_data(ttl=60 * 60 * 24 * 30)
 def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
@@ -277,7 +282,10 @@ with st.sidebar.status("Loading IBGE...", expanded=False) as s:
         ibge_first_full, ibge_surname_full, int(limit_first), int(limit_surname)
     )
     s.update(label=f"IBGE ready ({ibge_mode}) ✅", state="complete")
-    st.sidebar.success(f"✅ Using Top {int(limit_first)}/{int(limit_surname)} → {len(first_name_ranks)} first / {len(surname_ranks)} surname")
+    scope_label = "Allowing unranked spillover" if allow_unranked_names else "IBGE-ranked only"
+    st.sidebar.success(
+        f"✅ Using Top {int(limit_first)}/{int(limit_surname)} → {len(first_name_ranks)} first / {len(surname_ranks)} surname ({scope_label})"
+    )
 
 
 # =========================================================
@@ -288,8 +296,9 @@ def rank_score(rank: int, top_n: int, max_points: int = 50) -> int:
         return 0
     return max(1, int(max_points * (top_n - rank + 1) / top_n))
 
-def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
-    found = []
+def match_names(names: List[str], source: str, allow_unranked: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
+    found: List[Dict[str, Any]] = []
+    dropped_unranked: List[str] = []
     seen = set()
     for n in names:
         n = clean_extracted_name(n)
@@ -317,15 +326,20 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
         if rl > 0:
             score += rank_score(rl, int(limit_surname), 50)
 
-        if score > 0:
-            found.append({
-                "Full Name": n,
-                "Brazil Score": score,
-                "First Rank": rf if rf > 0 else None,
-                "Surname Rank": rl if rl > 0 else None,
-                "Source": source
-            })
-    return found
+        if score == 0 and not allow_unranked:
+            dropped_unranked.append(n)
+            continue
+
+        first_rank_field: Optional[Any] = rf if rf > 0 else ("Unranked" if allow_unranked else None)
+        surname_rank_field: Optional[Any] = rl if rl > 0 else ("Unranked" if allow_unranked else None)
+        found.append({
+            "Full Name": n,
+            "Brazil Score": score if score > 0 else 1,
+            "First Rank": first_rank_field,
+            "Surname Rank": surname_rank_field,
+            "Source": source
+        })
+    return found, dropped_unranked
 
 
 # =========================================================
@@ -643,7 +657,7 @@ if st.session_state.running:
             names = extract_names_multi(raw_html, manual_name_selector.strip() if manual_name_selector else None)
 
             status_log.write(f"🧩 Extracted {len(names)} candidates.")
-            matches = match_names(names, f"Page {page}")
+            matches, dropped = match_names(names, f"Page {page}", allow_unranked_names)
             if matches:
                 # dedupe by name
                 for m in matches:
@@ -655,7 +669,13 @@ if st.session_state.running:
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
                 status_log.write(f"✅ Added {len(matches)} matches.")
             else:
-                status_log.write("🤷 No matches.")
+                if dropped:
+                    sample = ", ".join(dropped[:5])
+                    status_log.write(
+                        f"🤷 IBGE ranks filtered out {len(dropped)} names. Enable 'Allow non-IBGE names' to keep them (e.g., {sample})."
+                    )
+                else:
+                    status_log.write("🤷 No matches. Adjust IBGE scope or enable 'Allow non-IBGE names'.")
 
             next_req = find_next_request_heuristic(
                 raw_html,
@@ -699,7 +719,7 @@ if st.session_state.running:
 
                 html = driver.page_source
                 names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
-                matches = match_names(names, f"Scroll batch {k+1}")
+                matches, dropped = match_names(names, f"Scroll batch {k+1}", allow_unranked_names)
 
                 for m in matches:
                     if m["Full Name"] not in all_seen:
@@ -711,6 +731,11 @@ if st.session_state.running:
                 if matches:
                     table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
                     status_log.write(f"✅ Added {len(matches)} matches.")
+                elif dropped:
+                    sample = ", ".join(dropped[:5])
+                    status_log.write(
+                        f"🤷 IBGE ranks filtered out {len(dropped)} names. Enable 'Allow non-IBGE names' to keep them (e.g., {sample})."
+                    )
         finally:
             try:
                 driver.quit()
@@ -806,7 +831,7 @@ if st.session_state.running:
                 time.sleep(search_delay)
                 continue
 
-            matches = match_names(names, f"Search: {surname}")
+            matches, dropped = match_names(names, f"Search: {surname}", allow_unranked_names)
             if matches:
                 for m in matches:
                     if m["Full Name"] not in all_seen:
@@ -817,7 +842,13 @@ if st.session_state.running:
                 table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
                 status_log.write(f"✅ Added {len(matches)} matches.")
             else:
-                status_log.write("🤷 Names found, but none matched current IBGE Top-N filters.")
+                if dropped:
+                    sample = ", ".join(dropped[:5])
+                    status_log.write(
+                        f"🤷 Names found, but IBGE Top-N removed {len(dropped)} of them. Example discards: {sample}. Enable 'Allow non-IBGE names' to keep them."
+                    )
+                else:
+                    status_log.write("🤷 Names found, but none matched current IBGE Top-N filters. Try enabling 'Allow non-IBGE names'.")
 
             time.sleep(search_delay)
 
