@@ -8,7 +8,7 @@ import io
 import os
 import subprocess
 import sys
-import concurrent.futures  # ADDED: For parallel processing
+import concurrent.futures
 from typing import Optional, Dict, Any, List, Tuple
 from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
@@ -48,7 +48,7 @@ except Exception:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Universal Scraper • Parallel Active Search • IBGE Scoring • Auto-Driver Fix")
+st.caption("Universal Scraper • Parallel Active Search • AI Cleaning")
 
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -71,11 +71,10 @@ api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type=
 
 st.sidebar.markdown("---")
 st.sidebar.header("🚀 Performance")
-# ADDED: Parallel Slider
 num_browsers = st.sidebar.slider("⚡ Parallel Browsers (Active Search)", 1, 5, 1, 
     help="Opens multiple Chrome instances to search different surnames simultaneously.")
 
-search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 30, 10)
+search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 5, 60, 15)
 use_browserlike_tls = st.sidebar.checkbox("Use browser-like requests (curl_cffi)", value=False)
 if use_browserlike_tls and not HAS_CURL:
     st.sidebar.warning("curl_cffi not installed; falling back to requests.")
@@ -92,8 +91,7 @@ with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
     manual_search_button = st.text_input("Manual Search Button Selector", placeholder="e.g. button[type='submit']")
     manual_search_param = st.text_input("Manual Search Param (URL mode)", placeholder="e.g. q or query")
-    # ADDED: No Results Logic
-    manual_no_results = st.text_input("No Results Text", placeholder="e.g. 'No matching records found'")
+    manual_no_results = st.text_input("No Results Text", placeholder="e.g. 'No matching records'")
     debug_show_candidates = st.checkbox("Debug: show extracted candidates", value=False)
 
 st.sidebar.markdown("---")
@@ -126,7 +124,6 @@ BLOCKLIST_SURNAMES = {
     "WANG","LI","ZHANG","LIU","CHEN","YANG","HUANG","ZHAO","WU","ZHOU",
     "XU","SUN","MA","ZHU","HU","GUO","HE","GAO","LIN","LUO",
     "KIM","PARK","LEE","CHOI","NG","SINGH","PATEL","KHAN","TRAN",
-    # Generic Web Words
     "RESULTS","WEBSITE","SEARCH","MENU","SKIP","CONTENT","FOOTER","HEADER",
     "OVERVIEW","PROJECTS","PEOPLE","PROFILE","VIEW","CONTACT","SPOTLIGHT",
     "PDF","LOGIN","SIGNUP","HOME","ABOUT","CAREERS","NEWS","EVENTS",
@@ -143,14 +140,10 @@ def normalize_token(s: str) -> str:
 
 def clean_extracted_name(raw_text):
     if not isinstance(raw_text, str): return None
-    
-    # 1. Whitespace
     raw_text = " ".join(raw_text.split()).strip()
     if not raw_text: return None
 
     upper = raw_text.upper()
-
-    # 2. Expanded Junk Phrases
     junk_phrases = [
         "RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "SPOTLIGHT",
         "EXPERIENCE", "CALCULATION", "LIVING WAGE", "GOING FAST",
@@ -160,12 +153,7 @@ def clean_extracted_name(raw_text):
         "UNIVERSITY", "INSTITUTE", "SCHOOL", "DEPARTMENT", "COLLEGE",
         "PROGRAM", "INITIATIVE", "LABORATORY", "CENTER FOR", "CENTRE FOR",
         "ALUMNI", "DIRECTORY", "REAP", "MBA", "PHD", "MSC", "CLASS OF",
-        "EDUCATION", "INNOVATION", "CAMPUS LIFE", "LIFELONG LEARNING",
-        "GIVE", "HOME", "VISIT", "MAP", "EVENTS", "JOBS", "PRIVACY",
-        "ACCESSIBILITY", "SOCIAL MEDIA", "TERMS OF USE", "COPYRIGHT",
-        "BRASIL", "BRAZIL", "PERU", "ARGENTINA", "CHILE", "USA", "UNITED STATES",
-        "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
-        "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"
+        "BRASIL", "BRAZIL", "PERU", "ARGENTINA", "CHILE", "USA", "UNITED STATES"
     ]
     
     if any(phrase in upper for phrase in junk_phrases): return None
@@ -210,7 +198,7 @@ def fetch_native(method: str, url: str, data: Optional[dict] = None):
 IBGE_CACHE_FILE = "data/ibge_rank_cache.json"
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ IBGE Matching Scope (Precision)")
+st.sidebar.header("⚙️ IBGE Matching Scope")
 limit_first = st.sidebar.number_input("Use Top N First Names", 1, 20000, 3000, 1)
 limit_surname = st.sidebar.number_input("Use Top N Surnames", 1, 20000, 3000, 1)
 allow_api = st.sidebar.checkbox("If JSON missing, fetch from IBGE API", value=True)
@@ -235,7 +223,7 @@ def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str
                     if n:
                         out[n] = int(it.get("rank", 0) or 0)
                 page += 1
-                if len(out) > 20000: break # Safety cap
+                if len(out) > 20000: break
                 time.sleep(0.08)
             except: break
         return out
@@ -252,7 +240,6 @@ def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str
 
 @st.cache_resource
 def load_ibge_full_best_effort(allow_api_fallback: bool, save_if_fetched: bool):
-    # Try local file first
     if os.path.exists(IBGE_CACHE_FILE):
         try:
             with open(IBGE_CACHE_FILE, "r", encoding="utf-8") as f:
@@ -262,7 +249,7 @@ def load_ibge_full_best_effort(allow_api_fallback: bool, save_if_fetched: bool):
             meta = payload.get("meta", {"source": "local_json"})
             return first_full, surname_full, meta, "file"
         except Exception:
-            pass # File corrupted, fall through to API
+            pass
 
     if not allow_api_fallback:
         raise FileNotFoundError(f"Missing {IBGE_CACHE_FILE} and API fallback disabled.")
@@ -349,7 +336,6 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
 
         score_f = calculate_score(rf, int(limit_first), 50)
         score_l = calculate_score(rl, int(limit_surname), 50)
-        
         total_score = round(score_f + score_l, 1)
 
         if total_score > 5: 
@@ -371,7 +357,6 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
 # =========================================================
 def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
-
     selectors = []
     if manual_sel:
         selectors.append(manual_sel.strip())
@@ -390,21 +375,15 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
             c = clean_extracted_name(t)
             if c:
                 out.append(c)
-
-        if len(out) >= 500: # Safety break
-            break
-
+        if len(out) >= 500: break
     return list(dict.fromkeys(out))
 
 
 # =========================================================
-#             DRIVER MANAGEMENT (FIXED: WDM + Fallback)
+#             DRIVER MANAGEMENT
 # =========================================================
 def get_driver(headless: bool = True):
-    if not HAS_SELENIUM:
-        return None
-
-    # 1. Setup Options
+    if not HAS_SELENIUM: return None
     options = Options()
     if headless:
         options.add_argument("--headless=new")
@@ -412,36 +391,16 @@ def get_driver(headless: bool = True):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # These often help with session creation issues
     options.add_argument("--remote-allow-origins=*")
     options.add_argument("--disable-extensions")
     
-    # 2. Try Standard Path (Linux/Streamlit Cloud)
-    service = None
-    if os.path.exists("/usr/bin/chromedriver"):
-        service = Service("/usr/bin/chromedriver")
-    
-    # 3. Attempt to initialize
     try:
-        if service:
-            return webdriver.Chrome(service=service, options=options)
-        return webdriver.Chrome(options=options)
-    except Exception as e_native:
-        # 4. FALLBACK: WebDriver Manager (Fixes SessionNotCreatedException)
+        # Fallback to WebDriverManager
         if HAS_WEBDRIVER_MANAGER:
-            try:
-                # Installs matching driver for the browser
-                return webdriver.Chrome(
-                    service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-                    options=options
-                )
-            except Exception as e_wdm:
-                st.error(f"Driver Init Failed. Native: {e_native} | WDM: {e_wdm}")
-                return None
-        else:
-            st.error(f"Selenium Driver Error (and webdriver_manager not found): {e_native}")
-            return None
-
+            return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
+        return webdriver.Chrome(options=options)
+    except Exception:
+        return None
 
 def selenium_wait_document_ready(driver, timeout: int = 10):
     try:
@@ -452,41 +411,41 @@ def selenium_wait_document_ready(driver, timeout: int = 10):
         pass
 
 # =========================================================
-#             SMART WAIT LOGIC (NEW - REPLACES OLD WAIT)
+#             SMART WAIT LOGIC (FIXED)
 # =========================================================
 def smart_search_wait(driver, timeout: int, name_selector: Optional[str] = None):
     """
-    Waits until:
-    1. The name selector appears (SUCCESS)
-    2. OR 'No results' text appears (STOP)
-    3. OR The DOM stabilizes (for pages with no clear signals)
+    Waits until results appear OR 'no results' appears OR DOM stabilizes.
+    Allows for generic selector fallback.
     """
     start_time = time.time()
     last_source_len = 0
     stable_count = 0
     
-    # Text triggers that mean "Stop waiting, there is nothing here"
     negative_triggers = ["no results", "not found", "0 results", "no matches", "search returned no", "try again"]
-    if manual_no_results:
-        negative_triggers.append(manual_no_results.lower())
+    if manual_no_results: negative_triggers.append(manual_no_results.lower())
+
+    # If no manual selector, use generic ones to detect if results appeared
+    check_selectors = [name_selector] if name_selector else ["td.name", "h3", "h4", ".result"]
 
     while (time.time() - start_time) < timeout:
-        # 1. Check for Matches (Success)
-        if name_selector:
+        # 1. Check for Matches
+        for sel in check_selectors:
+            if not sel: continue
             try:
-                if len(driver.find_elements(By.CSS_SELECTOR, name_selector)) > 0:
-                    time.sleep(0.5) # Allow render to finish
+                if len(driver.find_elements(By.CSS_SELECTOR, sel)) > 0:
+                    time.sleep(0.5) 
                     return True
             except: pass
         
-        # 2. Check for "No Results" (Failure)
+        # 2. Check for "No Results"
         try:
             body_text = driver.find_element(By.TAG_NAME, "body").text.lower()[:10000] 
             if any(trig in body_text for trig in negative_triggers):
-                return False # Stop waiting immediately
+                return False 
         except: pass
 
-        # 3. DOM Stabilization (Wait for AJAX to finish)
+        # 3. DOM Stabilization
         try:
             current_len = len(driver.page_source)
             if current_len == last_source_len:
@@ -495,72 +454,26 @@ def smart_search_wait(driver, timeout: int, name_selector: Optional[str] = None)
                 stable_count = 0
             last_source_len = current_len
             
-            # If page hasn't changed size for 2.0 seconds and we are at least 2.5s in
-            if stable_count > 4 and (time.time() - start_time) > 2.5:
-                 # If we have a selector, keep waiting a bit longer. If NOT, assume load is done.
-                 if not name_selector: 
-                     return True
+            # Stricter stability: Wait at least 3 seconds before assuming stable
+            if stable_count > 4 and (time.time() - start_time) > 3.0:
+                 return True
         except: pass
 
         time.sleep(0.5)
     return False
 
 def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = None):
-    # Remap old call to new smart logic
     smart_search_wait(driver, timeout, name_selector)
 
 # =========================================================
-#             ACTIVE SEARCH UTILS
-# =========================================================
-def selenium_find_search_input(driver) -> Optional[str]:
-    if manual_search_selector and len(driver.find_elements(By.CSS_SELECTOR, manual_search_selector)) > 0:
-        return manual_search_selector
-
-    candidates = [
-        "input[type='search']", "input[name='q']", "input[name='query']",
-        "input[name='search']", "input[aria-label='Search']",
-        "input[placeholder*='search' i]", "input[placeholder*='Search' i]"
-    ]
-    for c in candidates:
-        if len(driver.find_elements(By.CSS_SELECTOR, c)) > 0:
-            return c
-    return None
-
-def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
-    try:
-        inp = driver.find_element(By.CSS_SELECTOR, sel_input)
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
-        inp.click()
-        try:
-            inp.send_keys(Keys.CONTROL + "a")
-            inp.send_keys(Keys.BACKSPACE)
-            driver.execute_script("arguments[0].value = '';", inp)
-        except: pass
-
-        inp.send_keys(query)
-        time.sleep(0.5)
-        inp.send_keys(Keys.RETURN)
-        
-        # Click manual button if exists
-        if manual_search_button:
-            try:
-                driver.find_element(By.CSS_SELECTOR, manual_search_button).click()
-            except: pass
-            
-        return True
-    except Exception:
-        return False
-
-# =========================================================
-#             WORKER FUNCTION (PARALLEL)
+#             PARALLEL WORKER (ACTIVE SEARCH)
 # =========================================================
 def worker_search_batch(surnames_chunk, url, selector, search_sel, headless):
     """
     Independent worker that opens one browser and processes a list of surnames
     """
     driver = get_driver(headless=headless)
-    if not driver: 
-        return []
+    if not driver: return []
     
     results = []
     seen = set()
@@ -571,7 +484,7 @@ def worker_search_batch(surnames_chunk, url, selector, search_sel, headless):
             try:
                 driver.get(url)
                 
-                # 1. Find & Fill Search
+                # Input Selection
                 inp = None
                 search_selectors = [search_sel] if search_sel else ["input[type='search']", "input[name='q']", "input[name='search']", "input[aria-label='Search']"]
                 
@@ -583,20 +496,16 @@ def worker_search_batch(surnames_chunk, url, selector, search_sel, headless):
                     except: pass
                 
                 if inp:
-                    # Clear and type
                     driver.execute_script("arguments[0].value = '';", inp)
                     inp.send_keys(surname)
                     inp.send_keys(Keys.RETURN)
                     
-                    # 2. Smart Wait (The upgraded logic)
-                    found_something = smart_search_wait(driver, timeout=20, name_selector=selector)
-                    
-                    # 3. Extract
+                    # Wait for results
+                    smart_search_wait(driver, timeout=20, name_selector=selector)
                     html = driver.page_source
-            except Exception:
-                pass # Continue to next surname even if one crashes
+            except Exception: pass
             
-            # --- FALLBACK REQUESTS IF SELENIUM FAILED TO GET HTML ---
+            # Fallback
             if not html:
                 try:
                     u = urlparse(url)
@@ -624,47 +533,30 @@ def worker_search_batch(surnames_chunk, url, selector, search_sel, headless):
 #             AI CLEANING AGENT
 # =========================================================
 def batch_clean_with_ai(matches, api_key):
-    if not api_key:
-        st.error("API Key required.")
-        return matches
-
+    if not api_key: st.error("API Key required."); return matches
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-2.0-flash')
-
     names = [m["Full Name"] for m in matches]
     junk_names = []
     
-    batch_size = 50
-    progress_bar = st.progress(0)
-    
-    for i in range(0, len(names), batch_size):
-        batch = names[i:i+batch_size]
-        prompt = f"""
-        Identify junk strings (titles, places, nav items) in this list. 
-        Return JSON list of JUNK items only.
-        List: {json.dumps(batch)}
-        """
+    prog = st.progress(0)
+    for i in range(0, len(names), 50):
+        batch = names[i:i+50]
         try:
+            prompt = f"Identify non-name junk strings (titles, headers). Return JSON list. Input: {json.dumps(batch)}"
             response = model.generate_content(prompt)
-            text = response.text.replace("```json", "").replace("```", "")
-            found_junk = json.loads(text)
-            junk_names.extend(found_junk)
-        except Exception:
-            pass
-        
-        progress_bar.progress(min((i + batch_size) / len(names), 1.0))
+            junk_names.extend(json.loads(response.text.replace("```json", "").replace("```", "")))
+        except: pass
+        prog.progress(min((i+50)/len(names), 1.0))
         time.sleep(1) 
 
-    # Update matches
     for m in matches:
         if m["Full Name"] in junk_names:
-            m["Status"] = "Junk (AI Flagged)"
+            m["Status"] = "Junk (AI)"
             m["Brazil Score"] = -1
         else:
             m["Status"] = "Verified"
-            
     return matches
-
 
 # =========================================================
 #             PAGINATION UTILS (CLASSIC)
@@ -712,15 +604,13 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
     for a in soup.select("a[href]"):
         if looks_like_next(a.get_text(" ", strip=True)) or looks_like_next(a.get("aria-label", "")):
             return {"method": "GET", "url": urljoin(base_url, a["href"]), "data": None}
-    
-    # Check buttons
+            
     for btn in soup.find_all(["button", "input"]):
         txt = btn.get_text(" ", strip=True) if btn.name == "button" else btn.get("value", "")
         if looks_like_next(txt) or looks_like_next(btn.get("aria-label", "")):
             req = extract_form_request_from_element(btn, base_url)
             if req: return req
             
-    # URL params
     u = urlparse(base_url)
     qs = parse_qs(u.query)
     for k in ["page", "p", "pg", "start", "offset"]:
@@ -819,7 +709,6 @@ if st.button("🚀 Start Mission", type="primary"):
             st.stop()
         
         surnames_to_check = sorted_surnames[:int(max_cycles)]
-        # Split into chunks for each browser
         chunk_size = len(surnames_to_check) // num_browsers + 1
         chunks = [surnames_to_check[i:i + chunk_size] for i in range(0, len(surnames_to_check), chunk_size)]
         
@@ -865,7 +754,6 @@ if st.session_state.matches:
             else:
                 with st.spinner("🤖 AI is reviewing every name..."):
                     cleaned = batch_clean_with_ai(st.session_state.matches, api_key)
-                    # Sort: Valid (High Score -> Low) THEN Junk
                     cleaned.sort(key=lambda x: (x.get("Status") == "Junk (AI Flagged)", -x["Brazil Score"]))
                     st.session_state.matches = cleaned
                     st.success("Cleaning Complete!")
@@ -873,13 +761,14 @@ if st.session_state.matches:
 
     with col2:
         df = pd.DataFrame(st.session_state.matches)
-        
-        cols_config = {
-            "Brazil Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.1f"),
-            "Status": st.column_config.TextColumn("Status"),
-        }
-        
-        st.dataframe(df, column_config=cols_config, use_container_width=True)
+        st.dataframe(
+            df, 
+            column_config={
+                "Brazil Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.1f"),
+                "Status": st.column_config.TextColumn("Status"),
+            }, 
+            use_container_width=True
+        )
         
     c1, c2 = st.columns(2)
     with c1:
