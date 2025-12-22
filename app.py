@@ -22,18 +22,20 @@ from webdriver_manager.core.os_manager import ChromeType
 # ================================
 st.set_page_config(page_title="Universal Active Search Debugger", layout="wide", page_icon="🧪")
 st.title("🧪 Universal Active Search Debugger")
-st.caption("Probe → Detect → Decide → Extract (Form-aware, JS-shell-aware, CSE-tab-aware)")
+st.caption("Probe → Detect → Decide → Extract (Form-aware, JS-shell-aware, CSE-tab-aware: prefers People)")
 
 TARGET_URL = st.text_input("Target URL", "https://web.mit.edu/directory/")
 SURNAME = st.text_input("Test Surname", "oliveira")
 TIMEOUT = st.slider("Timeout (seconds)", 5, 30, 15)
 RUN = st.button("▶ Run Debugger", type="primary")
 
+
 # ================================
 # Logging
 # ================================
 def log(status, msg: str):
     status.write(msg)
+
 
 # ================================
 # JS shell detection
@@ -48,8 +50,9 @@ def is_js_shell(html: str) -> bool:
         return True
     return False
 
+
 # ================================
-# Discover search form
+# Discover search form (universal-ish)
 # ================================
 def discover_search_form(base_url: str, status) -> Optional[Dict[str, str]]:
     try:
@@ -108,13 +111,16 @@ def discover_search_form(base_url: str, status) -> Optional[Dict[str, str]]:
     action_url = urljoin(base_url, action)
     return {"action_url": action_url, "method": method, "query_param": qparam}
 
+
 def build_search_url(action_url: str, query_param: str, term: str) -> str:
     u = urlparse(action_url)
     qs = parse_qs(u.query)
     qs[query_param] = [term]
+    # MIT pattern: tab=directory. If not MIT, this is harmless.
     if "search" in u.path.lower() and "tab" not in qs:
-        qs["tab"] = ["directory"]  # MIT pattern
+        qs["tab"] = ["directory"]
     return u._replace(query=urlencode(qs, doseq=True)).geturl()
+
 
 # ================================
 # Selenium helpers
@@ -128,11 +134,14 @@ def get_driver():
     service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
     return webdriver.Chrome(service=service, options=opts)
 
+
 def selenium_wait_ready(driver, timeout=10):
     WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState") == "complete")
 
+
 def selenium_find_search_input(driver):
-    for sel in ["#es-search-form-input", "input[name='q']", "input[type='search']"]:
+    # Try known MIT selector + common search selectors
+    for sel in ["#es-search-form-input", "input[name='q']", "input[type='search']", "input[placeholder*='search' i]"]:
         els = driver.find_elements(By.CSS_SELECTOR, sel)
         if els:
             try:
@@ -140,7 +149,7 @@ def selenium_find_search_input(driver):
                     return els[0]
             except Exception:
                 pass
-    # fallback any input
+    # Fallback: any visible enabled input
     for el in driver.find_elements(By.TAG_NAME, "input"):
         try:
             if el.is_displayed() and el.is_enabled():
@@ -149,6 +158,7 @@ def selenium_find_search_input(driver):
             pass
     return None
 
+
 def selenium_submit_search(driver, inp, term):
     inp.click()
     inp.send_keys(Keys.CONTROL + "a")
@@ -156,50 +166,12 @@ def selenium_submit_search(driver, inp, term):
     inp.send_keys(term)
     inp.send_keys(Keys.RETURN)
 
+
 # ================================
-# CSE wait + tab logic
+# CSE wait + tab logic (KEY FIX: click PEOPLE)
 # ================================
-def cse_tab_labels(driver) -> List[str]:
-    out = []
-    for el in driver.find_elements(By.CSS_SELECTOR, ".gsc-tabsArea .gsc-tabHeader"):
-        try:
-            t = (el.text or "").strip()
-            if t:
-                out.append(t)
-        except Exception:
-            pass
-    return out
-
-def cse_active_tab_label(driver) -> str:
-    for el in driver.find_elements(By.CSS_SELECTOR, ".gsc-tabsArea .gsc-tabHeader.gsc-tabhActive"):
-        try:
-            t = (el.text or "").strip()
-            if t:
-                return t
-        except Exception:
-            pass
-    return ""
-
-def cse_click_tab(driver, want_keywords=("directory", "people")) -> bool:
-    tabs = driver.find_elements(By.CSS_SELECTOR, ".gsc-tabsArea .gsc-tabHeader")
-    for el in tabs:
-        try:
-            t = (el.text or "").strip().lower()
-            if any(k in t for k in want_keywords):
-                el.click()
-                return True
-        except Exception:
-            pass
-    return False
-
-def selenium_wait_for_cse_dom(driver, term: str, timeout: int, status, poll: float = 0.25):
-    """
-    Wait for CSE container, then results OR explicit no-results element.
-    """
+def selenium_wait_for_cse_container(driver, timeout: int, status, poll: float = 0.25) -> bool:
     start = time.time()
-    log(status, f"🧪 Waiting for CSE to load for '{term}'")
-
-    # wait for container
     while time.time() - start < timeout:
         elapsed = round(time.time() - start, 1)
         cse_controls = driver.find_elements(By.CSS_SELECTOR, ".gsc-control-cse, .gcse-searchresults, .gsc-results-wrapper-visible")
@@ -207,9 +179,49 @@ def selenium_wait_for_cse_dom(driver, term: str, timeout: int, status, poll: flo
             log(status, f"🧪 t={elapsed}s → CSE container detected ({len(cse_controls)})")
             return True
         time.sleep(poll)
-
     log(status, "🧪 TIMEOUT: CSE container never appeared")
     return False
+
+
+def cse_get_tabs(driver):
+    tabs = []
+    for el in driver.find_elements(By.CSS_SELECTOR, ".gsc-tabsArea .gsc-tabHeader"):
+        try:
+            label = (el.text or "").strip()
+            cls = el.get_attribute("class") or ""
+            active = "gsc-tabhActive" in cls
+            if label:
+                tabs.append({"el": el, "label": label, "active": active})
+        except Exception:
+            pass
+    return tabs
+
+
+def cse_click_preferred_tab(driver, status, prefer=("people", "directory")) -> bool:
+    tabs = cse_get_tabs(driver)
+    labels = [t["label"] for t in tabs]
+    active = next((t["label"] for t in tabs if t["active"]), "")
+    log(status, f"🧭 CSE tabs: {labels} | active='{active}'")
+
+    # Already on People/Directory?
+    if any(p in (active or "").lower() for p in prefer):
+        log(status, "🧭 Already on preferred tab.")
+        return True
+
+    # Try click in order: People first, then Directory
+    for want in prefer:
+        for t in tabs:
+            if want in (t["label"] or "").lower():
+                try:
+                    t["el"].click()
+                    log(status, f"🧭 Clicked tab '{t['label']}'")
+                    return True
+                except Exception as e:
+                    log(status, f"⚠ Failed clicking tab '{t['label']}': {e}")
+
+    log(status, "⚠ No People/Directory tab found to click.")
+    return False
+
 
 def selenium_wait_for_results_or_noresults(driver, timeout: int, status, poll: float = 0.25) -> Tuple[str, str]:
     start = time.time()
@@ -219,7 +231,7 @@ def selenium_wait_for_results_or_noresults(driver, timeout: int, status, poll: f
         results = driver.find_elements(By.CSS_SELECTOR, ".gsc-result, .gsc-webResult")
         nores = driver.find_elements(By.CSS_SELECTOR, ".gs-no-results-result, .gsc-no-results-result")
 
-        # light debug heartbeat
+        # Debug peek
         titles = driver.find_elements(By.CSS_SELECTOR, ".gsc-result .gs-title, .gsc-webResult .gs-title")
         peek = []
         for e in titles[:3]:
@@ -240,24 +252,30 @@ def selenium_wait_for_results_or_noresults(driver, timeout: int, status, poll: f
 
     return "timeout", driver.page_source or ""
 
+
 # ================================
-# Extraction: ONLY accept titles containing surname (debug-proof)
+# Extraction (debug-proof)
 # ================================
 def extract_cse_titles(html: str) -> List[str]:
     soup = BeautifulSoup(html or "", "html.parser")
     out: List[str] = []
-    for el in soup.select(".gsc-result .gs-title, .gsc-webResult .gs-title, .gsc-result .gs-title a, .gsc-webResult .gs-title a"):
+    for el in soup.select(
+        ".gsc-result .gs-title, .gsc-webResult .gs-title, "
+        ".gsc-result .gs-title a, .gsc-webResult .gs-title a"
+    ):
         t = (el.get_text(" ", strip=True) or "").strip()
         if t:
             out.append(t)
     return list(dict.fromkeys(out))
 
+
 def titles_containing_term(titles: List[str], term: str) -> List[str]:
     t = term.strip().lower()
     return [x for x in titles if t in x.lower()]
 
+
 # ================================
-# Universal engine
+# Universal engine (Requests probe -> Selenium CSE -> CLICK PEOPLE -> wait -> extract)
 # ================================
 def universal_active_search(start_url: str, term: str, timeout: int, status) -> Tuple[str, List[str], str]:
     log(status, "🔎 Discovering search form…")
@@ -278,22 +296,22 @@ def universal_active_search(start_url: str, term: str, timeout: int, status) -> 
         req_titles = extract_cse_titles(html)
         log(status, f"📦 Requests CSE titles: {len(req_titles)}")
 
+        # For MIT (and most CSE), requests is a shell: force Selenium
         if not html or is_js_shell(html):
             log(status, "⚠ Requests looks like JS shell → forcing Selenium")
             selenium_target = search_url
         else:
-            # If somehow not shell, still only show matching titles for debug sanity
             return "requests_form_search", titles_containing_term(req_titles, term), search_url
     else:
         selenium_target = start_url
 
-    # Selenium flow
     log(status, f"🤖 Selenium fallback starting at: {selenium_target}")
     driver = get_driver()
     try:
         driver.get(selenium_target)
         selenium_wait_ready(driver, timeout=10)
 
+        # If we landed on a page with an input, we can re-submit to be sure
         inp = selenium_find_search_input(driver)
         if inp:
             selenium_submit_search(driver, inp, term)
@@ -301,22 +319,14 @@ def universal_active_search(start_url: str, term: str, timeout: int, status) -> 
             log(status, "ℹ️ No search input found; continuing (URL may already include query)")
 
         # Wait for CSE container
-        ok = selenium_wait_for_cse_dom(driver, term, timeout, status)
-        if not ok:
+        if not selenium_wait_for_cse_container(driver, timeout, status):
             return "selenium_timeout_no_cse", [], driver.current_url
 
-        # Log tabs
-        labels = cse_tab_labels(driver)
-        active = cse_active_tab_label(driver)
-        log(status, f"🧭 CSE tabs: {labels} | active='{active}'")
-
-        # Try to click Directory/People tab if present AND not active
-        if labels:
-            if not any(k in (active or "").lower() for k in ("directory", "people")):
-                clicked = cse_click_tab(driver, want_keywords=("directory", "people"))
-                log(status, f"🧭 Clicked directory/people tab: {clicked}")
-                # small settle
-                time.sleep(0.3)
+        # ✅ KEY: click People tab (or Directory)
+        clicked = cse_click_preferred_tab(driver, status, prefer=("people", "directory"))
+        if clicked:
+            # Important: wait again after tab change
+            time.sleep(0.3)
 
         # Wait for results/no-results AFTER tab selection
         state, html = selenium_wait_for_results_or_noresults(driver, timeout, status)
@@ -324,15 +334,31 @@ def universal_active_search(start_url: str, term: str, timeout: int, status) -> 
         titles = extract_cse_titles(html)
         matching = titles_containing_term(titles, term)
 
-        log(status, f"📦 Selenium CSE titles: {len(titles)} | titles containing '{term}': {len(matching)} | state={state}")
+        # Debug: show active tab again
+        tabs = cse_get_tabs(driver)
+        active = next((t["label"] for t in tabs if t["active"]), "")
+        log(status, f"🧭 Active tab after click: '{active}'")
 
-        # IMPORTANT: only return matching items (so we stop lying with unrelated titles)
-        return "selenium_dom", (matching[:25]), driver.current_url
+        log(status, f"📦 Titles total={len(titles)} | containing '{term}'={len(matching)} | state={state}")
+
+        # ✅ Return only titles that contain the surname (debug-proof)
+        # If none, return a small sample for inspection
+        if matching:
+            return "selenium_people_tab", matching[:25], driver.current_url
+
+        sample = titles[:10]
+        if sample:
+            log(status, "⚠ No titles contained the surname on this tab; returning sample for inspection.")
+            return "selenium_people_tab_sample", sample, driver.current_url
+
+        return "selenium_people_tab_empty", [], driver.current_url
+
     finally:
         try:
             driver.quit()
         except Exception:
             pass
+
 
 # ================================
 # RUN
@@ -347,9 +373,9 @@ if RUN:
     st.subheader("🧠 Result")
     st.write(f"**Strategy used:** `{strategy}`")
     st.write(f"**URL used:** {used_url}")
-    st.write(f"**Matching items shown:** {len(items)}")
+    st.write(f"**Items shown:** {len(items)}")
 
     if items:
-        st.dataframe({"Matches (must contain surname)": items})
+        st.dataframe({"Items": items})
     else:
-        st.warning("No matching items. (This is good signal: it means we’re not accepting junk like 'Ascending Republic'.)")
+        st.warning("No items found.")
