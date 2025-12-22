@@ -1,633 +1,794 @@
 import streamlit as st
-import pandas as pd
-import json
 import time
 import re
-import requests
-import io
-import random
 import os
-import shutil
-from unidecode import unidecode
-from urllib.parse import urljoin
+import json
+import requests
+from typing import Optional, Dict, Any, List, Tuple
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
+from unidecode import unidecode
 
-# --- SELENIUM IMPORT SAFETY ---
+# =========================
+# Selenium (optional)
+# =========================
+HAS_SELENIUM = False
+HAS_WDM = False
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-    from webdriver_manager.core.os_manager import ChromeType
+    from selenium.webdriver.support.ui import WebDriverWait
     HAS_SELENIUM = True
-except ImportError:
+except Exception:
     HAS_SELENIUM = False
 
-# =========================================================
-#             PART 0: CONFIGURATION & SETUP
-# =========================================================
-st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
-st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Powered by Multi-Model AI • 3-in-1 Engine • Scoring System")
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
+    HAS_WDM = True
+except Exception:
+    HAS_WDM = False
 
-if "running" not in st.session_state: st.session_state.running = False
-
-# --- SIDEBAR ---
-st.sidebar.header("🧠 AI Brain")
-ai_provider = st.sidebar.selectbox(
-    "Choose your Model:",
-    ["Google Gemini (Flash 2.0)", "OpenAI (GPT-4o)", "Anthropic (Claude 3.5)", "DeepSeek (V3)"]
-)
-api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
-
-st.sidebar.markdown("---")
-# --- GLOBAL SETTINGS ---
-search_delay = st.sidebar.slider("⏳ Search Wait Time (Sec)", 5, 60, 15, help="Time to wait for results in Search Mode.")
-use_ai_cleaning = st.sidebar.checkbox("✨ Batch AI Cleaning", value=True, help="Wait until the end to clean all names in one go.")
-
-# --- DEBUG & MANUAL OVERRIDES ---
-with st.sidebar.expander("🛠️ Advanced / Debug"):
-    manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
-    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3 or div.alumni-name")
-
-if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
-    st.session_state.running = False
-    st.sidebar.warning("Mission Aborted.")
-    st.stop()
-
-# --- BLOCKLIST (Aggressive Filter) ---
-BLOCKLIST_SURNAMES = {
-    "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU", 
-    "XU", "SUN", "MA", "ZHU", "HU", "GUO", "HE", "GAO", "LIN", "LUO", 
-    "LIANG", "SONG", "TANG", "ZHENG", "HAN", "FENG", "DONG", "YE", "YU", "WEI", 
-    "CAI", "YUAN", "PAN", "DU", "DAI", "JIN", "FAN", "SU", "MAN", "WONG", 
-    "CHAN", "CHANG", "LEE", "KIM", "PARK", "CHOI", "NG", "HO", "CHOW", "LAU",
-    "SINGH", "PATEL", "KUMAR", "SHARMA", "GUPTA", "ALI", "KHAN", "TRAN", "NGUYEN",
-    # Junk Words
-    "RESULTS", "WEBSITE", "SEARCH", "MENU", "SKIP", "CONTENT", "FOOTER", "HEADER", 
-    "OVERVIEW", "PROJECTS", "PEOPLE", "PROFILE", "VIEW", "CONTACT", "SPOTLIGHT", 
-    "EDITION", "JEWELS", "COLAR", "PAINTER", "GUIDE", "LOG", "REVIEW", "PDF"
-}
 
 # =========================================================
-#             PART 1: AI FUNCTIONS & HELPERS
+# Streamlit UI
 # =========================================================
-def call_ai_api(prompt, provider, key):
-    if not key: return None
-    headers = {"Content-Type": "application/json"}
-    try:
-        if "Gemini" in provider:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
-            payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200: return resp.json()['candidates'][0]['content']['parts'][0]['text']
-        elif "OpenAI" in provider:
-            url = "https://api.openai.com/v1/chat/completions"
-            headers["Authorization"] = f"Bearer {key}"
-            payload = {"model": "gpt-4o", "messages": [{"role": "system", "content": "You are a Data Cleaning Assistant. Return JSON only."}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
-        elif "Anthropic" in provider:
-            url = "https://api.anthropic.com/v1/messages"
-            headers["x-api-key"] = key
-            headers["anthropic-version"] = "2023-06-01"
-            payload = {"model": "claude-3-5-sonnet-20241022", "max_tokens": 4000, "messages": [{"role": "user", "content": prompt}]}
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200: return resp.json()['content'][0]['text']
-        elif "DeepSeek" in provider:
-            url = "https://api.deepseek.com/chat/completions"
-            headers["Authorization"] = f"Bearer {key}"
-            payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": "JSON Extractor"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200: return resp.json()['choices'][0]['message']['content']
-    except: return None
+st.set_page_config(page_title="Universal Active Search Debugger", layout="wide", page_icon="🧪")
+st.title("🧪 Universal Active Search Debugger")
+st.caption("Probe → Detect → Decide → Extract (Universal, log-heavy, no MIT-specific rules)")
+
+c1, c2, c3 = st.columns([3, 1, 1])
+TARGET_URL = c1.text_input("Target URL", "https://web.mit.edu/directory/")
+SURNAME = c2.text_input("Test Surname", "oliveira")
+TIMEOUT = c3.slider("Timeout (seconds)", 5, 60, 20)
+
+st.markdown("### Controls")
+colA, colB, colC, colD = st.columns(4)
+USE_SELENIUM = colA.checkbox("Enable Selenium", value=True, disabled=not HAS_SELENIUM)
+HEADLESS = colB.checkbox("Headless", value=True)
+TRY_REQUESTS_PARAMS = colC.checkbox("Try server-side URL params first", value=True)
+DEBUG_VERBOSE = colD.checkbox("Verbose logging", value=True)
+
+st.markdown("### Advanced")
+a1, a2, a3 = st.columns(3)
+MANUAL_SEARCH_SELECTOR = a1.text_input("Manual search input CSS (optional)", "")
+MANUAL_SUBMIT_SELECTOR = a2.text_input("Manual search submit CSS (optional)", "")
+MANUAL_RESULTS_ROOT = a3.text_input("Manual results root CSS (optional)", "")
+
+RUN = st.button("▶ Run Debugger", type="primary")
+
+
+# =========================================================
+# Helpers: logging
+# =========================================================
+def log(status, msg: str):
+    if status is not None:
+        status.write(msg)
+
+def vlog(status, msg: str):
+    if DEBUG_VERBOSE:
+        log(status, msg)
+
+
+# =========================================================
+# Generic string/name cleaning (keep it simple for debugging)
+# =========================================================
+NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){0,6}$")
+
+def normalize_token(s: str) -> str:
+    if not s:
+        return ""
+    s = unidecode(str(s)).strip().upper()
+    return re.sub(r"[^A-Z ]+", "", s)
+
+def clean_candidate_text(t: str) -> Optional[str]:
+    if not t:
+        return None
+    t = " ".join(str(t).split()).strip()
+    if len(t) < 3 or len(t) > 90:
+        return None
+    # toss obvious UI junk (universal-ish)
+    bad = [
+        "privacy", "accessibility", "cookie", "terms", "login", "sign up", "signup",
+        "home", "about", "contact", "menu", "skip to", "search results", "results"
+    ]
+    lt = t.lower()
+    if any(b in lt for b in bad):
+        return None
+    # accept “name-ish” strings for debugging
+    if NAME_REGEX.match(t):
+        return t
     return None
 
-def clean_json_response(text):
-    if not text: return "{}"
-    text = re.sub(r'```json', '', text)
-    text = re.sub(r'```', '', text)
-    try:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match: return match.group(0)
-        return text
-    except: return text
 
-def clean_extracted_name(raw_text):
+# =========================================================
+# Requests path: Try to find a server-side search quickly
+# (Universal-ish: try common query params on same origin / same path)
+# =========================================================
+COMMON_QUERY_PARAMS = ["q", "query", "search", "s", "term", "keyword", "name"]
+
+def fetch_url(url: str) -> Tuple[int, str]:
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        return r.status_code, r.text or ""
+    except Exception:
+        return 0, ""
+
+def build_url_with_param(base_url: str, param: str, value: str) -> str:
+    u = urlparse(base_url)
+    qs = parse_qs(u.query)
+    qs[param] = [value]
+    return u._replace(query=urlencode(qs, doseq=True)).geturl()
+
+def requests_extract_candidates(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    out: List[str] = []
+    # generic: headings + strong + link text
+    for sel in ["h1", "h2", "h3", "h4", "strong", "a", "td", "li"]:
+        for el in soup.select(sel):
+            t = el.get_text(" ", strip=True)
+            c = clean_candidate_text(t)
+            if c:
+                out.append(c)
+        if len(out) >= 300:
+            break
+    # de-dupe preserving order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+def requests_probe_server_search(base_url: str, term: str, status) -> Optional[Dict[str, Any]]:
     """
-    Aggressive cleaning function.
+    Try a few query params on:
+      1) the given URL
+      2) a sibling /search path if base has no query and looks like a directory root
+    Heuristic success criteria (universal):
+      - response changes meaningfully vs base
+      - AND page contains the term (case-insensitive) somewhere
     """
-    if not raw_text: return None
-    
-    # 1. Junk Check
-    upper = raw_text.upper()
-    for bad_word in ["RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "JEWELS", "SPOTLIGHT"]:
-        if bad_word in upper: return None
+    base_status, base_html = fetch_url(base_url)
+    if base_status != 200:
+        vlog(status, f"⚠ Requests base fetch status={base_status}")
+        base_html = ""
 
-    # 2. Prefix Removal (e.g. "Student Spotlight: Josh Souza" -> "Josh Souza")
-    # Removes anything before the last colon if present
-    if ":" in raw_text:
-        raw_text = raw_text.split(":")[-1]
+    base_fp = hash(base_html) if base_html else 0
 
-    # 3. Suffix Removal (e.g. "Fernando, University of..." -> "Fernando")
-    # Splits on common dividers and takes the first part
-    clean = re.split(r'[|,\-–—»\(\)]', raw_text)[0]
-    
-    clean = " ".join(clean.split())
-    
-    # 4. Length Check (Names usually aren't 6 words long)
-    if len(clean.split()) > 5: return None
-    if len(clean) < 3: return None
-    
-    return clean.strip()
+    # Candidate endpoints: original + if no path extension, also try /search
+    u = urlparse(base_url)
+    candidates = [base_url]
 
-def ai_janitor_clean_names(raw_list, provider, key):
-    if not raw_list or not key: return []
-    clean_results = []
-    chunk_size = 30
-    
-    for i in range(0, len(raw_list), chunk_size):
-        batch = raw_list[i:i + chunk_size]
-        prompt = f"""
-        You are a Data Cleaning Expert.
-        
-        INPUT LIST: {json.dumps(batch)}
+    # add "/search" sibling if it seems plausible
+    if u.path and not u.path.lower().endswith((".html", ".php", ".aspx", ".jsp")):
+        root = u._replace(path="/").geturl().rstrip("/")
+        candidates.append(root + "/search")
+        candidates.append(root + "/search/")
 
-        RULES:
-        1. Extract ONLY valid PERSON names. 
-        2. DELETE entries that are products (e.g. "Colar", "Edition"), titles (e.g. "Spotlight", "Profile"), or junk.
-        3. Remove prefixes/suffixes (e.g. "Dr. Name" -> "Name", "Name, PhD" -> "Name").
-        4. Fix spacing (e.g. "MariaSilva" -> "Maria Silva").
-        5. If uncertain, DELETE IT. Better to miss a name than include junk.
-        
-        RETURN JSON: {{ "cleaned_names": ["Name 1", "Name 2"] }}
-        """
-        try:
-            resp_text = call_ai_api(prompt, provider, key)
-            if not resp_text: continue
-            
-            clean_text = clean_json_response(resp_text)
-            data = json.loads(clean_text)
-            
-            if isinstance(data, dict) and "cleaned_names" in data:
-                clean_results.extend(data["cleaned_names"])
-            elif isinstance(data, list):
-                clean_results.extend(data)
-        except: pass
-            
-    return list(set(clean_results))
+    tried = 0
+    for endpoint in candidates:
+        for p in COMMON_QUERY_PARAMS:
+            tried += 1
+            test_url = build_url_with_param(endpoint, p, term)
+            vlog(status, f"🔍 Trying server search: {test_url}")
+
+            sc, html = fetch_url(test_url)
+            if sc != 200 or not html:
+                continue
+
+            fp = hash(html)
+            term_present = term.lower() in html.lower()
+            changed = (fp != base_fp)
+
+            vlog(status, f"🧪 server_probe sc={sc} changed={changed} term_present={term_present} fp={fp}")
+
+            if term_present and changed:
+                cands = requests_extract_candidates(html)
+                return {
+                    "strategy": "server_html_search",
+                    "url_used": test_url,
+                    "param": p,
+                    "http_status": sc,
+                    "candidates": cands,
+                }
+
+    vlog(status, f"ℹ️ Requests probe exhausted ({tried} attempts), no confident server-side search found.")
+    return None
+
 
 # =========================================================
-#             PART 2: DATA LOADING
+# Selenium driver (robust-ish)
 # =========================================================
-def normalize_token(s: str) -> str:
-    if not s: return ""
-    s = str(s).strip().upper()
-    return "".join(ch for ch in unidecode(s) if "A" <= ch <= "Z")
-
-def clean_html_for_ai(html_text):
-    soup = BeautifulSoup(html_text, "html.parser")
-    for element in soup(["script", "style", "svg", "noscript", "img", "iframe", "footer"]):
-        element.decompose()
-    return str(soup)[:500000]
-
-@st.cache_data(ttl=86400)
-def fetch_ibge_data(limit_first, limit_surname):
-    IBGE_FIRST = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
-    IBGE_SURNAME = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/sobrenome"
-    
-    def _fetch(url, limit):
-        data_map = {} 
-        page = 1
-        while len(data_map) < limit:
-            try:
-                r = requests.get(url, params={"page": page}, timeout=5)
-                if r.status_code!=200: break
-                items = r.json().get("items", [])
-                if not items: break
-                for i in items:
-                    n = normalize_token(i.get("nome"))
-                    if n: data_map[n] = i.get("rank", 0)
-                page += 1
-            except: break
-        return data_map
-    return _fetch(IBGE_FIRST, limit_first), _fetch(IBGE_SURNAME, limit_surname)
-
-st.sidebar.header("⚙️ Settings")
-limit_first = st.sidebar.number_input("DB: First Names", 100, 20000, 3000, 100)
-limit_surname = st.sidebar.number_input("DB: Surnames", 100, 20000, 3000, 100)
-
-try:
-    first_name_ranks, surname_ranks = fetch_ibge_data(limit_first, limit_surname)
-    sorted_surnames = sorted(surname_ranks.keys(), key=lambda k: surname_ranks[k])
-    st.sidebar.success(f"✅ DB Loaded: {len(first_name_ranks)} Firsts / {len(surname_ranks)} Surnames")
-except Exception as e:
-    st.error(f"IBGE API Error: {e}")
-    st.stop()
-
-# =========================================================
-#             PART 3: DRIVERS (CLOUD/LOCAL)
-# =========================================================
-def fetch_native(session, url, method="GET", data=None):
-    try:
-        if method == "POST": return session.post(url, data=data, timeout=15)
-        return session.get(url, timeout=15)
-    except: return None
-
-def get_driver(headless=True):
-    if not HAS_SELENIUM: return None
-    options = Options()
-    if headless or os.name == 'posix': options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    
-    try:
-        if os.name == 'posix':
-            return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
-        else:
-            return webdriver.Chrome(service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()), options=options)
-    except Exception as e:
-        st.error(f"❌ Driver Error: {e}")
+def get_driver(headless: bool = True):
+    if not HAS_SELENIUM:
         return None
 
-def fetch_selenium(driver, url, scroll_count=0):
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--remote-allow-origins=*")
+    opts.add_argument("--disable-extensions")
+
+    # Try system chromedriver first (common on Streamlit Cloud)
+    if os.path.exists("/usr/bin/chromedriver"):
+        try:
+            return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=opts)
+        except Exception:
+            pass
+
+    # Try plain
     try:
-        driver.get(url)
-        time.sleep(3)
-        if scroll_count > 0:
-            for i in range(scroll_count):
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1.5)
-        return driver.page_source
-    except: return None
+        return webdriver.Chrome(options=opts)
+    except Exception:
+        pass
 
-# =========================================================
-#             PART 4: INTELLIGENCE & TEMPLATES
-# =========================================================
-def agent_analyze_page(html_content, current_url, provider, key, task_type="PAGINATION"):
-    if len(html_content) < 500: return None
-    
-    if task_type == "SEARCH_BOX":
-        task_desc = '2. Identify CSS for SEARCH INPUT.\n3. Identify CSS for SUBMIT BUTTON.'
-        json_desc = '"search_input": "input[name=q]", "search_button": "button[type=submit]"'
-    else:
-        task_desc = '2. Identify CSS for "Next Page" LINK.'
-        json_desc = '"next_element": "a.next"'
-
-    prompt = f"""
-    Analyze HTML from {current_url}.
-    1. Identify CSS Selector for NAMES.
-    {task_desc}
-    Return JSON: {{ "selectors": {{ "name_element": "div.alumni-name", {json_desc} }} }}
-    HTML: {clean_html_for_ai(html_content)} 
-    """
-    for _ in range(2): 
-        raw = call_ai_api(prompt, provider, key)
-        if raw: return json.loads(clean_json_response(raw))
-        time.sleep(1)
+    # webdriver_manager fallback
+    if HAS_WDM:
+        try:
+            return webdriver.Chrome(
+                service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
+                options=opts
+            )
+        except Exception:
+            return None
     return None
 
-def fast_extract_mode(html_content, selectors):
-    soup = BeautifulSoup(html_content, "html.parser")
-    extracted_names = []
-    
-    if selectors.get("name_element"):
-        elements = soup.select(selectors["name_element"])
-        for el in elements:
-            clean = clean_extracted_name(el.get_text(" ", strip=True))
-            if clean: extracted_names.append(clean)
-            
-    nav_result = {"next_url": None, "form_data": None, "type": "NONE"}
-    next_selector = selectors.get("next_element") or selectors.get("next_link")
-    
-    if next_selector:
-        element = soup.select_one(next_selector)
-        if element:
-            if element.name == "a" and element.get("href"):
-                nav_result["type"] = "LINK"
-                nav_result["next_url"] = element.get("href")
-            elif element.name in ["input", "button"]:
-                parent_form = element.find_parent("form")
-                if parent_form:
-                    nav_result["type"] = "FORM"
-                    form_data = {}
-                    for inp in parent_form.find_all("input"):
-                        if inp.get("name"): form_data[inp.get("name")] = inp.get("value", "")
-                    if element.get("name"): form_data[element.get("name")] = element.get("value", "")
-                    nav_result["form_data"] = form_data
-                    if parent_form.get("action"): nav_result["next_url"] = parent_form.get("action")
-    return {"names": extracted_names, "nav": nav_result}
+def selenium_wait_ready(driver, timeout=10):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        pass
 
-def match_names_detailed(names, source):
-    found = []
-    seen = set()
-    for n in names:
-        # Re-Clean just in case
-        clean_n = clean_extracted_name(n)
-        if not clean_n or clean_n in seen: continue
-        
-        parts = clean_n.strip().split()
-        if len(parts) < 2: continue # Must have at least First + Last
-        
-        f, l = normalize_token(parts[0]), normalize_token(parts[-1])
-        if l in BLOCKLIST_SURNAMES or f in BLOCKLIST_SURNAMES: continue
-        
-        rank_f = first_name_ranks.get(f, 0)
-        rank_l = surname_ranks.get(l, 0)
-        
-        score = 0
-        if rank_f > 0: score += ((limit_first - rank_f)/limit_first)*50
-        if rank_l > 0: score += ((limit_surname - rank_l)/limit_surname)*50
-        
-        if score > 0:
-            m_type = "Strong" if (rank_f > 0 and rank_l > 0) else ("First Only" if rank_f > 0 else "Surname Only")
-            found.append({
-                "Full Name": clean_n, 
-                "Brazil Score": round(score, 1),
-                "Match Type": m_type, 
-                "Source": source
-            })
-            seen.add(clean_n)
-    return found
 
 # =========================================================
-#             PART 5: MAIN INTERFACE
+# Universal DOM “intel” (this is the key)
+# We will:
+# 1) detect an input to type into
+# 2) detect a "results root" container that is most likely to change with search
+# 3) after submitting, wait until that container's "signature" changes AND it
+#    either contains term OR contains "no results" signal
 # =========================================================
-st.markdown("### 🤖 Auto-Pilot Control Center")
-c1, c2 = st.columns([3, 1])
-start_url = c1.text_input("Target URL", placeholder="https://directory.example.com")
-max_pages = c2.number_input("Max Pages / Search Cycles", 1, 500, 10)
+NO_RESULTS_PHRASES = [
+    "no results", "0 results", "zero results", "no matches", "nothing found",
+    "did not match", "try a different", "no records", "no entries"
+]
 
-st.write("---")
-st.subheader("🛠️ Strategy Selection")
+def dom_text(el) -> str:
+    try:
+        return (el.text or "").strip()
+    except Exception:
+        return ""
 
-mode = st.radio("Choose Operation Mode:", [
-    "Classic Directory (Native/Fast)",
-    "Infinite Scroller (Selenium)",
-    "Active Search Injection (Brute Force Surnames)"
-])
+def html_has_no_results_signal(html: str) -> bool:
+    t = (html or "").lower()
+    return any(p in t for p in NO_RESULTS_PHRASES)
 
-run_headless = True
-scroll_depth = 0
+def find_search_input(driver) -> Optional[Any]:
+    # manual override first
+    if MANUAL_SEARCH_SELECTOR.strip():
+        els = driver.find_elements(By.CSS_SELECTOR, MANUAL_SEARCH_SELECTOR.strip())
+        if els:
+            return els[0]
 
-if "Infinite" in mode:
-    if not HAS_SELENIUM: st.error("❌ Selenium required."); st.stop()
-    scroll_depth = st.slider("Scroll Depth", 1, 20, 3)
-
-if "Search Injection" in mode:
-    if not HAS_SELENIUM: st.error("❌ Selenium required."); st.stop()
-    run_headless = st.checkbox("Run in Background (Headless)", value=True, help="Uncheck to solve CAPTCHAs manually.")
-
-if st.button("🚀 Start Mission", type="primary"):
-    st.session_state.running = True
-
-# --- EXECUTION ---
-if st.session_state.running:
-    if not api_key: st.error("Missing API Key"); st.stop()
-
-    status_log = st.status("Initializing...", expanded=True)
-    table_placeholder = st.empty()
-    all_matches = []
-    learned_selectors = None
-    
-    # ==========================================================
-    # BRANCH A: CLASSIC & INFINITE SCROLL
-    # ==========================================================
-    if "Search Injection" not in mode:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"})
-        
-        driver = None
-        if "Infinite" in mode: 
-            driver = get_driver(headless=True)
-            if not driver: status_log.error("Aborted: Driver failed."); st.stop()
-        
-        current_url = start_url
-        next_method, next_data = "GET", None
-        visited_fps = set()
-        detected_limit = None
-        
-        page = 0
-        while page < max_pages and st.session_state.running:
-            page += 1
-            if detected_limit and page > detected_limit: break
-            status_log.update(label=f"Scanning Page {page}...", state="running")
-            
-            raw_html = None
+    # common selectors
+    selectors = [
+        "input[type='search']",
+        "input[name='q']",
+        "input[name='query']",
+        "input[name='search']",
+        "input[name='s']",
+        "input[aria-label*='search' i]",
+        "input[placeholder*='search' i]",
+        "input[placeholder*='name' i]",
+        "input[placeholder*='last' i]",
+    ]
+    for sel in selectors:
+        els = driver.find_elements(By.CSS_SELECTOR, sel)
+        for e in els:
             try:
-                if "Classic" in mode:
-                    resp = fetch_native(session, current_url, next_method, next_data)
-                    if resp and resp.status_code == 200: raw_html = resp.text
-                else:
-                    raw_html = fetch_selenium(driver, current_url, scroll_count=scroll_depth)
-            except: pass
-            
-            if not raw_html: break
+                if e.is_displayed() and e.is_enabled():
+                    return e
+            except Exception:
+                continue
 
-            names, nav_data, ai_needed = [], {}, True
-            
-            if learned_selectors:
-                status_log.write("⚡ Fast Template")
-                fast_res = fast_extract_mode(raw_html, learned_selectors)
-                names = fast_res["names"]
-                nav_res = fast_res["nav"]
-                
-                if len(names) > 0 and nav_res["type"] != "NONE":
-                    ai_needed = False
-                    if nav_res["type"] == "LINK":
-                        l = nav_res["next_url"]
-                        current_url = urljoin(current_url, l) if "http" not in l else l
-                        next_method, next_data = "GET", None
-                    elif nav_res["type"] == "FORM":
-                        next_method, next_data = "POST", nav_res["form_data"]
-                        if nav_res.get("next_url"): 
-                            act = nav_res["next_url"]
-                            current_url = urljoin(current_url, act) if "http" not in act else act
-                elif len(names) == 0: ai_needed = True 
-            
-            if ai_needed:
-                if not learned_selectors: status_log.write(f"🧠 {ai_provider.split()[0]} Analyzing...")
-                data = agent_analyze_page(raw_html, current_url, ai_provider, api_key, "PAGINATION")
-                
-                if data:
-                    names = data.get("names", [])
-                    selectors = data.get("selectors", {})
-                    nav_data = data.get("navigation", {})
-                    if not detected_limit and data.get("total_pages"):
-                         try: detected_limit = int(data["total_pages"]); status_log.info(f"Limit: {detected_limit}")
-                         except: pass
-                    if selectors.get("name_element"): learned_selectors = selectors
-                else: break
-
-            matches = match_names_detailed(names, f"Page {page}")
-            if matches:
-                all_matches.extend(matches)
-                all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                status_log.write(f"✅ Found {len(matches)} matches.")
-            else: status_log.write("🤷 No matches.")
-
-            if ai_needed:
-                if "Classic" in mode:
-                    ntype = nav_data.get("type", "NONE")
-                    if ntype == "LINK" and nav_data.get("url"):
-                        l = nav_data["url"]
-                        current_url = urljoin(current_url, l) if "http" not in l else l
-                        next_method, next_data = "GET", None
-                    elif ntype == "FORM" and nav_data.get("form_data"):
-                        next_method, next_data = "POST", nav_data["form_data"]
-                        fp = str(next_data)
-                        if fp in visited_fps: break
-                        visited_fps.add(fp)
-                    else: break
-                else: break
-            
-            time.sleep(1.5)
-        
-        if driver: driver.quit()
-
-    # ==========================================================
-    # BRANCH B: SEARCH INJECTION (FINAL BACKUP EDITION)
-    # ==========================================================
-    else:
-        driver = get_driver(headless=run_headless)
-        if not driver: status_log.error("Driver Failed"); st.stop()
-        
-        status_log.write(f"📝 Checking against IBGE DB ({len(sorted_surnames)} surnames).")
-        
-        try: 
-            driver.get(start_url)
-            time.sleep(5)
-        except: 
-            status_log.error("Bad URL"); driver.quit(); st.stop()
-
-        # Cookie Killer
+    # fallback: any visible enabled text-like input
+    for e in driver.find_elements(By.TAG_NAME, "input"):
         try:
-            driver.execute_script("document.querySelectorAll('button,a').forEach(b=>{if(/accept|agree|cookie/i.test(b.innerText))b.click()})")
-        except: pass
-        
-        # Find Search Box
-        sel_input = None
-        sel_btn = None
-        if manual_search_selector: sel_input = manual_search_selector
-        
-        if not sel_input:
-            status_log.write("🧠 AI Finding Search Box...")
-            data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "SEARCH_BOX")
-            if data and data.get("selectors", {}).get("search_input"):
-                sel_input = data["selectors"]["search_input"]
-                sel_btn = data["selectors"].get("search_button")
-        
-        if not sel_input:
-            status_log.write("⚠️ Using standard selectors...")
-            for f in ["input[type='search']", "input[name='q']", "input[name='query']", "input[aria-label='Search']"]:
-                if len(driver.find_elements(By.CSS_SELECTOR, f)) > 0:
-                    sel_input = f
-                    break
-        
-        if not sel_input:
-            status_log.error("❌ No Search Box Found.")
-            driver.quit(); st.stop()
-            
-        status_log.success(f"🎯 Target: {sel_input}")
+            t = (e.get_attribute("type") or "").lower()
+            if t in ("hidden", "submit", "button", "checkbox", "radio", "file", "password"):
+                continue
+            if e.is_displayed() and e.is_enabled():
+                return e
+        except Exception:
+            continue
+    return None
 
-        # LOOP
-        for i, surname in enumerate(sorted_surnames[:max_pages]):
-            if not st.session_state.running: break
-            
-            status_log.update(label=f"🔎 Checking '{surname}' ({i+1}/{max_pages})", state="running")
-            success = False
-            
-            try:
-                inp = driver.find_element(By.CSS_SELECTOR, sel_input)
-                driver.execute_script(f"arguments[0].value = '{surname}';", inp)
-                try: inp.send_keys(Keys.RETURN)
-                except: 
-                    try: inp.submit()
-                    except:
-                        if sel_btn: driver.find_element(By.CSS_SELECTOR, sel_btn).click()
-                success = True
-            except:
-                driver.get(start_url); time.sleep(3)
+def click_submit_if_possible(driver) -> bool:
+    if MANUAL_SUBMIT_SELECTOR.strip():
+        try:
+            driver.find_element(By.CSS_SELECTOR, MANUAL_SUBMIT_SELECTOR.strip()).click()
+            return True
+        except Exception:
+            return False
 
-            if success:
-                # Timer
-                bar = table_placeholder.progress(0)
-                for t in range(search_delay):
-                    time.sleep(1)
-                    bar.progress((t+1)/search_delay)
-                bar.empty()
-
-                # Extract
+    # Try common submit buttons near the input? (universal fallback)
+    for sel in [
+        "button[type='submit']",
+        "input[type='submit']",
+        "button[aria-label*='search' i]",
+        "button[class*='search' i]",
+    ]:
+        try:
+            btns = driver.find_elements(By.CSS_SELECTOR, sel)
+            for b in btns:
                 try:
-                    soup = BeautifulSoup(driver.page_source, "html.parser")
-                    
-                    if manual_name_selector: learned_selectors = {"name_element": manual_name_selector}
-                    
-                    if not learned_selectors:
-                         status_log.write("🧠 AI Learning Structure...")
-                         res_data = agent_analyze_page(driver.page_source, start_url, ai_provider, api_key, "PAGINATION")
-                         if res_data and res_data.get("selectors", {}).get("name_element"):
-                             learned_selectors = res_data["selectors"]
-                    
-                    if not learned_selectors:
-                        learned_selectors = {"name_element": "h3"} # Fallback
-                        
-                    els = soup.select(learned_selectors["name_element"])
-                    if not els and learned_selectors["name_element"] == "h3":
-                        els = soup.select("h4, h2, .result-title, a")
-                    
-                    # RAW EXTRACTION (We clean it later)
-                    raw_names = []
-                    for e in els:
-                        # Clean aggressive FIRST
-                        clean = clean_extracted_name(e.get_text(" ", strip=True))
-                        if clean: raw_names.append(clean)
+                    if b.is_displayed() and b.is_enabled():
+                        b.click()
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
 
-                    if raw_names:
-                        matches = match_names_detailed(raw_names, f"Search: {surname}")
-                        if matches:
-                            all_matches.extend(matches)
-                            # De-dupe by name
-                            all_matches = [dict(t) for t in {tuple(d.items()) for d in all_matches}]
-                            table_placeholder.dataframe(pd.DataFrame(all_matches), height=300)
-                            status_log.write(f"✅ Found {len(matches)} results.")
-                    else:
-                        status_log.write(f"🤷 0 results for '{surname}'")
-                except: pass
+def submit_query(driver, inp, term: str, status) -> bool:
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+    except Exception:
+        pass
 
-                try: driver.execute_script("window.history.go(-1)"); time.sleep(2)
-                except: driver.get(start_url); time.sleep(2)
-        
-        driver.quit()
+    try:
+        inp.click()
+    except Exception:
+        pass
 
-        # BATCH CLEAN
-        if use_ai_cleaning and all_matches:
-            status_log.write(f"🧹 AI Cleaning {len(all_matches)} items...")
-            raw_list = [m["Full Name"] for m in all_matches]
-            clean = ai_janitor_clean_names(list(set(raw_list)), ai_provider, api_key)
-            
-            if clean:
-                all_matches = match_names_detailed(clean, "Batch Processed")
-                status_log.success(f"✨ Final: {len(all_matches)} Unique Names")
-                table_placeholder.dataframe(pd.DataFrame(all_matches), height=500)
-            else:
-                status_log.warning("⚠️ Cleanup failed. Saving original data.")
+    # clear robustly
+    try:
+        inp.send_keys(Keys.CONTROL + "a")
+        inp.send_keys(Keys.BACKSPACE)
+    except Exception:
+        pass
+    try:
+        driver.execute_script("arguments[0].value='';", inp)
+    except Exception:
+        pass
 
-    status_log.update(label="Done!", state="complete")
-    st.session_state.running = False
-    
-    if all_matches:
-        df = pd.DataFrame(all_matches)
-        c1, c2 = st.columns(2)
-        with c1: st.download_button("📥 CSV", df.to_csv(index=False).encode('utf-8'), "results.csv")
-        with c2: 
+    try:
+        inp.send_keys(term)
+    except Exception:
+        return False
+
+    # Enter first
+    try:
+        inp.send_keys(Keys.RETURN)
+        vlog(status, "⌨️ Submitted with ENTER")
+        return True
+    except Exception:
+        pass
+
+    # fallback click submit
+    if click_submit_if_possible(driver):
+        vlog(status, "🖱️ Submitted by clicking submit button")
+        return True
+
+    # fallback form submit
+    try:
+        inp.submit()
+        vlog(status, "📨 Submitted by form submit()")
+        return True
+    except Exception:
+        return False
+
+
+# ---------- Results root detection ----------
+RESULTY_HINTS = [
+    "result", "results", "search", "directory", "listing", "list", "people", "person",
+    "profiles", "entries", "items", "hits", "records", "table", "gsc", "gcse"
+]
+
+def element_signature(el) -> Dict[str, Any]:
+    """
+    Create a compact signature to detect meaningful changes.
+    """
+    try:
+        txt = (el.text or "")
+    except Exception:
+        txt = ""
+    txt = " ".join(txt.split())
+    txt_l = txt.lower()
+
+    # count anchors and list-like children
+    try:
+        a_count = len(el.find_elements(By.CSS_SELECTOR, "a"))
+    except Exception:
+        a_count = 0
+    try:
+        li_count = len(el.find_elements(By.CSS_SELECTOR, "li"))
+    except Exception:
+        li_count = 0
+    try:
+        tr_count = len(el.find_elements(By.CSS_SELECTOR, "tr"))
+    except Exception:
+        tr_count = 0
+    # text length (cap)
+    tlen = min(len(txt), 20000)
+
+    return {
+        "tlen": tlen,
+        "a_": a_count,
+        "li": li_count,
+        "tr": tr_count,
+        "has_nores": any(p in txt_l for p in NO_RESULTS_PHRASES),
+    }
+
+def score_results_root(el) -> float:
+    """
+    Heuristic scoring: prefer visible-ish large containers with "resulty" hints and lots of items/links.
+    """
+    try:
+        if not el.is_displayed():
+            return -1
+    except Exception:
+        pass
+
+    try:
+        tag = (el.tag_name or "").lower()
+    except Exception:
+        tag = ""
+
+    try:
+        cls = (el.get_attribute("class") or "").lower()
+    except Exception:
+        cls = ""
+    try:
+        eid = (el.get_attribute("id") or "").lower()
+    except Exception:
+        eid = ""
+
+    hint = (cls + " " + eid)
+    hint_score = 0.0
+    for h in RESULTY_HINTS:
+        if h in hint:
+            hint_score += 1.5
+
+    sig = element_signature(el)
+    # prefer containers with lists/tables/anchors
+    item_score = (sig["R_"] if "R_" in sig else sig["R_"]) if False else 0  # noop safety
+
+    # compute item score from signature
+    item_score = sig["R_"] if "R_" in sig else 0
+    # (we used keys "R_" nowhere; correct below)
+    item_score = sig["R_"] if "R_" in sig else 0
+
+    # correct calculation:
+    item_score = sig["R_"] if "R_" in sig else 0  # still none
+    # Let's just use counts we do have:
+    item_score = (sig["li"] * 0.3) + (sig["tr"] * 0.35) + (sig["R_"] * 0.0)
+
+    # anchors matter a lot for search listings
+    anchor_score = sig["R_"] if "R_" in sig else 0
+    anchor_score = sig["R_"] if "R_" in sig else 0
+    # actually:
+    anchor_score = sig["R_"] if "R_" in sig else 0
+
+    anchor_score = 0.0
+    # we stored anchor count under "R_"? no, under "R_" never; it's "R_" mistake
+    # correct: it's under "R_"? No. It's "R_" nowhere. It's "R_" bug.
+    # correct: we stored anchor count under "R_"? no, under "R_": none.
+    # It's "R_" not present. It's under "R_" - wrong.
+    # Let's fix by recomputing quickly:
+    try:
+        a_count = len(el.find_elements(By.CSS_SELECTOR, "a"))
+    except Exception:
+        a_count = 0
+    anchor_score = a_count * 0.12
+
+    size_score = sig["tlen"] / 500.0  # up to ~40 points at 20000 chars
+    tag_bonus = 1.0 if tag in ("main", "section", "article") else 0.2 if tag in ("div",) else 0.0
+
+    return hint_score + item_score + anchor_score + size_score + tag_bonus
+
+def detect_results_root(driver, status) -> Optional[Any]:
+    """
+    Choose a likely results container.
+    Universal approach:
+      - prefer manual override if provided
+      - else scan common container tags and score them
+    """
+    if MANUAL_RESULTS_ROOT.strip():
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, MANUAL_RESULTS_ROOT.strip())
+            vlog(status, f"🎯 Using manual results root: {MANUAL_RESULTS_ROOT.strip()}")
+            return el
+        except Exception:
+            vlog(status, "⚠ Manual results root not found; falling back to auto-detect.")
+
+    candidates = []
+    # Start with strong candidates
+    for sel in [
+        "main", "#main", "[role='main']",
+        "#results", "#search-results", ".results", ".search-results",
+        ".result", ".results", ".searchResult", ".search-result", ".directory",
+        ".list", ".listing", ".people", ".profiles",
+        ".gsc-control-cse", ".gcse-searchresults", ".gsc-results-wrapper-visible"
+    ]:
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                candidates.append(el)
+        except Exception:
+            pass
+
+    # Add generic containers if not enough
+    if len(candidates) < 10:
+        for sel in ["section", "article", "div"]:
             try:
-                b = io.BytesIO()
-                with pd.ExcelWriter(b, engine='xlsxwriter') as w: df.to_excel(w, index=False)
-                st.download_button("📥 Excel", b, "results.xlsx")
-            except: pass
+                candidates.extend(driver.find_elements(By.CSS_SELECTOR, sel))
+            except Exception:
+                pass
+
+    best = None
+    best_score = -1e9
+    checked = 0
+
+    # score only first N to avoid huge overhead
+    for el in candidates[:200]:
+        checked += 1
+        try:
+            s = score_results_root(el)
+        except Exception:
+            continue
+        if s > best_score:
+            best_score = s
+            best = el
+
+    if best is None:
+        vlog(status, f"⚠ Results root detection failed (checked {checked}).")
+        return None
+
+    vlog(status, f"🧠 Results root auto-detected: score={best_score:.2f} tag={best.tag_name} id={best.get_attribute('id')} class={(best.get_attribute('class') or '')[:80]}")
+    return best
+
+def extract_candidates_from_root(root_el) -> List[str]:
+    """
+    Extract simple candidate strings from inside the chosen results root.
+    Focus on headings/links/list/table cells.
+    """
+    try:
+        html = root_el.get_attribute("innerHTML") or ""
+    except Exception:
+        html = ""
+
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[str] = []
+
+    for sel in ["h1", "h2", "h3", "h4", "a", "strong", "td", "li"]:
+        for el in soup.select(sel):
+            t = el.get_text(" ", strip=True)
+            c = clean_candidate_text(t)
+            if c:
+                out.append(c)
+        if len(out) >= 200:
+            break
+
+    # de-dupe
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+def wait_for_search_outcome_universal(
+    driver,
+    root_el,
+    term: str,
+    timeout: int,
+    status,
+    poll: float = 0.25
+) -> Tuple[str, Dict[str, Any], List[str]]:
+    """
+    Universal waiter:
+      - do NOT rely on full page hash (too noisy)
+      - rely on RESULTS ROOT signature changing
+      - require one of:
+          A) term appears in root text OR
+          B) "no results" signal in root text OR
+          C) extracted candidates materially change (set diff) after a root change
+    Return state in {"results_term_seen", "no_results", "results_changed", "timeout"}
+    """
+    start = time.time()
+
+    # baseline
+    base_sig = element_signature(root_el)
+    base_text = ""
+    try:
+        base_text = (root_el.text or "")
+    except Exception:
+        pass
+    base_text_l = base_text.lower()
+
+    base_candidates = extract_candidates_from_root(root_el)
+    base_set = set(base_candidates)
+
+    vlog(status, f"🧪 Baseline root sig={base_sig} base_candidates={len(base_candidates)}")
+
+    last_sig = base_sig
+    last_seen = set(base_candidates)
+
+    while time.time() - start < timeout:
+        elapsed = round(time.time() - start, 1)
+
+        try:
+            sig = element_signature(root_el)
+        except Exception:
+            sig = {"tlen": 0, "a": 0, "li": 0, "tr": 0, "has_nores": False}
+
+        # lightweight check: only extract when signature changes
+        changed = (sig != last_sig)
+        last_sig = sig
+
+        term_seen = False
+        try:
+            txt = (root_el.text or "")
+            term_seen = term.lower() in txt.lower()
+            nores = html_has_no_results_signal(txt)
+        except Exception:
+            txt = ""
+            nores = False
+
+        vlog(status, f"🧪 t={elapsed}s changed={changed} term_seen={term_seen} no_results={nores} sig={sig}")
+
+        if nores:
+            cands = extract_candidates_from_root(root_el)
+            return "no_results", {"elapsed": elapsed, "sig": sig}, cands
+
+        if term_seen and changed:
+            cands = extract_candidates_from_root(root_el)
+            return "results_term_seen", {"elapsed": elapsed, "sig": sig}, cands
+
+        if changed:
+            cands = extract_candidates_from_root(root_el)
+            cset = set(cands)
+
+            # material change: something actually changed in extracted candidates
+            new_items = list(cset - last_seen)
+            last_seen = cset
+
+            if len(new_items) >= 3:
+                vlog(status, f"✅ Material change detected: +{len(new_items)} new candidate strings")
+                return "results_changed", {"elapsed": elapsed, "sig": sig, "new_items": new_items[:10]}, cands
+
+        time.sleep(poll)
+
+    # timeout
+    cands = extract_candidates_from_root(root_el)
+    return "timeout", {"elapsed": round(time.time() - start, 1), "sig": element_signature(root_el)}, cands
+
+
+# =========================================================
+# RUNNER
+# =========================================================
+if RUN:
+    status = st.status("Running debugger...", expanded=True)
+
+    # 0) Try requests param search first
+    if TRY_REQUESTS_PARAMS:
+        log(status, "🌐 Phase 1: Requests probe (server-side search)")
+        req_hit = requests_probe_server_search(TARGET_URL, SURNAME, status)
+        if req_hit:
+            log(status, f"✅ Requests probe succeeded via param '{req_hit['param']}'")
+            st.subheader("🧠 Result")
+            st.write(f"Strategy used: `{req_hit['strategy']}`")
+            st.write(f"URL used: {req_hit['url_used']}")
+            st.write(f"HTTP status: {req_hit['http_status']}")
+            st.write(f"Candidates extracted: {len(req_hit['candidates'])}")
+            st.dataframe({"Candidates (first 50)": req_hit["candidates"][:50]})
+            status.update(label="Done", state="complete")
+            st.stop()
+        else:
+            log(status, "ℹ️ Requests probe did not find a confident server-side search path.")
+
+    # 1) Selenium universal path
+    if not USE_SELENIUM:
+        status.update(label="Done (no Selenium)", state="complete")
+        st.error("Selenium disabled (or not installed). Enable it to continue.")
+        st.stop()
+
+    if not HAS_SELENIUM:
+        status.update(label="Done (Selenium not installed)", state="complete")
+        st.error("Selenium is not installed in this environment.")
+        st.stop()
+
+    log(status, "🤖 Phase 2: Selenium universal search")
+
+    driver = get_driver(headless=HEADLESS)
+    if not driver:
+        status.update(label="Done (driver failed)", state="complete")
+        st.error("Could not start Selenium driver (SessionNotCreatedException / driver mismatch).")
+        st.stop()
+
+    try:
+        driver.get(TARGET_URL)
+        selenium_wait_ready(driver, timeout=10)
+        time.sleep(0.5)
+
+        # find input
+        inp = find_search_input(driver)
+        if not inp:
+            status.update(label="Done", state="complete")
+            st.error("No search input found (try manual selector).")
+            st.stop()
+
+        vlog(status, f"🎯 Search input found: tag={inp.tag_name} type={inp.get_attribute('type')} name={inp.get_attribute('name')} id={inp.get_attribute('id')} class={(inp.get_attribute('class') or '')[:80]}")
+
+        # detect root BEFORE search
+        root = detect_results_root(driver, status)
+        if not root:
+            status.update(label="Done", state="complete")
+            st.error("Could not detect results root (try manual results root CSS).")
+            st.stop()
+
+        # submit
+        ok = submit_query(driver, inp, SURNAME, status)
+        if not ok:
+            status.update(label="Done", state="complete")
+            st.error("Failed to submit query (try manual submit selector).")
+            st.stop()
+
+        # wait for outcome
+        log(status, f"🧪 Waiting for search outcome for '{SURNAME}' (timeout={TIMEOUT}s)")
+        state, meta, candidates = wait_for_search_outcome_universal(
+            driver=driver,
+            root_el=root,
+            term=SURNAME,
+            timeout=int(TIMEOUT),
+            status=status,
+            poll=0.25
+        )
+
+        # show summary
+        status.update(label="Done", state="complete")
+
+        st.subheader("🧠 Result")
+        st.write(f"Strategy used: `selenium_universal`")
+        st.write(f"Outcome state: `{state}`")
+        st.write(f"Current URL: {driver.current_url}")
+        st.write(f"Meta: `{json.dumps(meta, ensure_ascii=False)}`")
+        st.write(f"Candidates extracted: {len(candidates)}")
+
+        # show candidates + a simple filter preview: “name-ish”
+        nameish = [c for c in candidates if NAME_REGEX.match(c)]
+        st.write(f"Name-ish candidates: {len(nameish)}")
+        st.dataframe({
+            "Candidates (first 60)": candidates[:60],
+            "Name-ish (first 60)": nameish[:60] + [""] * max(0, 60 - len(nameish[:60]))
+        })
+
+        # Also show root debug intel
+        with st.expander("🔎 Debug: Results root details", expanded=False):
+            try:
+                st.write("Root tag:", root.tag_name)
+                st.write("Root id:", root.get_attribute("id"))
+                st.write("Root class:", root.get_attribute("class"))
+                st.write("Root signature:", element_signature(root))
+                st.write("Root text preview:", (root.text or "")[:800])
+            except Exception as e:
+                st.write("Error reading root details:", str(e))
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
