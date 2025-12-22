@@ -175,45 +175,37 @@ def selenium_wait_for_search_outcome(
 ) -> Tuple[str, str, List[str]]:
 
     start = time.time()
+    target = surname.upper()
 
-    baseline_html = driver.page_source or ""
-    baseline_names = set(extract_names_multi(baseline_html))
-
-    debug_log(
-        status_log,
-        f"[{surname}] baseline names={len(baseline_names)}"
-    )
+    debug_log(status_log, f"[{surname}] waiting for names containing '{target}'")
 
     while (time.time() - start) < timeout:
         html = driver.page_source or ""
         elapsed = round(time.time() - start, 1)
 
         names = extract_names_multi(html)
-        name_set = set(names)
 
-        names_changed = name_set != baseline_names
-        no_results = page_has_no_results_signal(html, names)
+        # 🔑 CORE LOGIC: surname containment
+        matching = [
+            n for n in names
+            if target in n.upper().split()
+            or n.upper().endswith(f" {target}")
+        ]
 
         debug_log(
             status_log,
             f"[{surname}] t={elapsed}s "
-            f"names={len(names)} "
-            f"changed={names_changed} "
-            f"no_results={no_results}"
+            f"total_names={len(names)} "
+            f"matches={len(matching)}"
         )
 
-        # ✅ ONLY succeed if names CHANGE
-        if names_changed:
-            return "names_changed", html, names
-
-        # explicit empty state (rare on MIT, but keep it)
-        if no_results:
-            return "no_results", html, []
+        if matching:
+            return "surname_match", html, matching
 
         time.sleep(poll_s)
 
-    debug_log(status_log, f"[{surname}] TIMEOUT")
-    return "timeout", html, names
+    debug_log(status_log, f"[{surname}] TIMEOUT — no matching names")
+    return "timeout", html, []
 
 
 # =========================================================
