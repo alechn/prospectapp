@@ -8,6 +8,7 @@ import io
 import os
 import subprocess
 import sys
+import concurrent.futures  # ADDED: For parallel processing
 from typing import Optional, Dict, Any, List, Tuple
 from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
@@ -47,7 +48,7 @@ except Exception:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Universal Scraper • IBGE Scoring • AI Cleaning • Auto-Driver Fix")
+st.caption("Universal Scraper • Parallel Active Search • AI Cleaning • Auto-Driver Fix")
 
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -69,8 +70,12 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 st.sidebar.markdown("---")
-st.sidebar.header("🛰️ Networking")
-search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 20, 3)
+st.sidebar.header("🚀 Performance")
+# ADDED: Parallel Browsers Slider
+num_browsers = st.sidebar.slider("⚡ Parallel Browsers (Active Search)", 1, 5, 1, 
+    help="Opens multiple Chrome instances to search different surnames simultaneously.")
+
+search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 30, 15)
 use_browserlike_tls = st.sidebar.checkbox("Use browser-like requests (curl_cffi)", value=False)
 if use_browserlike_tls and not HAS_CURL:
     st.sidebar.warning("curl_cffi not installed; falling back to requests.")
@@ -87,6 +92,8 @@ with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
     manual_search_button = st.text_input("Manual Search Button Selector", placeholder="e.g. button[type='submit']")
     manual_search_param = st.text_input("Manual Search Param (URL mode)", placeholder="e.g. q or query")
+    # ADDED: No Results Text Selector
+    manual_no_results = st.text_input("No Results Text", placeholder="e.g. 'No matching records found'")
     debug_show_candidates = st.checkbox("Debug: show extracted candidates", value=False)
 
 st.sidebar.markdown("---")
@@ -409,95 +416,6 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
 
 
 # =========================================================
-#             PAGINATION (Classic Mode)
-# =========================================================
-def extract_form_request_from_element(el, current_url: str) -> Optional[Dict[str, Any]]:
-    if el is None or el.name not in ("button", "input"):
-        return None
-    form = el.find_parent("form")
-    if not form:
-        return None
-
-    method = (form.get("method") or "GET").upper()
-    action = form.get("action") or current_url
-    url = urljoin(current_url, action)
-
-    data: Dict[str, str] = {}
-    for inp in form.find_all("input"):
-        nm = inp.get("name")
-        if nm:
-            data[nm] = inp.get("value", "")
-
-    btn_name = el.get("name")
-    if btn_name:
-        data[btn_name] = el.get("value", "")
-
-    if method == "GET":
-        u = urlparse(url)
-        qs = parse_qs(u.query)
-        for k, v in data.items():
-            qs[k] = [v]
-        url = u._replace(query=urlencode(qs, doseq=True)).geturl()
-        return {"method": "GET", "url": url, "data": None}
-
-    return {"method": "POST", "url": url, "data": data}
-
-def find_next_request_heuristic(html: str, current_url: str, manual_next: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    soup = BeautifulSoup(html, "html.parser")
-    base = soup.find("base", href=True)
-    base_url = base["href"] if base else current_url
-
-    if manual_next:
-        el = soup.select_one(manual_next)
-        if el:
-            if el.name == "a" and el.get("href"):
-                return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
-            if el.name in ("button", "input"):
-                req = extract_form_request_from_element(el, base_url)
-                if req: return req
-
-    el = soup.select_one("a[rel='next'][href]")
-    if el:
-        return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
-
-    next_texts = {"next", "next page", "older", ">", "›", "»", "more"}
-    for a in soup.select("a[href]"):
-        t = (a.get_text(" ", strip=True) or "").strip().lower()
-        aria = (a.get("aria-label") or "").strip().lower()
-        if t in next_texts or aria in next_texts or "next" in aria:
-            return {"method": "GET", "url": urljoin(base_url, a["href"]), "data": None}
-
-    def looks_like_next(s: str) -> bool:
-        s = (s or "").strip().lower()
-        return (s in next_texts) or ("next" in s) or ("more" in s)
-
-    for btn in soup.find_all(["button", "input"]):
-        if btn.name == "button":
-            if looks_like_next(btn.get_text(" ", strip=True)) or looks_like_next(btn.get("aria-label", "")):
-                req = extract_form_request_from_element(btn, base_url)
-                if req: return req
-        else:
-            t = btn.get("value", "") or btn.get("aria-label", "") or ""
-            if looks_like_next(t):
-                req = extract_form_request_from_element(btn, base_url)
-                if req: return req
-    
-    # URL Query param heuristics
-    u = urlparse(base_url)
-    qs = parse_qs(u.query)
-    for k in ["page", "p", "pg", "start", "offset"]:
-        if k in qs:
-            try:
-                val = int(qs[k][0])
-                qs[k] = [str(val + 1)]
-                return {"method": "GET", "url": u._replace(query=urlencode(qs, doseq=True)).geturl(), "data": None}
-            except Exception:
-                pass
-
-    return None
-
-
-# =========================================================
 #             DRIVER MANAGEMENT (FIXED: WDM + Fallback)
 # =========================================================
 def get_driver(headless: bool = True):
@@ -551,30 +469,67 @@ def selenium_wait_document_ready(driver, timeout: int = 10):
     except Exception:
         pass
 
-def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = None):
-    selenium_wait_document_ready(driver, min(5, timeout))
-    time.sleep(1.5) # Forced pause for JS rendering
+# =========================================================
+#             SMART WAIT LOGIC (NEW)
+# =========================================================
+def smart_search_wait(driver, timeout: int, name_selector: Optional[str] = None):
+    """
+    Waits until:
+    1. The name selector appears (SUCCESS)
+    2. OR 'No results' text appears (STOP)
+    3. OR The DOM stabilizes (for pages with no clear signals)
+    """
+    start_time = time.time()
+    last_source_len = 0
+    stable_count = 0
     
-    if name_selector:
+    # Text triggers that mean "Stop waiting, there is nothing here"
+    negative_triggers = ["no results", "not found", "0 results", "no matches", "search returned no", "try again"]
+    if manual_no_results:
+        negative_triggers.append(manual_no_results.lower())
+
+    while (time.time() - start_time) < timeout:
+        # 1. Check for Matches (Success)
+        if name_selector:
+            try:
+                if len(driver.find_elements(By.CSS_SELECTOR, name_selector)) > 0:
+                    time.sleep(0.5) # Allow render to finish
+                    return True
+            except: pass
+        
+        # 2. Check for "No Results" (Failure)
         try:
-            WebDriverWait(driver, timeout).until(
-                lambda d: len(d.find_elements(By.CSS_SELECTOR, name_selector)) > 0
-            )
-            return
-        except Exception:
-            pass
+            body_text = driver.find_element(By.TAG_NAME, "body").text.lower()[:10000] 
+            if any(trig in body_text for trig in negative_triggers):
+                return False # Stop waiting immediately
+        except: pass
 
-    # Generic result waiter
-    common = [".search-results", "#search-results", "table tr", "ul li", ".result", ".person", ".profile"]
-    for s in common:
-        if len(driver.find_elements(By.CSS_SELECTOR, s)) > 0:
-            return
+        # 3. DOM Stabilization (Wait for AJAX to finish)
+        try:
+            current_len = len(driver.page_source)
+            if current_len == last_source_len:
+                stable_count += 1
+            else:
+                stable_count = 0
+            last_source_len = current_len
+            
+            # If page hasn't changed size for 2.0 seconds and we are at least 2.5s in
+            if stable_count > 4 and (time.time() - start_time) > 2.5:
+                 # If we have a selector, keep waiting a bit longer. If NOT, assume load is done.
+                 if not name_selector: 
+                     return True
+        except: pass
+
+        time.sleep(0.5)
     
-    time.sleep(1.5) 
+    return False
 
+def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = None):
+    # Wrapper for legacy calls, mapped to new smart wait
+    smart_search_wait(driver, timeout, name_selector)
 
 # =========================================================
-#             ACTIVE SEARCH: FIXED LOGIC
+#             ACTIVE SEARCH UTILS
 # =========================================================
 def selenium_find_search_input(driver) -> Optional[str]:
     if manual_search_selector and len(driver.find_elements(By.CSS_SELECTOR, manual_search_selector)) > 0:
@@ -617,7 +572,7 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
 
 
 # =========================================================
-#             AI CLEANING AGENT (NEW)
+#             AI CLEANING AGENT
 # =========================================================
 def batch_clean_with_ai(matches, api_key):
     if not api_key:
@@ -663,12 +618,150 @@ def batch_clean_with_ai(matches, api_key):
 
 
 # =========================================================
-#             MAIN UI
+#             PAGINATION UTILS (CLASSIC)
+# =========================================================
+def extract_form_request_from_element(el, current_url: str) -> Optional[Dict[str, Any]]:
+    if el is None or el.name not in ("button", "input"): return None
+    form = el.find_parent("form")
+    if not form: return None
+    method = (form.get("method") or "GET").upper()
+    action = form.get("action") or current_url
+    url = urljoin(current_url, action)
+    data: Dict[str, str] = {}
+    for inp in form.find_all("input"):
+        nm = inp.get("name")
+        if nm: data[nm] = inp.get("value", "")
+    btn_name = el.get("name")
+    if btn_name: data[btn_name] = el.get("value", "")
+    if method == "GET":
+        u = urlparse(url)
+        qs = parse_qs(u.query)
+        for k, v in data.items(): qs[k] = [v]
+        url = u._replace(query=urlencode(qs, doseq=True)).geturl()
+        return {"method": "GET", "url": url, "data": None}
+    return {"method": "POST", "url": url, "data": data}
+
+def find_next_request_heuristic(html: str, current_url: str, manual_next: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+    base = soup.find("base", href=True)
+    base_url = base["href"] if base else current_url
+    if manual_next:
+        el = soup.select_one(manual_next)
+        if el:
+            if el.name == "a" and el.get("href"): return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
+            if el.name in ("button", "input"): 
+                req = extract_form_request_from_element(el, base_url)
+                if req: return req
+    el = soup.select_one("a[rel='next'][href]")
+    if el: return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
+    
+    next_texts = {"next", "next page", "older", ">", "›", "»", "more"}
+    def looks_like_next(s: str) -> bool:
+        s = (s or "").strip().lower()
+        return (s in next_texts) or ("next" in s) or ("more" in s)
+        
+    for a in soup.select("a[href]"):
+        if looks_like_next(a.get_text(" ", strip=True)) or looks_like_next(a.get("aria-label", "")):
+            return {"method": "GET", "url": urljoin(base_url, a["href"]), "data": None}
+    
+    # Check buttons
+    for btn in soup.find_all(["button", "input"]):
+        txt = btn.get_text(" ", strip=True) if btn.name == "button" else btn.get("value", "")
+        if looks_like_next(txt) or looks_like_next(btn.get("aria-label", "")):
+            req = extract_form_request_from_element(btn, base_url)
+            if req: return req
+            
+    # URL params
+    u = urlparse(base_url)
+    qs = parse_qs(u.query)
+    for k in ["page", "p", "pg", "start", "offset"]:
+        if k in qs:
+            try:
+                val = int(qs[k][0])
+                qs[k] = [str(val + 1)]
+                return {"method": "GET", "url": u._replace(query=urlencode(qs, doseq=True)).geturl(), "data": None}
+            except: pass
+    return None
+
+
+# =========================================================
+#             WORKER FUNCTION (PARALLEL)
+# =========================================================
+def worker_search_batch(surnames_chunk, url, selector, search_sel, headless):
+    """
+    Independent worker that opens one browser and processes a list of surnames
+    """
+    driver = get_driver(headless=headless)
+    if not driver: 
+        # Selenium failed, return empty to trigger fallback logic if needed
+        return []
+    
+    results = []
+    seen = set()
+    
+    try:
+        for surname in surnames_chunk:
+            html = None
+            try:
+                driver.get(url)
+                
+                # 1. Find & Fill Search
+                inp = None
+                search_selectors = [search_sel] if search_sel else ["input[type='search']", "input[name='q']", "input[name='search']", "input[aria-label='Search']"]
+                
+                for s in search_selectors:
+                    if not s: continue
+                    try:
+                        inp = driver.find_element(By.CSS_SELECTOR, s)
+                        if inp: break
+                    except: pass
+                
+                if inp:
+                    # Clear and type
+                    driver.execute_script("arguments[0].value = '';", inp)
+                    inp.send_keys(surname)
+                    inp.send_keys(Keys.RETURN)
+                    
+                    # 2. Smart Wait (The upgraded logic)
+                    found_something = smart_search_wait(driver, timeout=20, name_selector=selector)
+                    
+                    # 3. Extract
+                    html = driver.page_source
+            except Exception:
+                pass # Continue to next surname even if one crashes
+            
+            # --- FALLBACK REQUESTS IF SELENIUM FAILED TO GET HTML ---
+            if not html:
+                try:
+                    u = urlparse(url)
+                    qs = parse_qs(u.query)
+                    qs[manual_search_param or "q"] = [surname]
+                    cand = u._replace(query=urlencode(qs, doseq=True)).geturl()
+                    r = requests.get(cand, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                    if r.status_code == 200: html = r.text
+                except: pass
+
+            if html:
+                raw_names = extract_names_multi(html, selector)
+                matches = match_names(raw_names, f"Search: {surname}")
+                for m in matches:
+                    if m["Full Name"] not in seen:
+                        seen.add(m["Full Name"])
+                        results.append(m)
+    finally:
+        try: driver.quit()
+        except: pass
+        
+    return results
+
+
+# =========================================================
+#             MAIN UI & EXECUTION
 # =========================================================
 st.markdown("### 🤖 Auto-Pilot Control Center")
 c1, c2 = st.columns([3, 1])
 start_url = c1.text_input("Target URL", placeholder="https://directory.example.com")
-max_pages = c2.number_input("Max Pages / Search Cycles", 1, 10000, 500)
+max_cycles = c2.number_input("Total Surnames to Search", 1, 5000, 50)
 
 st.write("---")
 mode = st.radio(
@@ -681,183 +774,105 @@ mode = st.radio(
 )
 
 if st.button("🚀 Start Mission", type="primary"):
-    st.session_state.running = True
-
-# =========================================================
-#             EXECUTION
-# =========================================================
-if st.session_state.running:
     if not start_url:
-        st.error("Missing Target URL")
+        st.error("URL required")
         st.stop()
-
+        
+    st.session_state.running = True
     status_log = st.status("Initializing...", expanded=True)
     table_placeholder = st.empty()
-
-    all_matches: List[Dict[str, Any]] = []
-    all_seen = set()
-
+    all_matches = []
+    
     # ---------------------------
-    # CLASSIC DIRECTORY MODE
+    # CLASSIC MODE
     # ---------------------------
     if mode.startswith("Classic"):
         current_req = {"method": "GET", "url": start_url, "data": None}
-
-        for page in range(1, int(max_pages) + 1):
-            fp = request_fingerprint(current_req["method"], current_req["url"], current_req.get("data"))
-            if fp in st.session_state.visited_fps:
-                status_log.info("🏁 Pagination loop detected; stopping.")
-                break
-            st.session_state.visited_fps.add(fp)
-
+        for page in range(1, int(max_cycles) + 1):
             status_log.update(label=f"Scanning Page {page}...", state="running")
-
             r = fetch_native(current_req["method"], current_req["url"], current_req.get("data"))
-            if not r or getattr(r, "status_code", None) != 200:
-                status_log.warning(f"Fetch failed.")
-                break
-
+            if not r or getattr(r, "status_code", None) != 200: break
+            
             raw_html = r.text
-            names = extract_names_multi(raw_html, manual_name_selector.strip() if manual_name_selector else None)
+            names = extract_names_multi(raw_html, manual_name_selector)
             matches = match_names(names, f"Page {page}")
+            all_matches.extend(matches)
             
-            for m in matches:
-                if m["Full Name"] not in all_seen:
-                    all_seen.add(m["Full Name"])
-                    all_matches.append(m)
-            
-            # Sort by Score
-            all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-            st.session_state.matches = all_matches
-            table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
-            status_log.write(f"✅ Added {len(matches)} matches.")
-
-            next_req = find_next_request_heuristic(
-                raw_html, current_req["url"], manual_next_selector.strip() if manual_next_selector else None
-            )
-            if not next_req:
-                status_log.info("🏁 No more pages detected.")
-                break
-
-            current_req = {
-                "method": next_req.get("method", "GET").upper(),
-                "url": next_req["url"],
-                "data": next_req.get("data"),
-            }
+            if all_matches:
+                df = pd.DataFrame(all_matches).sort_values(by="Brazil Score", ascending=False)
+                table_placeholder.dataframe(df, height=320)
+                
+            next_req = find_next_request_heuristic(raw_html, current_req["url"], manual_next_selector)
+            if not next_req: break
+            current_req = next_req
             time.sleep(search_delay)
 
     # ---------------------------
     # INFINITE SCROLLER MODE
     # ---------------------------
     elif mode.startswith("Infinite"):
-        if not HAS_SELENIUM:
-            st.error("Selenium not installed.")
-            st.stop()
-
         driver = get_driver(headless=run_headless)
-        if not driver:
-            st.error("Selenium could not start.")
-            st.stop()
-
-        try:
-            driver.get(start_url)
-            selenium_wait_document_ready(driver, timeout=int(selenium_wait))
-            for k in range(int(max_pages)):
-                status_log.update(label=f"Scroll batch {k+1}/{int(max_pages)}...", state="running")
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(max(1, search_delay))
-                selenium_wait_results(driver, timeout=int(selenium_wait), name_selector=(manual_name_selector.strip() if manual_name_selector else None))
-
-                html = driver.page_source
-                names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
-                matches = match_names(names, f"Scroll batch {k+1}")
-
-                for m in matches:
-                    if m["Full Name"] not in all_seen:
-                        all_seen.add(m["Full Name"])
-                        all_matches.append(m)
-                
-                all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                st.session_state.matches = all_matches
-                if matches:
-                    table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
-                    status_log.write(f"✅ Added {len(matches)} matches.")
-        finally:
-            driver.quit()
-
-    # ---------------------------
-    # ACTIVE SEARCH INJECTION MODE
-    # ---------------------------
-    else:
-        status_log.write("🔎 Active Search Injection (Requests + Selenium)")
-
-        driver = get_driver(headless=run_headless)
-        if not driver:
-            status_log.warning("Selenium could not start. Using Requests Fallback.")
-
-        # Fallback function
-        def requests_urlparam_search(term: str) -> Optional[str]:
-            for p in (manual_search_param or "q,query,search").split(","):
-                u = urlparse(start_url)
-                qs = parse_qs(u.query)
-                qs[p] = [term]
-                cand = u._replace(query=urlencode(qs, doseq=True)).geturl()
-                rr = fetch_native("GET", cand, None)
-                if rr and getattr(rr, "status_code", None) == 200: return rr.text
-            return None
-
-        for i, surname in enumerate(sorted_surnames[: int(max_pages)]):
-            status_log.update(label=f"🔎 Searching '{surname}' ({i+1}/{int(max_pages)})", state="running")
-            html = None
-
-            # 1. Try Selenium
-            if driver:
-                try:
-                    driver.get(start_url)
-                    sel_input = selenium_find_search_input(driver)
-                    if sel_input:
-                        if selenium_submit_search(driver, sel_input, surname):
-                            selenium_wait_results(
-                                driver, timeout=int(selenium_wait), 
-                                name_selector=manual_name_selector
-                            )
-                            html = driver.page_source
-                except Exception as e:
-                    # If it crashes, continue to fallback
-                    pass
-
-            # 2. Try Requests if no HTML
-            if not html:
-                html = requests_urlparam_search(surname)
-
-            # 3. Process
-            if html:
-                names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
-                if debug_show_candidates:
-                    st.write(f"Candidates for {surname}: {names[:10]}")
-
-                matches = match_names(names, f"Search: {surname}")
-                for m in matches:
-                    if m["Full Name"] not in all_seen:
-                        all_seen.add(m["Full Name"])
-                        all_matches.append(m)
-                
-                all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                st.session_state.matches = all_matches
-                table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
-
-            time.sleep(search_delay)
-
         if driver:
-            try: driver.quit()
-            except: pass
+            try:
+                driver.get(start_url)
+                selenium_wait_document_ready(driver)
+                for i in range(int(max_cycles)):
+                    status_log.update(label=f"Scroll {i+1}...", state="running")
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2)
+                    
+                    html = driver.page_source
+                    names = extract_names_multi(html, manual_name_selector)
+                    matches = match_names(names, "Scroll")
+                    all_matches.extend(matches)
+                    
+                    if all_matches:
+                        df = pd.DataFrame(all_matches).drop_duplicates(subset=["Full Name"]).sort_values(by="Brazil Score", ascending=False)
+                        table_placeholder.dataframe(df, height=320)
+            finally:
+                driver.quit()
 
-    status_log.update(label="Scanning Complete", state="complete")
+    # ---------------------------
+    # ACTIVE SEARCH MODE (PARALLEL)
+    # ---------------------------
+    elif mode.startswith("Active"):
+        if not sorted_surnames:
+            status_log.error("IBGE Database empty.")
+            st.stop()
+        
+        surnames_to_check = sorted_surnames[:int(max_cycles)]
+        # Split into chunks for each browser
+        chunk_size = len(surnames_to_check) // num_browsers + 1
+        chunks = [surnames_to_check[i:i + chunk_size] for i in range(0, len(surnames_to_check), chunk_size)]
+        
+        status_log.write(f"🚀 Launching {len(chunks)} browsers in parallel...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_browsers) as executor:
+            futures = []
+            for i, chunk in enumerate(chunks):
+                status_log.write(f"Browser {i+1}: Checking {len(chunk)} surnames ({chunk[0]}...)")
+                futures.append(
+                    executor.submit(worker_search_batch, chunk, start_url, manual_name_selector, manual_search_selector, run_headless)
+                )
+            
+            completed_count = 0
+            for future in concurrent.futures.as_completed(futures):
+                batch_results = future.result()
+                all_matches.extend(batch_results)
+                completed_count += 1
+                status_log.write(f"✅ Browser {completed_count}/{len(chunks)} finished.")
+                
+                if all_matches:
+                    df = pd.DataFrame(all_matches).sort_values(by="Brazil Score", ascending=False)
+                    st.session_state.matches = df.to_dict('records')
+                    table_placeholder.dataframe(df, height=300)
+
+    status_log.update(label="Mission Complete!", state="complete")
     st.session_state.running = False
 
 
 # =========================================================
-#             POST-PROCESSING UI
+#             EXPORT & CLEAN
 # =========================================================
 if st.session_state.matches:
     st.markdown("---")
