@@ -55,6 +55,7 @@ try:
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
     from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
     HAS_SELENIUM = True
 except Exception:
     HAS_SELENIUM = False
@@ -724,9 +725,8 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
 
 def get_driver(headless: bool = True):
     """
-    Streamlit Cloud–friendly Chrome driver.
-    Uses Selenium Manager first. Falls back to webdriver_manager.
-    Returns None if it cannot start (so the app doesn't crash).
+    Streamlit Cloud-friendly driver setup.
+    Explicitly requests CHROMIUM to match packages.txt.
     """
     if not HAS_SELENIUM:
         return None
@@ -735,26 +735,32 @@ def get_driver(headless: bool = True):
     if headless:
         options.add_argument("--headless=new")
 
+    # Critical Flags for Cloud Environments
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-extensions")
-    options.add_argument("--incognito")
     options.add_argument("--remote-allow-origins=*")
-    options.add_argument("--disable-blink-features=AutomationControlled")
+    
+    # 1. Try using webdriver_manager with CHROMIUM (Best for Streamlit Cloud)
+    try:
+        return webdriver.Chrome(
+            service=Service(
+                ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
+            ),
+            options=options
+        )
+    except Exception:
+        pass
 
-    # Try Selenium Manager
+    # 2. Fallback: Selenium Manager (Standard Chrome)
     try:
         return webdriver.Chrome(options=options)
     except Exception:
         pass
 
-    # Fallback
-    try:
-        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    except Exception:
-        return None
+    return None
 
 def fetch_selenium(driver, url, scroll_count=0):
     driver.get(url)
