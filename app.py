@@ -38,7 +38,7 @@ except Exception:
 # =========================================================
 st.set_page_config(page_title="Universal Active Search Debugger", layout="wide", page_icon="🧪")
 st.title("🧪 Universal Active Search Debugger")
-st.caption("Probe → Detect → Decide → Extract (universal, log-heavy, tabpanel-locked)")
+st.caption("Probe → Detect → Decide → Extract (universal, log-heavy, people-container-aware)")
 
 c1, c2, c3 = st.columns([3, 1, 1])
 TARGET_URL = c1.text_input("Target URL", "https://web.mit.edu/directory/")
@@ -59,9 +59,10 @@ MANUAL_SUBMIT_SELECTOR = a2.text_input("Manual submit CSS", "")
 MANUAL_RESULTS_ROOT = a3.text_input("Manual results root CSS", "")
 
 st.markdown("### “Working logic” fallback")
-b1, b2 = st.columns(2)
+b1, b2, b3 = st.columns(3)
 FALLBACK_SLEEP = b1.slider("Fallback sleep after submit (seconds)", 0, 30, 15)
 TRY_TAB_CLICK = b2.checkbox("Try to click People/Directory tab/filter", value=True)
+AUTO_PEOPLE_SCOPE = b3.checkbox("Auto-scope to most people-like container", value=True)
 
 RUN = st.button("▶ Run Debugger", type="primary")
 
@@ -84,14 +85,24 @@ def vlog(status, msg: str):
 NAMEISH_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){1,6}$")
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
 
-NO_RESULTS_PHRASES = [
-    "no results", "0 results", "zero results", "no matches", "nothing found",
-    "did not match", "try a different", "no records", "no entries"
+# IMPORTANT: regex-based no-results detection (no substring traps like "9330 results" -> "0 results")
+NO_RESULTS_REGEXES = [
+    re.compile(r"\bno\s+results\b", re.I),
+    re.compile(r"\b0\s+results\b", re.I),
+    re.compile(r"\bzero\s+results\b", re.I),
+    re.compile(r"\bno\s+matches\b", re.I),
+    re.compile(r"\bnothing\s+found\b", re.I),
+    re.compile(r"\bdid\s+not\s+match\b", re.I),
+    re.compile(r"\bno\s+records\b", re.I),
+    re.compile(r"\bno\s+entries\b", re.I),
 ]
 
-def html_has_no_results_signal(text_or_html: str) -> bool:
-    t = (text_or_html or "").lower()
-    return any(p in t for p in NO_RESULTS_PHRASES)
+def text_has_no_results_signal(text_or_html: str) -> bool:
+    t = text_or_html or ""
+    # Guard: if there are obvious emails, it’s probably NOT a no-results page
+    if EMAIL_RE.search(t):
+        return False
+    return any(rx.search(t) for rx in NO_RESULTS_REGEXES)
 
 def clean_candidate_text(t: str) -> Optional[str]:
     if not t:
@@ -100,7 +111,6 @@ def clean_candidate_text(t: str) -> Optional[str]:
     if len(t) < 3 or len(t) > 140:
         return None
     lt = t.lower()
-    # light junk filter (universal)
     junk = [
         "privacy", "accessibility", "cookie", "terms", "login", "sign up",
         "skip to", "search results", "jobs", "events", "map"
@@ -112,8 +122,6 @@ def clean_candidate_text(t: str) -> Optional[str]:
 def extract_candidates_generic(html: str) -> List[str]:
     soup = BeautifulSoup(html or "", "html.parser")
     out: List[str] = []
-
-    # Prefer common "result title" / name spots first
     selectors = [
         "[class*='result' i] h3",
         "[class*='result' i] h2",
@@ -125,7 +133,6 @@ def extract_candidates_generic(html: str) -> List[str]:
         "li",
         "td",
     ]
-
     for sel in selectors:
         for el in soup.select(sel):
             txt = clean_candidate_text(el.get_text(" ", strip=True))
@@ -133,8 +140,6 @@ def extract_candidates_generic(html: str) -> List[str]:
                 out.append(txt)
         if len(out) >= 400:
             break
-
-    # de-dupe preserving order
     seen = set()
     uniq = []
     for x in out:
@@ -150,11 +155,9 @@ def filter_nameish(cands: List[str]) -> List[str]:
         if not NAMEISH_RE.match(cc):
             continue
         low = cc.lower()
-        # common non-person headings
-        if any(k in low for k in ["massachusetts institute", "search", "results for", "websites results", "locations results"]):
+        if any(k in low for k in ["results for", "websites results", "locations results", "people results"]):
             continue
         out.append(cc)
-
     seen = set()
     uniq = []
     for x in out:
@@ -164,18 +167,10 @@ def filter_nameish(cands: List[str]) -> List[str]:
     return uniq
 
 def extract_people_like_records_from_text(block_text: str) -> List[Dict[str, str]]:
-    """
-    Universal “people-ish” parsing from text:
-    - picks lines that look like names
-    - tries to attach an email nearby
-    """
     lines = [l.strip() for l in (block_text or "").splitlines() if l.strip()]
     records: List[Dict[str, str]] = []
-
-    # Build a rolling window to associate emails
     for i, line in enumerate(lines):
         if NAMEISH_RE.match(line) and not any(x in line.lower() for x in ["results for", "website", "locations", "people results"]):
-            # search for email in same/next few lines
             email = ""
             for j in range(i, min(i + 6, len(lines))):
                 m = EMAIL_RE.search(lines[j])
@@ -183,8 +178,6 @@ def extract_people_like_records_from_text(block_text: str) -> List[Dict[str, str
                     email = m.group(0)
                     break
             records.append({"name": line, "email": email})
-
-    # de-dupe by (name,email)
     seen = set()
     uniq = []
     for r in records:
@@ -304,17 +297,15 @@ def safe_body_inner_text(driver, max_chars=200000) -> str:
     except Exception:
         return ""
 
-def safe_element_text_by_id(driver, element_id: str, max_chars=200000) -> str:
+def safe_element_text(driver, el, max_chars=200000) -> str:
     try:
-        el = driver.find_element("id", element_id)
         t = el.text or ""
         return t[:max_chars]
     except Exception:
         return ""
 
-def safe_element_html_by_id(driver, element_id: str, max_chars=500000) -> str:
+def safe_element_html(driver, el, max_chars=500000) -> str:
     try:
-        el = driver.find_element("id", element_id)
         html = el.get_attribute("innerHTML") or ""
         return html[:max_chars]
     except Exception:
@@ -436,7 +427,7 @@ def submit_query(driver, inp, term: str, status) -> bool:
 
 
 # =========================================================
-# Tab clicking (tabpanel locked) — THE IMPORTANT PART
+# Tab clicking (best effort; may not provide panel id)
 # =========================================================
 TAB_PRIORITIES = [
     r"\bpeople\b",
@@ -450,14 +441,7 @@ TAB_PRIORITIES = [
 ]
 
 def click_best_people_tab(driver, status) -> Dict[str, Optional[str]]:
-    """
-    Universal heuristic:
-    - find tab-like clickables
-    - click best match (People/Directory)
-    - capture aria-controls / data-target / href#id as "tabpanel id"
-    """
     patterns = [re.compile(p, re.I) for p in TAB_PRIORITIES]
-
     elems = []
     try:
         elems.extend(driver.find_elements(By.CSS_SELECTOR, "[role='tab']"))
@@ -473,14 +457,8 @@ def click_best_people_tab(driver, status) -> Dict[str, Optional[str]]:
     best_txt = None
     best_panel = None
 
-    seen_ids = set()
     for el in elems:
         try:
-            eid = el.id
-            if eid in seen_ids:
-                continue
-            seen_ids.add(eid)
-
             if not el.is_displayed() or not el.is_enabled():
                 continue
             txt = (el.text or "").strip()
@@ -500,7 +478,6 @@ def click_best_people_tab(driver, status) -> Dict[str, Optional[str]]:
             if role == "tab" or "tab" in cls or "filter" in cls:
                 score += 1
 
-            # try to determine panel target
             aria_controls = (el.get_attribute("aria-controls") or "").strip() or None
             data_target = (el.get_attribute("data-target") or "").strip() or None
             href = (el.get_attribute("href") or "").strip()
@@ -533,73 +510,190 @@ def click_best_people_tab(driver, status) -> Dict[str, Optional[str]]:
 
 
 # =========================================================
-# “Working logic” waiter BUT SCOPED TO TABPANEL (if we have one)
+# UNIVERSAL PEOPLE-SCOPE: find the "most people-like" container
 # =========================================================
-def wait_scoped_outcome(driver, term: str, timeout: int, status, panel_id: Optional[str]) -> Dict[str, Any]:
+def find_best_people_container(driver, status) -> Optional[Dict[str, Any]]:
+    """
+    Universal heuristic:
+    - score many DOM containers by:
+      - mailto links count
+      - email regex count
+      - number of name-ish lines
+    - pick max score container
+    Returns a dict with a JS path and metrics (we re-find it each poll by JS path).
+    """
+    js = r"""
+    const EMAIL_RE = /[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/ig;
+
+    function isBad(el){
+      if(!el) return true;
+      const tag = (el.tagName||"").toLowerCase();
+      if(["script","style","svg","noscript","header","footer","nav"].includes(tag)) return true;
+      const cls = (el.className||"").toString().toLowerCase();
+      const id  = (el.id||"").toString().toLowerCase();
+      if(/nav|menu|footer|header|site-nav/.test(cls+ " " + id)) return true;
+      return false;
+    }
+
+    function jsPath(el){
+      // stable-ish path: tag:nth-of-type(...) chain, stops at body
+      if(!el) return null;
+      const parts = [];
+      while(el && el !== document.body){
+        let tag = el.tagName.toLowerCase();
+        let parent = el.parentElement;
+        if(!parent) break;
+        let siblings = Array.from(parent.children).filter(x => x.tagName === el.tagName);
+        let idx = siblings.indexOf(el) + 1;
+        parts.push(tag + ":nth-of-type(" + idx + ")");
+        el = parent;
+      }
+      parts.push("body");
+      return parts.reverse().join(" > ");
+    }
+
+    const roots = Array.from(document.querySelectorAll("main, section, article, div")).slice(0, 800);
+    let best = null;
+
+    for(const el of roots){
+      if(isBad(el)) continue;
+      const txt = (el.innerText || "").trim();
+      if(txt.length < 300) continue;
+      if(txt.length > 30000) continue;
+
+      const mailtos = el.querySelectorAll("a[href^='mailto:']").length;
+      const emails = (txt.match(EMAIL_RE) || []).length;
+
+      const lines = txt.split("\n").map(x => x.trim()).filter(Boolean).slice(0, 400);
+      let nameish = 0;
+      for(const line of lines){
+        // crude universal name-ish: "Word, Word" OR "Word Word"
+        if(line.length < 3 || line.length > 80) continue;
+        if(/[|]{1,}/.test(line)) continue;
+        if(/results for|website results|locations results|people results/i.test(line)) continue;
+        if(/^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+,\s*[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+/.test(line)) nameish++;
+        else if(/^[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'\-\.]+){1,4}$/.test(line)) nameish++;
+      }
+
+      // score: emails are strongest signal for "people directory"
+      let score = mailtos*10 + emails*6 + nameish*1;
+
+      // penalties if it looks like generic web search section
+      if(/websites results/i.test(txt)) score -= 10;
+      if(/locations results/i.test(txt)) score -= 5;
+
+      if(!best || score > best.score){
+        best = { score, mailtos, emails, nameish, path: jsPath(el), preview: txt.slice(0, 900) };
+      }
+    }
+    return best;
+    """
+    try:
+        best = driver.execute_script(js)
+        if best and best.get("path"):
+            vlog(status, f"🧲 Auto people-scope selected score={best.get('score')} mailtos={best.get('mailtos')} emails={best.get('emails')} nameish={best.get('nameish')}")
+            vlog(status, f"🧲 people-scope path: {best.get('path')}")
+            return best
+    except Exception as e:
+        vlog(status, f"⚠ people-scope JS failed: {e}")
+    return None
+
+def get_container_by_js_path(driver, js_path: str):
+    js = r"""
+    const path = arguments[0];
+    try { return document.querySelector(path); } catch(e){ return null; }
+    """
+    try:
+        return driver.execute_script(js, js_path)
+    except Exception:
+        return None
+
+
+# =========================================================
+# Wait for outcome (scoped to: manual root > panel_id > people-container > body)
+# =========================================================
+def wait_scoped_outcome(driver, term: str, timeout: int, status, panel_id: Optional[str], people_scope: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     start = time.time()
     term_l = term.lower()
 
-    def get_scope_text_and_html() -> Tuple[str, str]:
+    def get_scope_text_and_html() -> Tuple[str, str, str]:
+        # returns (scope_kind, text, html)
         if MANUAL_RESULTS_ROOT.strip():
-            # if user provides manual root CSS, use that first
             try:
                 el = driver.find_element(By.CSS_SELECTOR, MANUAL_RESULTS_ROOT.strip())
                 txt = (el.text or "")[:200000]
                 html = (el.get_attribute("innerHTML") or "")[:500000]
-                return txt, html
+                return ("manual_root", txt, html)
             except Exception:
                 pass
 
         if panel_id:
-            txt = safe_element_text_by_id(driver, panel_id, max_chars=200000)
-            html = safe_element_html_by_id(driver, panel_id, max_chars=500000)
-            if txt or html:
-                return txt, html
+            try:
+                el = driver.find_element(By.ID, panel_id)
+                txt = (el.text or "")[:200000]
+                html = (el.get_attribute("innerHTML") or "")[:500000]
+                return ("panel_id", txt, html)
+            except Exception:
+                pass
 
-        # fallback: full body
+        if people_scope and people_scope.get("path"):
+            el = get_container_by_js_path(driver, people_scope["path"])
+            if el is not None:
+                txt = safe_element_text(driver, el, 200000)
+                html = safe_element_html(driver, el, 500000)
+                if txt or html:
+                    return ("people_scope", txt, html)
+
         txt = safe_body_inner_text(driver, max_chars=200000)
         html = driver.page_source or ""
-        return txt, html
+        return ("body", txt, html)
 
-    base_txt, base_html = get_scope_text_and_html()
+    scope_kind, base_txt, base_html = get_scope_text_and_html()
     base_fp = hash(base_html or "")
     base_cands = extract_candidates_generic(base_html)
-    vlog(status, f"🧪 baseline scope panel_id={panel_id} fp={base_fp} candidates={len(base_cands)}")
+    vlog(status, f"🧪 baseline scope={scope_kind} panel_id={panel_id} fp={base_fp} candidates={len(base_cands)}")
 
     last_cset = set(base_cands)
 
     while time.time() - start < timeout:
         elapsed = round(time.time() - start, 1)
-        txt, html = get_scope_text_and_html()
+        scope_kind, txt, html = get_scope_text_and_html()
 
-        if html_has_no_results_signal(txt) or html_has_no_results_signal(html):
-            vlog(status, f"🧪 t={elapsed}s → no-results detected (scoped)")
+        # no-results: only if signal exists AND we have near-zero people signals
+        if text_has_no_results_signal(txt) or text_has_no_results_signal(html):
             cands = extract_candidates_generic(html)
-            return {"state": "no_results", "elapsed": elapsed, "candidates": cands, "scope_panel": panel_id}
+            people_records = extract_people_like_records_from_text(txt)
+            if len(people_records) == 0 and len(cands) < 5:
+                vlog(status, f"🧪 t={elapsed}s → no-results detected (scope={scope_kind})")
+                return {"state": "no_results", "elapsed": elapsed, "candidates": cands, "scope_kind": scope_kind}
 
+        # term seen in scoped text is a good sign (but not sufficient alone)
         if term_l in (txt or "").lower():
-            vlog(status, f"🧪 t={elapsed}s → term '{term}' appears in scoped text")
-            cands = extract_candidates_generic(html)
-            return {"state": "term_seen", "elapsed": elapsed, "candidates": cands, "scope_panel": panel_id}
+            vlog(status, f"🧪 t={elapsed}s → term '{term}' appears in scoped text (scope={scope_kind})")
 
         cands = extract_candidates_generic(html)
         cset = set(cands)
-
         changed = (cset != last_cset)
         delta = len(cset - last_cset)
         last_cset = cset
 
-        vlog(status, f"🧪 t={elapsed}s scoped_candidates={len(cands)} changed={changed} delta={delta}")
+        # If we have emails or multiple people-like lines, call it "results"
+        people_records = extract_people_like_records_from_text(txt)
+        emails_found = 1 if any(r.get("email") for r in people_records) else 0
+
+        vlog(status, f"🧪 t={elapsed}s scope={scope_kind} candidates={len(cands)} people_records={len(people_records)} emails={emails_found} changed={changed} delta={delta}")
+
+        if len(people_records) >= 3 or emails_found:
+            return {"state": "people_records", "elapsed": elapsed, "candidates": cands, "scope_kind": scope_kind, "people_records": people_records}
 
         if delta >= 5:
-            return {"state": "results_changed", "elapsed": elapsed, "candidates": cands, "scope_panel": panel_id}
+            return {"state": "results_changed", "elapsed": elapsed, "candidates": cands, "scope_kind": scope_kind}
 
         time.sleep(0.4)
 
-    # timeout
-    txt, html = get_scope_text_and_html()
+    scope_kind, txt, html = get_scope_text_and_html()
     cands = extract_candidates_generic(html)
-    return {"state": "timeout", "elapsed": round(time.time() - start, 1), "candidates": cands, "scope_panel": panel_id, "scoped_text_preview": (txt or "")[:2500]}
+    return {"state": "timeout", "elapsed": round(time.time() - start, 1), "candidates": cands, "scope_kind": scope_kind, "scoped_text_preview": (txt or "")[:2500]}
 
 
 # =========================================================
@@ -648,6 +742,7 @@ if RUN:
 
     clicked_tab_text = None
     panel_id = None
+    people_scope = None
 
     try:
         driver.get(TARGET_URL)
@@ -669,12 +764,10 @@ if RUN:
             st.error("Failed to submit query. Try manual submit selector.")
             st.stop()
 
-        # working logic sleep (from the code that "worked")
         if FALLBACK_SLEEP > 0:
             vlog(status, f"⏳ Working-logic initial sleep: {FALLBACK_SLEEP}s")
             time.sleep(float(FALLBACK_SLEEP))
 
-        # click People/Directory and LOCK to its panel
         if TRY_TAB_CLICK:
             tab_res = click_best_people_tab(driver, status)
             clicked_tab_text = tab_res.get("clicked_text")
@@ -682,27 +775,51 @@ if RUN:
             if clicked_tab_text:
                 time.sleep(0.8)
 
-        log(status, f"🧪 Waiting for outcome for '{TERM}' (timeout={TIMEOUT}s) scoped_panel={panel_id}")
-        res = wait_scoped_outcome(driver, TERM, timeout=int(TIMEOUT), status=status, panel_id=panel_id)
+        # If there is no panel_id, auto-scope to the most people-like container
+        if AUTO_PEOPLE_SCOPE and not panel_id and not MANUAL_RESULTS_ROOT.strip():
+            people_scope = find_best_people_container(driver, status)
+            if people_scope:
+                with st.expander("🧲 Auto people-scope preview (why this was chosen)", expanded=False):
+                    st.write(people_scope)
 
-        cands = res["candidates"]
+        log(status, f"🧪 Waiting for outcome for '{TERM}' (timeout={TIMEOUT}s) panel_id={panel_id} auto_people_scope={bool(people_scope)}")
+        res = wait_scoped_outcome(driver, TERM, timeout=int(TIMEOUT), status=status, panel_id=panel_id, people_scope=people_scope)
+
+        cands = res.get("candidates", [])
         nameish = filter_nameish(cands)
 
-        # additionally: parse people-like records from *scoped text* if we have it
-        scoped_text = ""
-        if panel_id:
-            scoped_text = safe_element_text_by_id(driver, panel_id, max_chars=200000)
-        else:
-            scoped_text = safe_body_inner_text(driver, max_chars=200000)
+        # Build scoped text preview for debug
+        scoped_text_preview = res.get("scoped_text_preview", "")
+        scope_kind = res.get("scope_kind", "unknown")
+        people_records = res.get("people_records", [])
 
-        people_records = extract_people_like_records_from_text(scoped_text)
+        # If we didn’t compute people_records inside waiter, compute now from best available scope
+        if not people_records:
+            try:
+                if MANUAL_RESULTS_ROOT.strip():
+                    el = driver.find_element(By.CSS_SELECTOR, MANUAL_RESULTS_ROOT.strip())
+                    t = (el.text or "")
+                elif panel_id:
+                    el = driver.find_element(By.ID, panel_id)
+                    t = (el.text or "")
+                elif people_scope and people_scope.get("path"):
+                    el = get_container_by_js_path(driver, people_scope["path"])
+                    t = (el.text or "") if el else safe_body_inner_text(driver)
+                else:
+                    t = safe_body_inner_text(driver)
+                people_records = extract_people_like_records_from_text(t)
+                if not scoped_text_preview:
+                    scoped_text_preview = (t or "")[:2500]
+            except Exception:
+                pass
 
         status.update(label="Done", state="complete")
 
         st.subheader("🧠 Result")
-        st.write("Strategy used: `selenium_tabpanel_scoped_working_logic`")
+        st.write("Strategy used: `selenium_universal_people_container_scope`")
         st.write(f"Clicked tab/filter: `{clicked_tab_text}`")
         st.write(f"Locked panel_id: `{panel_id}`")
+        st.write(f"Scope used: `{scope_kind}`")
         st.write(f"Outcome state: `{res['state']}`")
         st.write(f"Elapsed: {res['elapsed']}s")
         st.write(f"Current URL: {driver.current_url}")
@@ -722,8 +839,7 @@ if RUN:
         st.dataframe({"Name-ish": nameish[:60]})
 
         with st.expander("🔎 Debug: scoped text preview", expanded=False):
-            preview = (scoped_text or "")[:2500]
-            st.code(preview if preview else "(empty)")
+            st.code(scoped_text_preview if scoped_text_preview else "(empty)")
 
     except WebDriverException as e:
         status.update(label="Done (webdriver error)", state="complete")
