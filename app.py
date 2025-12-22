@@ -1,56 +1,96 @@
+import streamlit as st
+import pandas as pd
+import json
 import time
 import re
-from typing import List, Optional, Tuple
-from bs4 import BeautifulSoup
+import requests
+import io
+import os
+from typing import Optional, Dict, Any, List, Tuple
 from unidecode import unidecode
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from bs4 import BeautifulSoup
+import google.generativeai as genai
 
+# =========================================================
+# DEBUG FLAG
+# =========================================================
+DEBUG_ACTIVE_SEARCH = True
+
+def debug_log(status_log, msg):
+    if DEBUG_ACTIVE_SEARCH and status_log:
+        status_log.write(f"🧪 DEBUG {msg}")
+
+# =========================================================
+# Selenium
+# =========================================================
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 
+from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.os_manager import ChromeType
 
 # =========================================================
-# CONFIG
+# Streamlit config
 # =========================================================
-URL = "https://web.mit.edu/directory/"
-SURNAMES = ["SILVA", "SOUZA", "OLIVEIRA"]
-TIMEOUT = 20
-POLL = 0.3
-HEADLESS = False   # IMPORTANT: keep visible for now
+st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
+st.title("🕵️ Universal Brazilian Alumni Finder")
+st.caption("Active Search Injection — Isolated Debug Mode")
 
+if "running" not in st.session_state:
+    st.session_state.running = False
 
 # =========================================================
-# HELPERS
+# Sidebar
 # =========================================================
-NAME_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\. ]{3,}$")
+st.sidebar.header("🧪 Selenium")
+run_headless = st.sidebar.checkbox("Run Selenium headless", True)
+selenium_wait = st.sidebar.slider("Selenium wait timeout", 5, 60, 20)
+search_delay = st.sidebar.slider("Delay between surnames", 0, 5, 1)
 
-def clean_name(txt: str) -> Optional[str]:
+# =========================================================
+# Utilities
+# =========================================================
+NAME_REGEX = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'\-\. ]{3,}$")
+
+def clean_extracted_name(txt: str) -> Optional[str]:
     if not txt:
         return None
     txt = " ".join(txt.split())
-    if not NAME_RE.match(txt):
+    if not NAME_REGEX.match(txt):
         return None
     if any(x in txt.upper() for x in [
-        "SEARCH","RESULT","DIRECTORY","LOGIN","ABOUT",
-        "CONTACT","HOME","PEOPLE","STAFF","FACULTY","STUDENTS"
+        "SEARCH","RESULT","DIRECTORY","LOGIN","ABOUT","CONTACT",
+        "HOME","PEOPLE","STAFF","FACULTY","STUDENTS"
     ]):
         return None
     return txt
 
-def extract_names(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
+def extract_names_multi(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "html.parser")
     out = []
     for el in soup.select("a[href^='mailto:'], h2, h3, h4, strong, a"):
-        t = clean_name(el.get_text(" ", strip=True))
+        t = clean_extracted_name(el.get_text(" ", strip=True))
         if t:
             out.append(t)
     return list(dict.fromkeys(out))
 
-def page_has_no_results(html: str, names: List[str]) -> bool:
-    # CRITICAL RULE: if names exist, cannot be no-results
-    if names:
+# =========================================================
+# ✅ FIXED NO-RESULTS LOGIC
+# =========================================================
+def page_has_no_results_signal(html: str, extracted_names: List[str]) -> bool:
+    """
+    Conservative rule:
+    If ANY names exist, this is NOT a no-results page.
+    """
+    if extracted_names:
+        return False
+
+    if not html:
         return False
 
     soup = BeautifulSoup(html, "html.parser")
@@ -73,29 +113,37 @@ def page_has_no_results(html: str, names: List[str]) -> bool:
         "your search returned no results",
         "did not match any results",
     ]
+
     return any(p in text for p in phrases)
 
-
 # =========================================================
-# SELENIUM
+# Selenium helpers (STREAMLIT CLOUD SAFE)
 # =========================================================
 def get_driver():
-    opts = Options()
-    if HEADLESS:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    return webdriver.Chrome(options=opts)
+    options = Options()
+    if run_headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--remote-allow-origins=*")
 
-def wait_ready(driver, t=10):
+    service = Service(
+        ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
+    )
+
+    return webdriver.Chrome(service=service, options=options)
+
+def selenium_wait_document_ready(driver, timeout=10):
     try:
-        WebDriverWait(driver, t).until(
+        WebDriverWait(driver, timeout).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
     except Exception:
         pass
 
-def find_search_input(driver):
+def selenium_find_search_input(driver):
     for el in driver.find_elements(By.TAG_NAME, "input"):
         try:
             if el.is_displayed() and el.is_enabled():
@@ -104,47 +152,52 @@ def find_search_input(driver):
             pass
     return None
 
-def submit_search(inp, term):
-    inp.click()
-    inp.send_keys(Keys.CONTROL + "a")
-    inp.send_keys(Keys.BACKSPACE)
-    inp.send_keys(term)
-    inp.send_keys(Keys.RETURN)
-
+def selenium_submit_search(driver, inp, term):
+    try:
+        inp.click()
+        inp.send_keys(Keys.CONTROL + "a")
+        inp.send_keys(Keys.BACKSPACE)
+        inp.send_keys(term)
+        inp.send_keys(Keys.RETURN)
+        return True
+    except Exception:
+        return False
 
 # =========================================================
-# WAIT + LOG
+# 🔥 FIXED + INSTRUMENTED WAITER
 # =========================================================
-def wait_for_outcome(driver, surname: str) -> Tuple[str, str, List[str]]:
+def selenium_wait_for_search_outcome(
+    driver,
+    timeout: int,
+    status_log,
+    surname: str,
+    poll_s: float = 0.3
+) -> Tuple[str, str, List[str]]:
+
     start = time.time()
 
     baseline_html = driver.page_source or ""
     baseline_fp = hash(baseline_html)
-    baseline_len = len(baseline_html)
 
-    print(f"\n=== {surname} ===")
-    print(f"baseline fp={baseline_fp} len={baseline_len}")
+    debug_log(status_log, f"[{surname}] baseline fp={baseline_fp} len={len(baseline_html)}")
 
     dom_changed = False
 
-    while time.time() - start < TIMEOUT:
+    while (time.time() - start) < timeout:
         html = driver.page_source or ""
         fp = hash(html)
-        length = len(html)
         elapsed = round(time.time() - start, 1)
 
-        names = extract_names(html)
-        no_results = page_has_no_results(html, names)
+        names = extract_names_multi(html)
+        no_results = page_has_no_results_signal(html, names)
 
         if fp != baseline_fp:
             dom_changed = True
 
-        print(
-            f"t={elapsed}s "
-            f"dom_changed={dom_changed} "
-            f"len={length} "
-            f"names={len(names)} "
-            f"no_results={no_results}"
+        debug_log(
+            status_log,
+            f"[{surname}] t={elapsed}s dom_changed={dom_changed} "
+            f"len={len(html)} names={len(names)} no_results={no_results}"
         )
 
         if dom_changed:
@@ -153,26 +206,54 @@ def wait_for_outcome(driver, surname: str) -> Tuple[str, str, List[str]]:
             if names:
                 return "names", html, names
 
-        time.sleep(POLL)
+        time.sleep(poll_s)
 
-    return "timeout", driver.page_source or "", extract_names(driver.page_source or "")
-
+    debug_log(status_log, f"[{surname}] TIMEOUT")
+    return "timeout", html, extract_names_multi(html)
 
 # =========================================================
-# MAIN
+# UI
 # =========================================================
-driver = get_driver()
-driver.get(URL)
-wait_ready(driver)
+st.markdown("### 🤖 Active Search Injection — Debug Mode")
+c1, c2 = st.columns([3, 1])
+start_url = c1.text_input("Target URL", "https://web.mit.edu/directory/")
+max_pages = c2.number_input("Max Search Cycles", 1, 5000, 500)
 
-for surname in SURNAMES:
-    inp = find_search_input(driver)
-    if not inp:
-        print("❌ No search input found")
-        break
+if st.button("🚀 Start Mission", type="primary"):
+    st.session_state.running = True
 
-    submit_search(inp, surname)
-    outcome, html, names = wait_for_outcome(driver, surname)
-    print(f"➡ OUTCOME: {outcome}, names={len(names)}")
+# =========================================================
+# EXECUTION
+# =========================================================
+if st.session_state.running:
+    status_log = st.status("Running...", expanded=True)
 
-driver.quit()
+    surnames = ["SILVA", "SOUZA", "OLIVEIRA", "SANTOS", "PEREIRA"]
+
+    driver = get_driver()
+    driver.get(start_url)
+    selenium_wait_document_ready(driver)
+
+    for i, surname in enumerate(surnames[: int(max_pages)], 1):
+        status_log.update(label=f"🔎 Searching '{surname}' ({i}/{max_pages})", state="running")
+
+        inp = selenium_find_search_input(driver)
+        if not inp:
+            status_log.error("No search input found.")
+            break
+
+        selenium_submit_search(driver, inp, surname)
+
+        outcome, html, names = selenium_wait_for_search_outcome(
+            driver,
+            timeout=int(selenium_wait),
+            status_log=status_log,
+            surname=surname
+        )
+
+        status_log.write(f"➡ Outcome: {outcome}, names={len(names)}")
+        time.sleep(search_delay)
+
+    driver.quit()
+    status_log.update(label="Done", state="complete")
+    st.session_state.running = False
