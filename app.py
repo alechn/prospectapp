@@ -508,51 +508,54 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
 
 
 # =========================================================
-#             SELENIUM DRIVER (NUCLEAR OPTION FOR CLOUD)
+#             SELENIUM DRIVER (FIXED FOR CLOUD)
 # =========================================================
 def get_driver(headless: bool = True, fail_loud: bool = False):
     """
-    Streamlit Cloud-friendly Selenium setup with 'Nuclear' flags to prevent crashes.
+    Streamlit Cloud-friendly Selenium setup.
+    Creates a unique user-data-dir for every session to prevent 'SessionNotCreatedException' / 'DevToolsActivePort' crashes.
     """
     if not HAS_SELENIUM:
         return None
 
     options = Options()
-    
-    # 1. Use Classic Headless (lighter on memory than --headless=new)
     if headless:
         options.add_argument("--headless")
 
-    # 2. Critical Container Flags
+    # Critical Cloud Flags
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
-    options.add_argument("--window-size=1920,1080")
     options.add_argument("--remote-allow-origins=*")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--no-zygote")  # Helps with 'Chrome instance exited'
-    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--start-maximized")
+    options.add_argument("--window-size=1920,1080")
+    
+    # Port fix for DevToolsActivePort issues
+    options.add_argument("--remote-debugging-port=9222")
 
-    # 3. Unique Profile (Prevents 'SessionNotCreatedException' from stale locks)
+    # --- FIX: UNIQUE USER PROFILE ---
+    # Create a fresh temporary directory for this specific driver instance
     user_data_dir = tempfile.mkdtemp()
     options.add_argument(f"--user-data-dir={user_data_dir}")
     options.add_argument(f"--data-path={user_data_dir}/data")
     options.add_argument(f"--disk-cache-dir={user_data_dir}/cache")
 
-    # 4. Explicit Binary Location
+    # Explicit Binary Location (Matches your diagnostics)
     if os.path.exists("/usr/bin/chromium"):
         options.binary_location = "/usr/bin/chromium"
     elif os.path.exists("/usr/bin/chromium-browser"):
         options.binary_location = "/usr/bin/chromium-browser"
 
-    # 5. Service Setup
+    # Prefer System Driver (Matches your diagnostics)
     service = None
     if os.path.exists("/usr/bin/chromedriver"):
         service = Service("/usr/bin/chromedriver")
     else:
+        # Fallback to webdriver_manager if system driver is missing
         try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from webdriver_manager.core.os_manager import ChromeType
             service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
         except Exception:
             pass
@@ -561,17 +564,16 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
         driver = webdriver.Chrome(service=service, options=options)
         return driver
     except Exception as e:
-        # Cleanup
+        # Clean up the temp dir if startup fails
         try:
             shutil.rmtree(user_data_dir)
         except:
             pass
             
         if fail_loud:
-            st.error(f"Selenium Startup Failed: {e}")
+            st.error(f"Selenium failed to start: {repr(e)}")
             raise e
         return None
-
 
 # =========================================================
 #             SELENIUM WAIT (FIXED)
