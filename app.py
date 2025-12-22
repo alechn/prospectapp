@@ -522,44 +522,47 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
 def get_driver(headless: bool = True, fail_loud: bool = False):
     """
     Streamlit Cloud-friendly Selenium setup.
-    Creates a unique user-data-dir for every session to prevent 'SessionNotCreatedException' crashes.
+    Includes fixes for 'SessionNotCreatedException' (Port 9222 + Classic Headless).
     """
     if not HAS_SELENIUM:
         return None
 
     options = Options()
+    
+    # 1. USE CLASSIC HEADLESS (More stable on limited-RAM cloud containers than 'new')
     if headless:
-        options.add_argument("--headless=new")
+        options.add_argument("--headless") 
 
-    # Critical Cloud Flags
+    # 2. CRITICAL CONTAINER FLAGS
     options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-dev-shm-usage") # Fixes shared memory crashes
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
     options.add_argument("--remote-allow-origins=*")
-    options.add_argument("--start-maximized")
     options.add_argument("--window-size=1920,1080")
+    
+    # 3. PORT FIX (Fixes 'DevToolsActivePort file doesn't exist' crashes)
+    options.add_argument("--remote-debugging-port=9222")
 
-    # --- FIX: UNIQUE USER PROFILE ---
-    # Create a fresh temporary directory for this specific driver instance
-    # This prevents the "SessionNotCreatedException" caused by stale locks
+    # 4. PROFILE MANAGEMENT (Prevents locking conflicts)
     user_data_dir = tempfile.mkdtemp()
     options.add_argument(f"--user-data-dir={user_data_dir}")
     options.add_argument(f"--data-path={user_data_dir}/data")
     options.add_argument(f"--disk-cache-dir={user_data_dir}/cache")
 
-    # Explicit Binary Location (Matches your diagnostics)
+    # 5. BINARY LOCATION
     if os.path.exists("/usr/bin/chromium"):
         options.binary_location = "/usr/bin/chromium"
     elif os.path.exists("/usr/bin/chromium-browser"):
         options.binary_location = "/usr/bin/chromium-browser"
 
-    # Prefer System Driver (Matches your diagnostics)
+    # 6. SERVICE SETUP
     service = None
     if os.path.exists("/usr/bin/chromedriver"):
+        # Use system driver (fastest)
         service = Service("/usr/bin/chromedriver")
     else:
-        # Fallback to webdriver_manager if system driver is missing
+        # Fallback to webdriver_manager
         try:
             from webdriver_manager.chrome import ChromeDriverManager
             from webdriver_manager.core.os_manager import ChromeType
@@ -568,21 +571,21 @@ def get_driver(headless: bool = True, fail_loud: bool = False):
             pass
 
     try:
+        # Try to launch
         driver = webdriver.Chrome(service=service, options=options)
         return driver
     except Exception as e:
-        # Clean up the temp dir if startup fails
+        # Cleanup if failed
         try:
             shutil.rmtree(user_data_dir)
         except:
             pass
             
-        # In "Force" mode, show the real error. In "Auto" mode, stay silent.
         if fail_loud:
-            st.error(f"Selenium failed to start: {repr(e)}")
+            st.error(f"Selenium Startup Failed: {e}")
             raise e
         return None
-
+       
 # =========================================================
 #             PART 7: PAGINATION HELPERS
 # =========================================================
