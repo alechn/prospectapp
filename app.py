@@ -7,6 +7,8 @@ import requests
 import io
 import os
 import subprocess
+import tempfile
+import shutil
 from typing import Optional, Dict, Any, List, Tuple
 from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
@@ -28,6 +30,8 @@ try:
     from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
     HAS_SELENIUM = True
 except Exception:
     HAS_SELENIUM = False
@@ -62,19 +66,30 @@ api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type=
 
 st.sidebar.markdown("---")
 st.sidebar.header("🛰️ Networking")
-search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 30, 2)
+search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 30, 5)
 use_browserlike_tls = st.sidebar.checkbox("Use browser-like requests (curl_cffi)", value=False)
 if use_browserlike_tls and not HAS_CURL:
     st.sidebar.warning("curl_cffi not installed; falling back to requests.")
     use_browserlike_tls = False
 
 st.sidebar.markdown("---")
-st.sidebar.header("🧪 Selenium")
+st.sidebar.header("🔎 Active Search Engine")
+active_search_engine = st.sidebar.selectbox(
+    "Engine:",
+    [
+        "Auto (Requests Form → Requests URL params → Selenium Chromium)",
+        "Requests: Form submit (no Selenium)",
+        "Requests: URL params (no Selenium)",
+        "Selenium: Chromium (force; error if can't start)",
+    ]
+)
+
+st.sidebar.markdown("---")
 run_headless = st.sidebar.checkbox("Run Selenium headless", value=True)
-selenium_wait = st.sidebar.slider("Selenium wait timeout", 3, 45, 12)
+selenium_wait = st.sidebar.slider("Selenium wait timeout", 3, 45, 15)
 
 with st.sidebar.expander("🛠️ Advanced / Debug"):
-    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3, table td.name")
+    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3, table td.name, a.gs-title")
     manual_next_selector = st.text_input("Manual Next Selector", placeholder="e.g. a[rel='next'], input[value*='Next']")
     manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
     manual_search_button = st.text_input("Manual Search Button Selector", placeholder="e.g. button[type='submit']")
@@ -379,6 +394,7 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
         "td.name", "td:first-child", "td:nth-child(1)",
         "h3", "h4", "h2",
         ".person .name", ".person-name", ".profile-name", ".result-title", ".result__title",
+        ".gs-title", "a.gs-title", ".gsc-result", # Google Search Selectors
         "a"
     ]
 
@@ -492,49 +508,69 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
 
 
 # =========================================================
-#             SELENIUM DRIVER (Streamlit Cloud-friendly)
+#             SELENIUM DRIVER (NUCLEAR OPTION FOR CLOUD)
 # =========================================================
-def get_driver(headless: bool = True):
+def get_driver(headless: bool = True, fail_loud: bool = False):
+    """
+    Streamlit Cloud-friendly Selenium setup with 'Nuclear' flags to prevent crashes.
+    """
     if not HAS_SELENIUM:
         return None
 
-    for p in ["/tmp/chrome-user-data", "/tmp/chrome-data-path", "/tmp/chrome-cache"]:
+    options = Options()
+    
+    # 1. Use Classic Headless (lighter on memory than --headless=new)
+    if headless:
+        options.add_argument("--headless")
+
+    # 2. Critical Container Flags
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--remote-allow-origins=*")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--no-zygote")  # Helps with 'Chrome instance exited'
+    options.add_argument("--ignore-certificate-errors")
+
+    # 3. Unique Profile (Prevents 'SessionNotCreatedException' from stale locks)
+    user_data_dir = tempfile.mkdtemp()
+    options.add_argument(f"--user-data-dir={user_data_dir}")
+    options.add_argument(f"--data-path={user_data_dir}/data")
+    options.add_argument(f"--disk-cache-dir={user_data_dir}/cache")
+
+    # 4. Explicit Binary Location
+    if os.path.exists("/usr/bin/chromium"):
+        options.binary_location = "/usr/bin/chromium"
+    elif os.path.exists("/usr/bin/chromium-browser"):
+        options.binary_location = "/usr/bin/chromium-browser"
+
+    # 5. Service Setup
+    service = None
+    if os.path.exists("/usr/bin/chromedriver"):
+        service = Service("/usr/bin/chromedriver")
+    else:
         try:
-            os.makedirs(p, exist_ok=True)
+            service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
         except Exception:
             pass
 
-    def build_options(use_new_headless: bool):
-        options = Options()
-        if headless:
-            options.add_argument("--headless=new" if use_new_headless else "--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--remote-allow-origins=*")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--user-data-dir=/tmp/chrome-user-data")
-        options.add_argument("--data-path=/tmp/chrome-data-path")
-        options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
-
-        if os.path.exists("/usr/bin/chromium"):
-            options.binary_location = "/usr/bin/chromium"
-        return options
-
-    service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else None
-
-    last = None
-    for use_new in ([True, False] if headless else [True]):
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
+    except Exception as e:
+        # Cleanup
         try:
-            if service:
-                return webdriver.Chrome(service=service, options=build_options(use_new))
-            return webdriver.Chrome(options=build_options(use_new))
-        except Exception as e:
-            last = e
-
-    st.warning(f"Selenium failed to start: {repr(last)}")
-    return None
+            shutil.rmtree(user_data_dir)
+        except:
+            pass
+            
+        if fail_loud:
+            st.error(f"Selenium Startup Failed: {e}")
+            raise e
+        return None
 
 
 # =========================================================
@@ -549,13 +585,6 @@ def selenium_wait_document_ready(driver, timeout: int = 10):
         pass
 
 def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = None):
-    """
-    More reliable wait:
-      1) document.readyState complete
-      2) if name_selector: wait for at least 1 match
-      3) else: wait for common result containers
-      4) fallback: wait for DOM node count to increase
-    """
     selenium_wait_document_ready(driver, min(8, timeout))
 
     if name_selector:
@@ -568,15 +597,8 @@ def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = N
             pass
 
     common = [
-        "main a",
-        "article a",
-        "table tbody tr",
-        "ul li a",
-        "ol li a",
-        ".search-results *",
-        "#search-results *",
-        ".results *",
-        "#results *",
+        "main a", "article a", "table tbody tr", "ul li a", 
+        ".search-results *", "#search-results *", ".gsc-result", ".gs-title"
     ]
     for sel in common:
         try:
@@ -587,29 +609,17 @@ def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = N
         except Exception:
             continue
 
-    try:
-        before = driver.execute_script("return document.getElementsByTagName('*').length") or 0
-        WebDriverWait(driver, timeout).until(
-            lambda d: (d.execute_script("return document.getElementsByTagName('*').length") or 0) > before + 30
-        )
-    except Exception:
-        pass
-
 
 # =========================================================
-#             ACTIVE SEARCH: FIXED LOGIC
+#             ACTIVE SEARCH
 # =========================================================
 def selenium_find_search_input(driver) -> Optional[str]:
     if manual_search_selector and len(driver.find_elements(By.CSS_SELECTOR, manual_search_selector)) > 0:
         return manual_search_selector
 
     candidates = [
-        "input[type='search']",
-        "input[name='q']",
-        "input[name='query']",
-        "input[name='search']",
-        "input[aria-label='Search']",
-        "input[placeholder*='search' i]"
+        "input[type='search']", "input[name='q']", "input[name='query']", 
+        "input[name='search']", "input[aria-label='Search']"
     ]
     for c in candidates:
         if len(driver.find_elements(By.CSS_SELECTOR, c)) > 0:
@@ -630,11 +640,9 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
         driver.execute_script("arguments[0].value = '';", inp)
 
         driver.execute_script(
-            """
-            arguments[0].value = arguments[1];
-            arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
-            arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
-            """,
+            "arguments[0].value = arguments[1];"
+            "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+            "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
             inp, query
         )
 
@@ -656,27 +664,6 @@ def selenium_submit_search(driver, sel_input: str, query: str) -> bool:
 
 
 # =========================================================
-#             MAIN UI
-# =========================================================
-st.markdown("### 🤖 Auto-Pilot Control Center")
-c1, c2 = st.columns([3, 1])
-start_url = c1.text_input("Target URL", placeholder="https://directory.example.com")
-max_pages = c2.number_input("Max Pages / Search Cycles", 1, 500, 10)
-
-st.write("---")
-mode = st.radio(
-    "Mode:",
-    [
-        "Classic Directory (Native/Fast)",
-        "Infinite Scroller (Selenium)",
-        "Active Search Injection (Brute Force Surnames)",
-    ]
-)
-
-if st.button("🚀 Start Mission", type="primary"):
-    st.session_state.running = True
-
-# =========================================================
 #             EXECUTION
 # =========================================================
 if st.session_state.running:
@@ -689,8 +676,6 @@ if st.session_state.running:
 
     status_log = st.status("Initializing...", expanded=True)
     table_placeholder = st.empty()
-
-    all_matches: List[Dict[str, Any]] = []
     all_seen = set()
 
     if st.session_state.matches:
@@ -710,100 +695,66 @@ if st.session_state.running:
             st.session_state.visited_fps.add(fp)
 
             status_log.update(label=f"Scanning Page {page}...", state="running")
-
             r = fetch_native(current_req["method"], current_req["url"], current_req.get("data"))
             if not r or getattr(r, "status_code", None) != 200:
-                status_log.warning(f"Fetch failed. HTTP={getattr(r, 'status_code', None)}")
                 break
 
-            raw_html = r.text
-            names = extract_names_multi(raw_html, manual_name_sel)
-
-            status_log.write(f"🧩 Extracted {len(names)} candidates.")
-            if debug_show_candidates:
-                st.write("URL:", current_req["url"])
-                st.write("HTML length:", len(raw_html))
-                st.write("Sample extracted candidates:", names[:30])
-
+            names = extract_names_multi(r.text, manual_name_sel)
             matches = match_names(names, f"Page {page}")
             if matches:
                 for m in matches:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
-                        all_matches.append(m)
-                all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                st.session_state.matches = all_matches
-                table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
+                        st.session_state.matches.append(m)
+                st.session_state.matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                table_placeholder.dataframe(pd.DataFrame(st.session_state.matches), height=320, use_container_width=True)
                 status_log.write(f"✅ Added {len(matches)} matches.")
-            else:
-                status_log.write("🤷 No matches.")
 
-            next_req = find_next_request_heuristic(
-                raw_html,
-                current_req["url"],
-                manual_next_sel
-            )
+            next_req = find_next_request_heuristic(r.text, current_req["url"], manual_next_sel)
             if not next_req:
-                status_log.info("🏁 No more pages detected.")
                 break
-
             current_req = {
                 "method": next_req.get("method", "GET").upper(),
                 "url": next_req["url"],
                 "data": next_req.get("data"),
             }
-            status_log.write(f"➡️ Next: {current_req['method']} {current_req['url']}")
             time.sleep(search_delay)
 
     # ---------------------------
     # INFINITE SCROLLER MODE
     # ---------------------------
     elif mode.startswith("Infinite"):
-        if not HAS_SELENIUM:
-            st.error("Selenium not installed.")
-            st.session_state.running = False
-            st.stop()
-
         driver = get_driver(headless=run_headless)
-        if not driver:
-            st.error("Selenium could not start in this environment.")
-            st.session_state.running = False
-            st.stop()
-
-        try:
-            driver.get(start_url)
-            selenium_wait_document_ready(driver, timeout=int(selenium_wait))
-            for k in range(int(max_pages)):
-                status_log.update(label=f"Scroll batch {k+1}/{int(max_pages)}...", state="running")
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(max(1, search_delay))
-                selenium_wait_results(driver, timeout=int(selenium_wait), name_selector=manual_name_sel)
-
-                html = driver.page_source
-                names = extract_names_multi(html, manual_name_sel)
-                matches = match_names(names, f"Scroll batch {k+1}")
-
-                for m in matches:
-                    if m["Full Name"] not in all_seen:
-                        all_seen.add(m["Full Name"])
-                        all_matches.append(m)
-                all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                st.session_state.matches = all_matches
-
-                if matches:
-                    table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
-                    status_log.write(f"✅ Added {len(matches)} matches.")
-        finally:
+        if driver:
             try:
+                driver.get(start_url)
+                for k in range(int(max_pages)):
+                    status_log.update(label=f"Scroll batch {k+1}/{int(max_pages)}...", state="running")
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(max(1, search_delay))
+                    selenium_wait_results(driver, timeout=int(selenium_wait), name_selector=manual_name_sel)
+                    
+                    names = extract_names_multi(driver.page_source, manual_name_sel)
+                    matches = match_names(names, f"Scroll batch {k+1}")
+                    if matches:
+                        for m in matches:
+                            if m["Full Name"] not in all_seen:
+                                all_seen.add(m["Full Name"])
+                                st.session_state.matches.append(m)
+                        st.session_state.matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                        table_placeholder.dataframe(pd.DataFrame(st.session_state.matches), height=320, use_container_width=True)
+                        status_log.write(f"✅ Added {len(matches)} matches.")
+            finally:
                 driver.quit()
-            except Exception:
-                pass
+        else:
+            st.error("Selenium unavailable.")
+            st.stop()
 
     # ---------------------------
     # ACTIVE SEARCH INJECTION MODE
     # ---------------------------
     else:
-        status_log.write("🔎 Active Search Injection (fixed): requests + selenium")
+        status_log.write("🔎 Active Search Injection (Fixed): Force Wait Enabled")
 
         driver = get_driver(headless=run_headless)
         if not driver:
@@ -811,7 +762,7 @@ if st.session_state.running:
 
         forced_param = manual_search_param.strip() if manual_search_param.strip() else None
         param_candidates = [forced_param] if forced_param else ["q", "query", "search", "name", "keyword", "term"]
-        wait_for_results = max(3, min(12, int(selenium_wait)))
+        wait_for_results = max(3, min(20, int(selenium_wait)))
 
         def requests_urlparam_search(term: str) -> Optional[str]:
             for p in param_candidates:
@@ -832,16 +783,8 @@ if st.session_state.running:
             deadline = time.time() + wait_for_results
 
             while not names_local and time.time() < deadline:
-                status_log.write("⏳ Waiting for results to render...")
-                time.sleep(1)
-                try:
-                    selenium_wait_results(
-                        driver,
-                        timeout=max(2, min(6, int(selenium_wait))),
-                        name_selector=manual_name_sel,
-                    )
-                except Exception:
-                    pass
+                status_log.write(f"⏳ Waiting for results... ({int(deadline - time.time())}s)")
+                time.sleep(1.5)
                 html_local = driver.page_source
                 names_local = extract_names_multi(html_local, manual_name_sel)
 
@@ -854,16 +797,9 @@ if st.session_state.running:
 
             if driver:
                 try:
-                    driver.get(start_url)
-                    selenium_wait_document_ready(driver, timeout=int(selenium_wait))
-
-                    # cookie click best-effort
-                    try:
-                        driver.execute_script(
-                            "document.querySelectorAll('button,a').forEach(b=>{if(/accept|agree|cookie/i.test(b.innerText))b.click()})"
-                        )
-                    except Exception:
-                        pass
+                    if surname == sorted_surnames[0] or "search" not in driver.current_url:
+                        driver.get(start_url)
+                        selenium_wait_document_ready(driver, timeout=int(selenium_wait))
 
                     sel_input = selenium_find_search_input(driver)
                     if not sel_input:
@@ -871,35 +807,27 @@ if st.session_state.running:
                     else:
                         ok = selenium_submit_search(driver, sel_input, surname)
                         if ok:
-                            selenium_wait_results(
-                                driver,
-                                timeout=int(selenium_wait),
-                                name_selector=manual_name_sel,
-                            )
+                            # CRITICAL FIX: Force wait for JS rendering
+                            sleep_time = max(4.0, float(search_delay))
+                            status_log.write(f"⏳ Loading results... ({sleep_time}s)")
+                            time.sleep(sleep_time) 
+                            
                             html, names = selenium_wait_for_names(driver)
                 except Exception as e:
                     status_log.warning(f"Selenium search failed: {repr(e)}")
                     html = None
 
-            if not html:
+            if not names and not html:
                 html = requests_urlparam_search(surname)
                 names = extract_names_multi(html, manual_name_sel) if html else []
-            elif not names:
-                names = extract_names_multi(html, manual_name_sel)
-
-            if not html:
-                status_log.write("🤷 No HTML results page.")
-                time.sleep(search_delay)
-                continue
 
             if debug_show_candidates:
-                st.write(f"URL after search: {(driver.current_url if driver else 'requests-mode')}")
-                st.write("HTML length:", len(html))
-                st.write(f"Sample extracted candidates for {surname}:", names[:30])
+                st.write(f"HTML len: {len(html) if html else 0}")
+                st.write(f"Candidates: {names[:10]}")
 
             if not names:
-                status_log.write("🤷 No names extracted from results page.")
-                time.sleep(search_delay)
+                status_log.write("🤷 No names found (check page load time or selector).")
+                time.sleep(1)
                 continue
 
             matches = match_names(names, f"Search: {surname}")
@@ -907,15 +835,12 @@ if st.session_state.running:
                 for m in matches:
                     if m["Full Name"] not in all_seen:
                         all_seen.add(m["Full Name"])
-                        all_matches.append(m)
-                all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
-                st.session_state.matches = all_matches
-                table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
+                        st.session_state.matches.append(m)
+                st.session_state.matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
+                table_placeholder.dataframe(pd.DataFrame(st.session_state.matches), height=320, use_container_width=True)
                 status_log.write(f"✅ Added {len(matches)} matches.")
             else:
-                status_log.write("🤷 Names found, but none matched current IBGE Top-N filters.")
-
-            time.sleep(search_delay)
+                status_log.write("🤷 Names found, but filtered by IBGE.")
 
         if driver:
             try:
@@ -933,7 +858,10 @@ if st.session_state.running:
         with c1:
             st.download_button("📥 CSV", df.to_csv(index=False).encode("utf-8"), "results.csv")
         with c2:
-            b = io.BytesIO()
-            with pd.ExcelWriter(b, engine="xlsxwriter") as w:
-                df.to_excel(w, index=False)
-            st.download_button("📥 Excel", b.getvalue(), "results.xlsx")
+            try:
+                b = io.BytesIO()
+                with pd.ExcelWriter(b, engine="xlsxwriter") as w:
+                    df.to_excel(w, index=False)
+                st.download_button("📥 Excel", b.getvalue(), "results.xlsx")
+            except:
+                pass
