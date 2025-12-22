@@ -360,6 +360,17 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
 def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
 
+    def fallback_from_text(text: str) -> List[str]:
+        out: List[str] = []
+        for raw in text.splitlines():
+            raw = " ".join(raw.split()).strip()
+            if len(raw) < 5 or len(raw.split()) > 6:
+                continue
+            c = clean_extracted_name(raw)
+            if c:
+                out.append(c)
+        return out
+
     selectors = []
     if manual_sel:
         selectors.append(manual_sel.strip())
@@ -381,6 +392,10 @@ def extract_names_multi(html: str, manual_sel: Optional[str] = None) -> List[str
 
         if len(out) >= 80 and sel in ("td:first-child", "h3", "h4", "td:nth-child(1)"):
             break
+
+    if not out:
+        text_blob = soup.get_text("\n", strip=True)
+        out = fallback_from_text(text_blob)
 
     return list(dict.fromkeys(out))
 
@@ -669,6 +684,9 @@ if st.session_state.running:
         st.error("Missing Target URL")
         st.stop()
 
+    manual_name_sel = manual_name_selector.strip() if manual_name_selector else None
+    manual_next_sel = manual_next_selector.strip() if manual_next_selector else None
+
     status_log = st.status("Initializing...", expanded=True)
     table_placeholder = st.empty()
 
@@ -699,7 +717,7 @@ if st.session_state.running:
                 break
 
             raw_html = r.text
-            names = extract_names_multi(raw_html, manual_name_selector.strip() if manual_name_selector else None)
+            names = extract_names_multi(raw_html, manual_name_sel)
 
             status_log.write(f"🧩 Extracted {len(names)} candidates.")
             if debug_show_candidates:
@@ -723,7 +741,7 @@ if st.session_state.running:
             next_req = find_next_request_heuristic(
                 raw_html,
                 current_req["url"],
-                manual_next_selector.strip() if manual_next_selector else None
+                manual_next_sel
             )
             if not next_req:
                 status_log.info("🏁 No more pages detected.")
@@ -759,10 +777,10 @@ if st.session_state.running:
                 status_log.update(label=f"Scroll batch {k+1}/{int(max_pages)}...", state="running")
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(max(1, search_delay))
-                selenium_wait_results(driver, timeout=int(selenium_wait), name_selector=(manual_name_selector.strip() if manual_name_selector else None))
+                selenium_wait_results(driver, timeout=int(selenium_wait), name_selector=manual_name_sel)
 
                 html = driver.page_source
-                names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
+                names = extract_names_multi(html, manual_name_sel)
                 matches = match_names(names, f"Scroll batch {k+1}")
 
                 for m in matches:
@@ -793,6 +811,7 @@ if st.session_state.running:
 
         forced_param = manual_search_param.strip() if manual_search_param.strip() else None
         param_candidates = [forced_param] if forced_param else ["q", "query", "search", "name", "keyword", "term"]
+        wait_for_results = max(3, min(12, int(selenium_wait)))
 
         def requests_urlparam_search(term: str) -> Optional[str]:
             for p in param_candidates:
@@ -807,9 +826,31 @@ if st.session_state.running:
                     return rr.text
             return None
 
+        def selenium_wait_for_names(driver) -> Tuple[str, List[str]]:
+            html_local = driver.page_source
+            names_local = extract_names_multi(html_local, manual_name_sel)
+            deadline = time.time() + wait_for_results
+
+            while not names_local and time.time() < deadline:
+                status_log.write("⏳ Waiting for results to render...")
+                time.sleep(1)
+                try:
+                    selenium_wait_results(
+                        driver,
+                        timeout=max(2, min(6, int(selenium_wait))),
+                        name_selector=manual_name_sel,
+                    )
+                except Exception:
+                    pass
+                html_local = driver.page_source
+                names_local = extract_names_multi(html_local, manual_name_sel)
+
+            return html_local, names_local
+
         for i, surname in enumerate(sorted_surnames[: int(max_pages)]):
             status_log.update(label=f"🔎 Searching '{surname}' ({i+1}/{int(max_pages)})", state="running")
             html = None
+            names: List[str] = []
 
             if driver:
                 try:
@@ -833,22 +874,24 @@ if st.session_state.running:
                             selenium_wait_results(
                                 driver,
                                 timeout=int(selenium_wait),
-                                name_selector=(manual_name_selector.strip() if manual_name_selector else None),
+                                name_selector=manual_name_sel,
                             )
-                            html = driver.page_source
+                            html, names = selenium_wait_for_names(driver)
                 except Exception as e:
                     status_log.warning(f"Selenium search failed: {repr(e)}")
                     html = None
 
             if not html:
                 html = requests_urlparam_search(surname)
+                names = extract_names_multi(html, manual_name_sel) if html else []
+            elif not names:
+                names = extract_names_multi(html, manual_name_sel)
 
             if not html:
                 status_log.write("🤷 No HTML results page.")
                 time.sleep(search_delay)
                 continue
 
-            names = extract_names_multi(html, manual_name_selector.strip() if manual_name_selector else None)
             if debug_show_candidates:
                 st.write(f"URL after search: {(driver.current_url if driver else 'requests-mode')}")
                 st.write("HTML length:", len(html))
