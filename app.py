@@ -1,21 +1,25 @@
 """
-Universal Brazilian Alumni Finder (Universal Pagination Edition)
+Universal Brazilian Alumni Finder (Universal Pagination + Cloud-safe Selenium + IBGE JSON cache)
 
-Goals:
-- Work on "most" directory/listing sites without site-specific rules.
-- Pagination support:
-  1) <a href="..."> next
-  2) <button>/<input> inside <form> (GET or POST)
-  3) URL query increment heuristics (?page=2, ?p=2, ?start=..., etc.)
-  4) Detect "Page X of Y" text and try to increment params
+What this app does:
+- Scrape directory-like pages, extract candidate names, score them vs IBGE first/surname rankings.
+- Universal pagination (Classic mode):
+  1) <a rel="next"> or next-like links
+  2) Next button/input inside a <form> (GET or POST) (e.g., Stanford legacy directory)
+  3) Query param increment heuristics (?page=?, ?p=?, ?pg=?, etc.)
+- Infinite scroller (Selenium): scroll + extract.
+- Active Search Injection:
+  - Selenium search box injection when Selenium can start.
+  - If Selenium cannot start on Streamlit Cloud, it fails gracefully (no crash).
 
-Notes:
-- "Universal" is never perfect: some sites require JS/XHR tokens. For those, use Selenium (Infinite mode),
-  or manual selectors, or the Search Injection mode.
-- This code is designed to be robust and fail-soft: it tries multiple strategies before stopping.
+IBGE:
+- Loads full rankings from data/ibge_rank_cache.json if present.
+- Otherwise can fetch from IBGE API (optional).
+- Sidebar controls let you use only Top N for matching (precision/speed).
 
-Streamlit Cloud:
-- Put `data/ibge_rank_cache.json` in your repo to avoid IBGE API waits.
+Streamlit Cloud tips:
+- Commit data/ibge_rank_cache.json to your repo for instant startup.
+- Selenium may be unavailable on Cloud sometimes; Classic mode will still work on many sites.
 """
 
 import os
@@ -31,7 +35,6 @@ import pandas as pd
 from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
-
 
 # -------------------------
 # Optional: curl_cffi (browser-like TLS fingerprint)
@@ -52,7 +55,6 @@ try:
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
     from webdriver_manager.chrome import ChromeDriverManager
-    from webdriver_manager.core.os_manager import ChromeType
     HAS_SELENIUM = True
 except Exception:
     HAS_SELENIUM = False
@@ -63,7 +65,7 @@ except Exception:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Heuristics First • Optional AI • Universal Pagination • IBGE File→API Fallback")
+st.caption("Hybrid Engine • Heuristics First • Optional AI • Universal Pagination • IBGE File→API Fallback")
 st.info(
     "Reminder: only scrape directories you have permission to process. "
     "Respect robots.txt, rate limits, and site terms."
@@ -74,7 +76,7 @@ if "running" not in st.session_state:
 if "matches" not in st.session_state:
     st.session_state.matches = []
 if "visited_fps" not in st.session_state:
-    st.session_state.visited_fps = set()  # request fingerprints (method+url+data)
+    st.session_state.visited_fps = set()
 if "learned_selectors" not in st.session_state:
     st.session_state.learned_selectors = {}
 if "pages_scanned" not in st.session_state:
@@ -392,10 +394,6 @@ Return STRICT JSON in this shape:
   }}
 }}
 
-Hints:
-- Many directories use tables: try selectors like "table tbody tr td:first-child"
-- For next: could be 'a[rel=next]', 'a.next', 'button.next', 'input[value*=\"Next\"]'
-
 Output JSON only.
 
 HTML:
@@ -428,7 +426,6 @@ def request_fingerprint(method: str, url: str, data: Optional[dict]) -> str:
     return f"{method.upper()}|{url}|{json.dumps(data or {}, sort_keys=True, ensure_ascii=False)}"
 
 def extract_form_request_from_element(el, current_url: str) -> Optional[Dict[str, Any]]:
-    """Given a <button>/<input> element, find parent form and build GET/POST request."""
     if el is None:
         return None
     if el.name not in ("button", "input"):
@@ -441,24 +438,20 @@ def extract_form_request_from_element(el, current_url: str) -> Optional[Dict[str
     method = (form.get("method") or "GET").upper()
     action = form.get("action") or current_url
 
-    soup = el if isinstance(el, BeautifulSoup) else None  # unused, kept simple
     base_url = current_url
     url = urljoin(base_url, action)
 
     data: Dict[str, str] = {}
-    # collect inputs
     for inp in form.find_all("input"):
         nm = inp.get("name")
         if not nm:
             continue
         data[nm] = inp.get("value", "")
 
-    # include the clicked control if it has a name/value (some servers require it)
     btn_name = el.get("name")
     if btn_name:
         data[btn_name] = el.get("value", "")
 
-    # If GET, encode into URL
     if method == "GET":
         u = urlparse(url)
         qs = parse_qs(u.query)
@@ -470,7 +463,6 @@ def extract_form_request_from_element(el, current_url: str) -> Optional[Dict[str
     return {"method": "POST", "url": url, "data": data}
 
 def find_next_request_by_selector(html: str, current_url: str, next_selector: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Try to build next-page request from a CSS selector."""
     if not next_selector:
         return None
     soup = BeautifulSoup(html, "html.parser")
@@ -481,25 +473,15 @@ def find_next_request_by_selector(html: str, current_url: str, next_selector: Op
     base = soup.find("base", href=True)
     base_url = base["href"] if base else current_url
 
-    # Link
     if el.name == "a" and el.get("href"):
         return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
 
-    # Button/Input inside form
     if el.name in ("button", "input"):
         return extract_form_request_from_element(el, current_url=base_url)
 
     return None
 
 def find_next_request_heuristic(html: str, current_url: str, manual_next: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    Heuristic pagination finder:
-    1) manual selector
-    2) a[rel=next]
-    3) anchors with text Next / › / » / >
-    4) buttons/inputs with value/text Next / › / »
-    5) query param increment if page info found or common keys exist
-    """
     soup = BeautifulSoup(html, "html.parser")
     base = soup.find("base", href=True)
     base_url = base["href"] if base else current_url
@@ -516,18 +498,24 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
         return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
 
     # 3) anchors by text / aria-label
-    next_texts = {"next", "next page", "older", ">", "›", "»"}
+    next_texts = {"next", "next page", "older", ">", "›", "»", "more"}
     for a in soup.select("a[href]"):
         t = (a.get_text(" ", strip=True) or "").strip().lower()
         aria = (a.get("aria-label") or "").strip().lower()
         if t in next_texts or aria in next_texts or "next" in aria:
             return {"method": "GET", "url": urljoin(base_url, a["href"]), "data": None}
 
-    # 4) buttons/inputs by label/value
     def looks_like_next(s: str) -> bool:
         s = (s or "").strip().lower()
-        return s in next_texts or "next" in s or s in {">", "›", "»"} or s.endswith("next") or s.startswith("next")
+        if s in next_texts:
+            return True
+        if "next" in s or "more" in s:
+            return True
+        if s in {">", "›", "»"}:
+            return True
+        return False
 
+    # 4) buttons/inputs by label/value
     for btn in soup.find_all(["button", "input"]):
         if btn.name == "button":
             if looks_like_next(btn.get_text(" ", strip=True)) or looks_like_next(btn.get("aria-label", "")):
@@ -541,8 +529,7 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
                 if req:
                     return req
 
-    # 5) query param increment heuristics
-    # If "Page X of Y" exists, try incrementing a common page param if present
+    # 5) query increment if page info exists
     text = soup.get_text(" ", strip=True)
     m = re.search(r"\bPage\s+(\d+)\s+of\s+(\d+)\b", text, flags=re.IGNORECASE)
     if m:
@@ -550,10 +537,7 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
         if cur < total:
             u = urlparse(base_url)
             qs = parse_qs(u.query)
-
-            # common keys
-            keys = ["page", "p", "pg", "paging", "start", "offset"]
-            for k in keys:
+            for k in ["page", "p", "pg", "paging", "start", "offset"]:
                 if k in qs:
                     try:
                         val = int(qs[k][0])
@@ -562,7 +546,7 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
                     except Exception:
                         pass
 
-    # If no "Page X of Y", still try to increment if URL already has a page-like param
+    # if URL already has a page-like param
     u = urlparse(base_url)
     qs = parse_qs(u.query)
     for k in ["page", "p", "pg"]:
@@ -591,7 +575,6 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
                 out.append(cand)
         return list(dict.fromkeys(out))
 
-    # Table header heuristic: if any header contains "name", grab first td
     for table in soup.find_all("table"):
         headers = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
         if any("name" in h for h in headers):
@@ -605,7 +588,6 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
             if out:
                 return list(dict.fromkeys(out))
 
-    # General fallback: headings/links
     for sel in ["h3", "h4", "h2", "a"]:
         for el in soup.select(sel):
             cand = clean_extracted_name(el.get_text(" ", strip=True))
@@ -740,23 +722,39 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
     except Exception:
         return None
 
-def get_driver(headless=True):
+def get_driver(headless: bool = True):
+    """
+    Streamlit Cloud–friendly Chrome driver.
+    Uses Selenium Manager first. Falls back to webdriver_manager.
+    Returns None if it cannot start (so the app doesn't crash).
+    """
     if not HAS_SELENIUM:
         return None
+
     options = Options()
     if headless:
         options.add_argument("--headless=new")
+
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--incognito")
+    options.add_argument("--remote-allow-origins=*")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+
+    # Try Selenium Manager
     try:
         return webdriver.Chrome(options=options)
     except Exception:
-        return webdriver.Chrome(
-            service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-            options=options
-        )
+        pass
+
+    # Fallback
+    try:
+        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    except Exception:
+        return None
 
 def fetch_selenium(driver, url, scroll_count=0):
     driver.get(url)
@@ -785,14 +783,12 @@ mode = st.radio(
 run_headless = True
 if "Search" in mode or "Infinite" in mode:
     if not HAS_SELENIUM:
-        st.error("Selenium Missing")
-        st.stop()
+        st.warning("Selenium not installed in this environment. Infinite/Search modes may not work.")
     run_headless = st.checkbox("Headless Mode", value=True)
 
 if st.button("🚀 Start Mission", type="primary"):
     st.session_state.running = True
 
-# show existing results
 if st.session_state.matches:
     st.dataframe(pd.DataFrame(st.session_state.matches), use_container_width=True, height=240)
 
@@ -815,6 +811,13 @@ if st.session_state.running:
     # ------------------------------------------------------------------
     if "Search Injection" not in mode:
         driver = get_driver(headless=run_headless) if "Infinite" in mode else None
+        if "Infinite" in mode and not driver:
+            st.error(
+                "Selenium could not start on this environment (common on Streamlit Cloud). "
+                "Use Classic mode, or deploy on a Docker/VM where Chrome is available."
+            )
+            st.session_state.running = False
+            st.stop()
 
         current_req = {"method": "GET", "url": start_url, "data": None}
 
@@ -852,7 +855,6 @@ if st.session_state.running:
             names: List[str] = []
             next_req: Optional[Dict[str, Any]] = None
 
-            # 1) Try selectors (saved / learned / manual)
             selectors = dict(st.session_state.learned_selectors) if isinstance(st.session_state.learned_selectors, dict) else {}
             selectors.update(manual_overrides)
 
@@ -864,13 +866,11 @@ if st.session_state.running:
                 if nx2:
                     next_req = nx2
 
-            # 2) Heuristic names if selectors failed
             if not names:
                 names = heuristic_extract_names(raw_html, manual_name_selector.strip() if manual_name_selector else None)
                 if names:
                     status_log.write(f"🧩 Heuristic extracted {len(names)} names.")
 
-            # 3) If no next_req yet, heuristic pagination
             if not next_req:
                 next_req = find_next_request_heuristic(
                     raw_html,
@@ -878,7 +878,6 @@ if st.session_state.running:
                     manual_next_selector.strip() if manual_next_selector else None
                 )
 
-            # 4) AI selector learning (one-time) if still weak
             if api_key and not st.session_state.learned_selectors and (len(names) == 0 or not next_req):
                 status_log.write("🧠 AI learning selectors (one-time)...")
                 learned = agent_learn_selectors(raw_html, current_req["url"], ai_provider, api_key)
@@ -898,13 +897,9 @@ if st.session_state.running:
                         names = n3
                     if nx3:
                         next_req = nx3
-
-                    # Even if AI gave a selector, if it didn't produce a next request,
-                    # try heuristic again (universal)
                     if not next_req:
                         next_req = find_next_request_heuristic(raw_html, current_req["url"])
 
-            # MATCHING
             if names:
                 matches = match_names_detailed(names, f"Page {page}", int(limit_first), int(limit_surname))
                 if matches:
@@ -916,7 +911,6 @@ if st.session_state.running:
             else:
                 status_log.write("🤷 No names extracted.")
 
-            # NEXT PAGE
             if next_req and next_req.get("url"):
                 current_req = {
                     "method": next_req.get("method", "GET").upper(),
@@ -937,8 +931,22 @@ if st.session_state.running:
     # BRANCH B: SEARCH INJECTION
     # ------------------------------------------------------------------
     else:
+        if not HAS_SELENIUM:
+            st.error(
+                "Selenium is not available in this environment, so Active Search Injection cannot run. "
+                "Use Classic mode instead."
+            )
+            st.session_state.running = False
+            st.stop()
+
         driver = get_driver(headless=run_headless)
         if not driver:
+            st.error(
+                "Selenium could not start on this environment (common on Streamlit Cloud). "
+                "Active Search Injection requires a working Chrome+driver. "
+                "Use Classic mode or run this app on a Docker/VM with Chrome installed."
+            )
+            st.session_state.running = False
             st.stop()
 
         try:
@@ -952,7 +960,7 @@ if st.session_state.running:
                     "input[name='q']",
                     "input[name='query']",
                     "input[aria-label='Search']",
-                    "input[placeholder*='Search' i]",
+                    "input[placeholder*='search' i]",
                 ]:
                     if len(driver.find_elements(By.CSS_SELECTOR, f)) > 0:
                         sel_input = f
@@ -961,6 +969,7 @@ if st.session_state.running:
             if not sel_input:
                 st.error("No Search Box found. Provide Manual Search Box Selector.")
                 driver.quit()
+                st.session_state.running = False
                 st.stop()
 
             status_log.success(f"🎯 Search input: {sel_input}")
@@ -989,7 +998,6 @@ if st.session_state.running:
                             table_placeholder.dataframe(pd.DataFrame(st.session_state.matches), height=320, use_container_width=True)
                             status_log.write(f"✅ Added {len(matches)} matches.")
 
-                    # back
                     try:
                         driver.execute_script("window.history.go(-1)")
                         time.sleep(1.5)
