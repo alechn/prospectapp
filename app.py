@@ -1,9 +1,13 @@
 """
 Universal Brazilian Alumni Finder (Streamlit Cloud friendly)
 ✅ Classic directories (requests): names + pagination (links/forms/heuristics)
-✅ Active Search (free): Requests form, Requests URL params, Selenium Chromium (best-effort)
+✅ Active Search (free): Requests form, Requests URL params, Selenium Chromium (best-effort or forced)
+✅ Infinite scroll (Selenium)
 ✅ Optional AI: learn selectors once (name + next)
 ✅ IBGE: load from data/ibge_rank_cache.json if present; else fetch from API; can save
+✅ Fixes:
+   - Selenium now fails loudly when forced (shows real exception)
+   - Name cleaner handles "LAST, FIRST" (MIT-style) instead of truncating at comma
 
 STREAMLIT CLOUD SETUP (FREE)
 1) packages.txt (repo root):
@@ -20,10 +24,6 @@ STREAMLIT CLOUD SETUP (FREE)
    selenium
    webdriver-manager
    curl_cffi
-
-NOTES
-- Selenium on Streamlit Cloud can still fail depending on container updates.
-- This app includes a Selenium diagnostics button to verify chromium/chromedriver.
 """
 
 import os
@@ -41,14 +41,14 @@ from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
 
-# Optional: curl_cffi for more browser-like TLS fingerprint (free)
+# Optional: curl_cffi for browser-like TLS (free)
 try:
     from curl_cffi import requests as crequests  # type: ignore
     HAS_CURL = True
 except Exception:
     HAS_CURL = False
 
-# Optional: Selenium (FREE, but may fail on Streamlit Cloud depending on environment)
+# Optional: Selenium (free)
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -213,21 +213,43 @@ def normalize_token(s: str) -> str:
     return "".join(ch for ch in s if "A" <= ch <= "Z")
 
 def clean_extracted_name(raw_text):
+    """
+    Improved cleaner:
+    - converts "LAST, FIRST ..." -> "FIRST LAST"
+    - does NOT truncate at comma before conversion (MIT fix)
+    """
     if not isinstance(raw_text, str):
         return None
+
+    raw_text = " ".join(raw_text.split()).strip()
+    if not raw_text:
+        return None
+
     upper = raw_text.upper()
-    junk = ["RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "JEWELS", "SPOTLIGHT", "GUIDE", "LOG", "REVIEW"]
+    junk = ["RESULTS FOR", "SEARCH", "WEBSITE", "EDITION", "SPOTLIGHT", "GUIDE", "LOG", "REVIEW"]
     if any(j in upper for j in junk):
         return None
-    if ":" in raw_text:
-        raw_text = raw_text.split(":")[-1]
-    clean = re.split(r"[|,\-–—»\(\)]", raw_text)[0]
-    clean = " ".join(clean.split())
-    if len(clean.split()) > 6 or len(clean) < 3:
+
+    # "Last, First Middle" -> "First Middle Last"
+    if "," in raw_text:
+        parts = [p.strip() for p in raw_text.split(",") if p.strip()]
+        if len(parts) >= 2:
+            last = parts[0]
+            first = parts[1]
+            raw_text = f"{first} {last}"
+
+    # cut off other separators after comma handling
+    raw_text = re.split(r"[|–—»\(\)]", raw_text)[0].strip()
+    raw_text = re.split(r"\s+-\s+|\s+\|\s+", raw_text)[0].strip()
+
+    clean = " ".join(raw_text.split()).strip()
+    if len(clean) < 3:
         return None
-    if clean.isupper() and len(clean.split()) <= 2 and clean in BLOCKLIST_SURNAMES:
+    if len(clean.split()) > 6:
         return None
-    return clean.strip()
+    if clean.isupper() and clean in BLOCKLIST_SURNAMES:
+        return None
+    return clean
 
 
 # =========================================================
@@ -493,12 +515,13 @@ def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation:
 
 
 # =========================================================
-#             PART 6: SELENIUM DRIVER (BEST-EFFORT, FREE)
+#             PART 6: SELENIUM DRIVER (LOUD WHEN FORCED)
 # =========================================================
-def get_driver(headless: bool = True):
+def get_driver(headless: bool = True, fail_loud: bool = False):
     """
-    Streamlit Cloud-friendly Selenium setup (free).
-    IMPORTANT: sets binary_location to system Chromium when available.
+    Streamlit Cloud-friendly Selenium setup.
+    Uses system Chromium + system chromedriver.
+    If fail_loud=True, raises and also shows the exception in the UI.
     """
     if not HAS_SELENIUM:
         return None
@@ -512,36 +535,33 @@ def get_driver(headless: bool = True):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-extensions")
     options.add_argument("--remote-allow-origins=*")
 
-    # Explicit Chromium binary (key fix for Streamlit Cloud)
-    for p in ["/usr/bin/chromium", "/usr/bin/chromium-browser"]:
-        if os.path.exists(p):
-            options.binary_location = p
-            break
+    # Extra flags for Streamlit Cloud / Debian containers
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
 
-    # 1) Use system chromedriver if present (Streamlit Cloud packages.txt)
-    system_driver = "/usr/bin/chromedriver"
-    if os.path.exists(system_driver):
-        try:
-            return webdriver.Chrome(service=Service(system_driver), options=options)
-        except Exception:
-            pass
+    # Writable dirs
+    options.add_argument("--user-data-dir=/tmp/chrome-user-data")
+    options.add_argument("--data-path=/tmp/chrome-data-path")
+    options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
 
-    # 2) webdriver_manager pinned to Chromium
+    # Explicit Chromium binary (your diagnostics confirm this exists)
+    options.binary_location = "/usr/bin/chromium"
+
+    # Prefer system driver (your diagnostics confirm this exists)
+    service = Service("/usr/bin/chromedriver")
+
     try:
-        return webdriver.Chrome(
-            service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-            options=options
-        )
-    except Exception:
-        pass
-
-    # 3) Selenium manager fallback
-    try:
-        return webdriver.Chrome(options=options)
-    except Exception:
+        return webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        st.error(f"Selenium failed to start: {repr(e)}")
+        if fail_loud:
+            raise
         return None
 
 
@@ -639,7 +659,6 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
                 if req:
                     return req
 
-    # URL param increment if present
     u = urlparse(base_url)
     qs = parse_qs(u.query)
     for k in ["page", "p", "pg", "start", "offset"]:
@@ -666,7 +685,7 @@ def looks_like_person_name(s: str) -> bool:
     if len(s) < 4 or len(s.split()) > 6:
         return False
     up = s.upper()
-    bad = {"MIT", "DIRECTORY", "SEARCH", "RESULTS", "OFFICE", "DEPARTMENT", "VIEW", "CONTACT", "EMAIL"}
+    bad = {"DIRECTORY", "SEARCH", "RESULTS", "OFFICE", "DEPARTMENT", "VIEW", "CONTACT", "EMAIL"}
     if any(b in up for b in bad):
         return False
     if not NAME_REGEX.match(s):
@@ -679,7 +698,6 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
     soup = BeautifulSoup(html_content, "html.parser")
     out: List[str] = []
 
-    # 0) manual selector
     if name_selector:
         for el in soup.select(name_selector):
             cand = clean_extracted_name(el.get_text(" ", strip=True))
@@ -687,7 +705,7 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
                 out.append(cand)
         return list(dict.fromkeys(out))
 
-    # 1) strongest signal: mailto blocks (often people listings)
+    # mailto blocks (people results)
     for a in soup.select("a[href^='mailto:']"):
         block = a.find_parent(["li", "div", "tr", "section"]) or a.parent
         if not block:
@@ -709,7 +727,6 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
     if out:
         return list(dict.fromkeys(out))
 
-    # 2) tables with "name" header
     for table in soup.find_all("table"):
         headers = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
         if any("name" in h for h in headers):
@@ -723,7 +740,6 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
             if out:
                 return list(dict.fromkeys(out))
 
-    # 3) headings/links
     for sel in ["h3", "h4", "h2", "a"]:
         for el in soup.select(sel):
             cand = clean_extracted_name(el.get_text(" ", strip=True))
@@ -964,7 +980,7 @@ def try_requests_urlparam_search(start_url: str, term: str, forced_param: Option
             return r
     return None
 
-def selenium_search(driver, start_url: str, term: str) -> Optional[str]:
+def selenium_search(driver, start_url: str, term: str, delay: int) -> Optional[str]:
     try:
         driver.get(start_url)
         time.sleep(2)
@@ -991,7 +1007,7 @@ def selenium_search(driver, start_url: str, term: str) -> Optional[str]:
         inp.send_keys(Keys.BACKSPACE)
         inp.send_keys(term)
         inp.send_keys(Keys.RETURN)
-        time.sleep(max(1, search_delay))
+        time.sleep(max(1, delay))
 
         return driver.page_source
     except Exception:
@@ -1143,12 +1159,7 @@ if st.session_state.running:
             st.session_state.running = False
             st.stop()
 
-        driver = get_driver(headless=run_headless)
-        if not driver:
-            st.error("Selenium could not start here. Check packages.txt + diagnostics.")
-            st.session_state.running = False
-            st.stop()
-
+        driver = get_driver(headless=run_headless, fail_loud=True)
         try:
             driver.get(start_url)
             time.sleep(3)
@@ -1190,28 +1201,25 @@ if st.session_state.running:
             status_log.write("ℹ️ No obvious search form found on landing page.")
 
         driver = None
+        force_selenium = active_search_engine.startswith("Selenium:")
+
         if active_search_engine in (
             "Auto (Requests Form → Requests URL params → Selenium Chromium)",
             "Selenium: Chromium (force; error if can't start)",
         ):
             if not HAS_SELENIUM:
-                if active_search_engine.startswith("Selenium:"):
+                if force_selenium:
                     st.error("Selenium not installed. Add selenium + webdriver-manager to requirements.txt.")
                     st.session_state.running = False
                     st.stop()
             else:
-                driver = get_driver(headless=run_headless)
-
-                if not driver:
-                    if active_search_engine.startswith("Selenium:"):
-                        st.error("Selenium could not start here. Run diagnostics; check packages.txt.")
-                        st.session_state.running = False
-                        st.stop()
-                    else:
-                        status_log.warning("Selenium could not start here. Will use requests engines only.")
+                # ✅ NEW: fail loudly when forced so you see the true exception
+                driver = get_driver(headless=run_headless, fail_loud=force_selenium)
+                if not driver and not force_selenium:
+                    status_log.warning("Selenium could not start here. Will use requests engines only.")
 
         def extract_and_add(html: str, source: str) -> int:
-            # MIT-like search pages: pivot to 'People' if exists
+            # Pivot to a "People" tab if present (MIT/global search)
             people_url = discover_people_results_url(html, start_url)
             if people_url and people_url != start_url:
                 rp = fetch_native("GET", people_url, None, tls_impersonation=use_browserlike_tls)
@@ -1238,9 +1246,8 @@ if st.session_state.running:
                 r = try_requests_urlparam_search(start_url, term, forced_param=forced_param)
                 return r.text if r and getattr(r, "status_code", None) == 200 else None
 
-            if active_search_engine.startswith("Selenium:"):
-                # Forced selenium path already validated driver exists
-                return selenium_search(driver, start_url, term) if driver else None
+            if force_selenium:
+                return selenium_search(driver, start_url, term, int(search_delay)) if driver else None
 
             # AUTO pipeline
             if cached_form:
@@ -1253,7 +1260,7 @@ if st.session_state.running:
                 return r.text
 
             if driver:
-                html = selenium_search(driver, start_url, term)
+                html = selenium_search(driver, start_url, term, int(search_delay))
                 if html:
                     return html
 
