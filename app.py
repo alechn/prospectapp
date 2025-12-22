@@ -1,31 +1,37 @@
 """
-Universal Brazilian Alumni Finder (Streamlit Cloud + Local Friendly)
+Universal Brazilian Alumni Finder (Universal Pagination Edition)
 
-✅ IBGE loading strategy:
-1) Try to load data/ibge_rank_cache.json (repo/local file)
-2) If missing (e.g., third-party running locally), fetch from IBGE API (cached)
-3) Optionally save fetched JSON locally for future runs
+Goals:
+- Work on "most" directory/listing sites without site-specific rules.
+- Pagination support:
+  1) <a href="..."> next
+  2) <button>/<input> inside <form> (GET or POST)
+  3) URL query increment heuristics (?page=2, ?p=2, ?start=..., etc.)
+  4) Detect "Page X of Y" text and try to increment params
 
-✅ Sidebar keeps "Top N" precision controls (Top 10, Top 3000, etc.)
+Notes:
+- "Universal" is never perfect: some sites require JS/XHR tokens. For those, use Selenium (Infinite mode),
+  or manual selectors, or the Search Injection mode.
+- This code is designed to be robust and fail-soft: it tries multiple strategies before stopping.
 
-✅ Heuristics-first scraping (Classic mode works on many directories)
-✅ Optional AI: selector learning + non-destructive verification
-✅ Session-state persistence: matches, visited URLs, learned selectors
+Streamlit Cloud:
+- Put `data/ibge_rank_cache.json` in your repo to avoid IBGE API waits.
 """
 
 import os
 import json
 import time
 import re
-import requests
 import io
 from typing import Optional, Dict, Any, List, Tuple
 
+import requests
 import streamlit as st
 import pandas as pd
 from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
+
 
 # -------------------------
 # Optional: curl_cffi (browser-like TLS fingerprint)
@@ -57,7 +63,7 @@ except Exception:
 # =========================================================
 st.set_page_config(page_title="Universal Alumni Finder", layout="wide", page_icon="🕵️")
 st.title("🕵️ Universal Brazilian Alumni Finder")
-st.caption("Hybrid Engine • Heuristics First • Optional AI • IBGE File→API Fallback")
+st.caption("Heuristics First • Optional AI • Universal Pagination • IBGE File→API Fallback")
 st.info(
     "Reminder: only scrape directories you have permission to process. "
     "Respect robots.txt, rate limits, and site terms."
@@ -67,16 +73,18 @@ if "running" not in st.session_state:
     st.session_state.running = False
 if "matches" not in st.session_state:
     st.session_state.matches = []
-if "visited_urls" not in st.session_state:
-    st.session_state.visited_urls = set()
+if "visited_fps" not in st.session_state:
+    st.session_state.visited_fps = set()  # request fingerprints (method+url+data)
 if "learned_selectors" not in st.session_state:
     st.session_state.learned_selectors = {}
+if "pages_scanned" not in st.session_state:
+    st.session_state.pages_scanned = 0
 
 
 # =========================================================
 #             PART 1: SIDEBAR / SETTINGS
 # =========================================================
-st.sidebar.header("🧠 AI Brain")
+st.sidebar.header("🧠 AI Brain (optional)")
 ai_provider = st.sidebar.selectbox(
     "Choose your Model:",
     ["Google Gemini (Flash 2.0)", "OpenAI (GPT-4o)", "Anthropic (Claude 3.5)", "DeepSeek (V3)"]
@@ -84,8 +92,17 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 st.sidebar.markdown("---")
-st.sidebar.header("💾 Memory & Logic")
+st.sidebar.header("🛰️ Networking")
+search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 30, 2)
+use_browserlike_tls = st.sidebar.checkbox(
+    "Use browser-like requests (curl_cffi)", value=False,
+    help="Optional. Helps for some sites. Requires curl_cffi installed."
+)
+if use_browserlike_tls and not HAS_CURL:
+    st.sidebar.warning("curl_cffi not installed; falling back to requests.")
 
+st.sidebar.markdown("---")
+st.sidebar.header("💾 Selector Memory")
 uploaded_selectors = st.sidebar.file_uploader("Load Selectors (JSON)", type="json")
 if uploaded_selectors:
     try:
@@ -102,47 +119,22 @@ if st.session_state.learned_selectors:
         mime="application/json"
     )
 
-search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 30, 2)
-
 use_ai_verification = st.sidebar.checkbox(
     "✨ AI Verify (Non-Destructive)", value=False,
     help="Adds AI_Observation column, does not delete rows."
 )
 
-st.sidebar.markdown("---")
-st.sidebar.header("🛰️ Networking")
-use_browserlike_tls = st.sidebar.checkbox(
-    "Use browser-like requests (curl_cffi)", value=False,
-    help="Optional. Helps for some sites. Requires curl_cffi installed."
-)
-if use_browserlike_tls and not HAS_CURL:
-    st.sidebar.warning("curl_cffi not installed; falling back to requests.")
-
 with st.sidebar.expander("🛠️ Advanced / Debug"):
     manual_search_selector = st.sidebar.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
     manual_name_selector = st.sidebar.text_input("Manual Name Selector", placeholder="e.g. table tbody tr td:first-child or h3")
-    manual_next_selector = st.sidebar.text_input("Manual Next Selector", placeholder="e.g. a[rel='next'] or a.next")
+    manual_next_selector = st.sidebar.text_input("Manual Next Selector", placeholder="e.g. a[rel='next'], a.next, button.next")
     show_debug_ai_payload = st.sidebar.checkbox("Show AI Debug Errors", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.header("⚙️ IBGE Matching Scope (Precision)")
-limit_first = st.sidebar.number_input("Use Top N First Names", 1, 20000, 3000, 1)
-limit_surname = st.sidebar.number_input("Use Top N Surnames", 1, 20000, 3000, 1)
-
-allow_api = st.sidebar.checkbox("If JSON missing, fetch from IBGE API", value=True)
-save_local = st.sidebar.checkbox("If fetched, save JSON locally", value=True)
-
-if st.sidebar.button("🔄 Refresh IBGE (clear API cache)"):
-    # clears cached API download
-    # (file cache still used if present)
-    # This doesn't delete the JSON file; it only clears st.cache_data for API.
-    st.cache_data.clear()
-    st.sidebar.success("Cleared Streamlit data cache. Next run may refetch from API if JSON is missing.")
 
 if st.sidebar.button("🧹 Clear session results"):
     st.session_state.matches = []
-    st.session_state.visited_urls = set()
-    st.sidebar.success("Cleared results & visited URLs.")
+    st.session_state.visited_fps = set()
+    st.session_state.pages_scanned = 0
+    st.sidebar.success("Cleared results & pagination fingerprints.")
 
 if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
     st.session_state.running = False
@@ -151,7 +143,7 @@ if st.sidebar.button("🛑 ABORT MISSION", type="primary"):
 
 
 # =========================================================
-#             PART 2: HELPERS / BLOCKLIST / NAME CLEAN
+#             PART 2: NAME CLEANING / BLOCKLIST
 # =========================================================
 BLOCKLIST_SURNAMES = {
     "WANG", "LI", "ZHANG", "LIU", "CHEN", "YANG", "HUANG", "ZHAO", "WU", "ZHOU",
@@ -194,6 +186,13 @@ def clean_extracted_name(raw_text):
 # =========================================================
 IBGE_CACHE_FILE = "data/ibge_rank_cache.json"
 
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ IBGE Matching Scope (Precision)")
+limit_first = st.sidebar.number_input("Use Top N First Names", 1, 20000, 3000, 1)
+limit_surname = st.sidebar.number_input("Use Top N Surnames", 1, 20000, 3000, 1)
+allow_api = st.sidebar.checkbox("If JSON missing, fetch from IBGE API", value=True)
+save_local = st.sidebar.checkbox("If fetched, save JSON locally", value=True)
+
 @st.cache_data(ttl=60 * 60 * 24 * 30)  # 30 days
 def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
     IBGE_FIRST = "https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome"
@@ -228,7 +227,6 @@ def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str
 
 @st.cache_resource
 def load_ibge_full_best_effort(allow_api_fallback: bool, save_if_fetched: bool):
-    # 1) Try file
     if os.path.exists(IBGE_CACHE_FILE):
         with open(IBGE_CACHE_FILE, "r", encoding="utf-8") as f:
             payload = json.load(f)
@@ -240,13 +238,11 @@ def load_ibge_full_best_effort(allow_api_fallback: bool, save_if_fetched: bool):
             surname_full = {str(k): int(v) for k, v in surname_full.items()}
             return first_full, surname_full, meta, "file"
 
-    # 2) API fallback
     if not allow_api_fallback:
         raise FileNotFoundError(f"IBGE cache file not found at '{IBGE_CACHE_FILE}' and API fallback disabled.")
 
     first_full, surname_full, meta = fetch_ibge_full_from_api()
 
-    # 3) Save (local only; Streamlit Cloud may not persist across restarts)
     if save_if_fetched:
         try:
             os.makedirs(os.path.dirname(IBGE_CACHE_FILE), exist_ok=True)
@@ -284,6 +280,10 @@ with st.sidebar.status("Loading IBGE...", expanded=False) as s:
         st.error(f"IBGE load failed: {e}")
         st.stop()
 
+if st.sidebar.button("🔄 Refresh IBGE API cache"):
+    fetch_ibge_full_from_api.clear()
+    st.sidebar.success("Cleared cached IBGE API download.")
+
 
 # =========================================================
 #             PART 4: AI WRAPPER (OPTIONAL)
@@ -304,27 +304,18 @@ def safe_json_loads(text: str):
 
 def clean_html_for_ai(html_text: str) -> str:
     soup = BeautifulSoup(html_text, "html.parser")
-    for element in soup(["script", "style", "svg", "noscript", "img", "iframe", "footer"]):
+    for element in soup(["script", "style", "svg", "noscript", "img", "iframe"]):
         element.decompose()
     text = str(soup)
-    if len(text) > 80000:
-        return text[:60000] + "\n<!-- snip -->\n" + text[-20000:]
+    if len(text) > 90000:
+        return text[:65000] + "\n<!-- snip -->\n" + text[-20000:]
     return text
 
 def call_ai_api(prompt: str, provider: str, key: str) -> Optional[str]:
-    """Returns JSON text OR '__HTTP_ERROR__ ...'."""
     if not key:
         return None
     headers = {"Content-Type": "application/json"}
     try:
-        if "Gemini" in provider:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
-            payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"response_mime_type": "application/json"}}
-            resp = requests.post(url, headers=headers, json=payload, timeout=60)
-            if resp.status_code != 200:
-                return f"__HTTP_ERROR__ {resp.status_code}: {resp.text}"
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-
         if "OpenAI" in provider:
             url = "https://api.openai.com/v1/chat/completions"
             headers["Authorization"] = f"Bearer {key}"
@@ -342,6 +333,17 @@ def call_ai_api(prompt: str, provider: str, key: str) -> Optional[str]:
             if resp.status_code != 200:
                 return f"__HTTP_ERROR__ {resp.status_code}: {resp.text}"
             return resp.json()["choices"][0]["message"]["content"]
+
+        if "Gemini" in provider:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"response_mime_type": "application/json"},
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            if resp.status_code != 200:
+                return f"__HTTP_ERROR__ {resp.status_code}: {resp.text}"
+            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
         if "Anthropic" in provider:
             url = "https://api.anthropic.com/v1/messages"
@@ -382,17 +384,19 @@ def agent_learn_selectors(html_content: str, current_url: str, provider: str, ke
     prompt = f"""
 You are a web scraping expert. Analyze HTML from {current_url}.
 
-Return STRICT JSON in this exact shape:
+Return STRICT JSON in this shape:
 {{
   "selectors": {{
-    "name_element": "CSS selector for person's name elements",
-    "next_element": "CSS selector for next-page link/button (or empty string)"
+    "name_element": "CSS selector that selects person names",
+    "next_element": "CSS selector for a Next-page clickable element (link OR button OR input). If unsure, empty string."
   }}
 }}
 
-Rules:
-- Keep selectors simple and robust.
-- Output JSON only.
+Hints:
+- Many directories use tables: try selectors like "table tbody tr td:first-child"
+- For next: could be 'a[rel=next]', 'a.next', 'button.next', 'input[value*=\"Next\"]'
+
+Output JSON only.
 
 HTML:
 {clean_html_for_ai(html_content)}
@@ -418,7 +422,163 @@ HTML:
 
 
 # =========================================================
-#             PART 5: EXTRACTION + PAGINATION
+#             PART 5: UNIVERSAL PAGINATION HELPERS
+# =========================================================
+def request_fingerprint(method: str, url: str, data: Optional[dict]) -> str:
+    return f"{method.upper()}|{url}|{json.dumps(data or {}, sort_keys=True, ensure_ascii=False)}"
+
+def extract_form_request_from_element(el, current_url: str) -> Optional[Dict[str, Any]]:
+    """Given a <button>/<input> element, find parent form and build GET/POST request."""
+    if el is None:
+        return None
+    if el.name not in ("button", "input"):
+        return None
+
+    form = el.find_parent("form")
+    if not form:
+        return None
+
+    method = (form.get("method") or "GET").upper()
+    action = form.get("action") or current_url
+
+    soup = el if isinstance(el, BeautifulSoup) else None  # unused, kept simple
+    base_url = current_url
+    url = urljoin(base_url, action)
+
+    data: Dict[str, str] = {}
+    # collect inputs
+    for inp in form.find_all("input"):
+        nm = inp.get("name")
+        if not nm:
+            continue
+        data[nm] = inp.get("value", "")
+
+    # include the clicked control if it has a name/value (some servers require it)
+    btn_name = el.get("name")
+    if btn_name:
+        data[btn_name] = el.get("value", "")
+
+    # If GET, encode into URL
+    if method == "GET":
+        u = urlparse(url)
+        qs = parse_qs(u.query)
+        for k, v in data.items():
+            qs[k] = [v]
+        url = u._replace(query=urlencode(qs, doseq=True)).geturl()
+        return {"method": "GET", "url": url, "data": None}
+
+    return {"method": "POST", "url": url, "data": data}
+
+def find_next_request_by_selector(html: str, current_url: str, next_selector: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Try to build next-page request from a CSS selector."""
+    if not next_selector:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    el = soup.select_one(next_selector)
+    if not el:
+        return None
+
+    base = soup.find("base", href=True)
+    base_url = base["href"] if base else current_url
+
+    # Link
+    if el.name == "a" and el.get("href"):
+        return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
+
+    # Button/Input inside form
+    if el.name in ("button", "input"):
+        return extract_form_request_from_element(el, current_url=base_url)
+
+    return None
+
+def find_next_request_heuristic(html: str, current_url: str, manual_next: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Heuristic pagination finder:
+    1) manual selector
+    2) a[rel=next]
+    3) anchors with text Next / › / » / >
+    4) buttons/inputs with value/text Next / › / »
+    5) query param increment if page info found or common keys exist
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    base = soup.find("base", href=True)
+    base_url = base["href"] if base else current_url
+
+    # 1) manual selector
+    if manual_next:
+        req = find_next_request_by_selector(html, base_url, manual_next)
+        if req:
+            return req
+
+    # 2) rel next link
+    el = soup.select_one("a[rel='next'][href]")
+    if el and el.get("href"):
+        return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
+
+    # 3) anchors by text / aria-label
+    next_texts = {"next", "next page", "older", ">", "›", "»"}
+    for a in soup.select("a[href]"):
+        t = (a.get_text(" ", strip=True) or "").strip().lower()
+        aria = (a.get("aria-label") or "").strip().lower()
+        if t in next_texts or aria in next_texts or "next" in aria:
+            return {"method": "GET", "url": urljoin(base_url, a["href"]), "data": None}
+
+    # 4) buttons/inputs by label/value
+    def looks_like_next(s: str) -> bool:
+        s = (s or "").strip().lower()
+        return s in next_texts or "next" in s or s in {">", "›", "»"} or s.endswith("next") or s.startswith("next")
+
+    for btn in soup.find_all(["button", "input"]):
+        if btn.name == "button":
+            if looks_like_next(btn.get_text(" ", strip=True)) or looks_like_next(btn.get("aria-label", "")):
+                req = extract_form_request_from_element(btn, current_url=base_url)
+                if req:
+                    return req
+        elif btn.name == "input":
+            t = btn.get("value", "") or btn.get("aria-label", "") or ""
+            if looks_like_next(t):
+                req = extract_form_request_from_element(btn, current_url=base_url)
+                if req:
+                    return req
+
+    # 5) query param increment heuristics
+    # If "Page X of Y" exists, try incrementing a common page param if present
+    text = soup.get_text(" ", strip=True)
+    m = re.search(r"\bPage\s+(\d+)\s+of\s+(\d+)\b", text, flags=re.IGNORECASE)
+    if m:
+        cur, total = int(m.group(1)), int(m.group(2))
+        if cur < total:
+            u = urlparse(base_url)
+            qs = parse_qs(u.query)
+
+            # common keys
+            keys = ["page", "p", "pg", "paging", "start", "offset"]
+            for k in keys:
+                if k in qs:
+                    try:
+                        val = int(qs[k][0])
+                        qs[k] = [str(val + 1)]
+                        return {"method": "GET", "url": u._replace(query=urlencode(qs, doseq=True)).geturl(), "data": None}
+                    except Exception:
+                        pass
+
+    # If no "Page X of Y", still try to increment if URL already has a page-like param
+    u = urlparse(base_url)
+    qs = parse_qs(u.query)
+    for k in ["page", "p", "pg"]:
+        if k in qs:
+            try:
+                val = int(qs[k][0])
+                qs[k] = [str(val + 1)]
+                return {"method": "GET", "url": u._replace(query=urlencode(qs, doseq=True)).geturl(), "data": None}
+            except Exception:
+                pass
+
+    return None
+
+
+# =========================================================
+#             PART 6: EXTRACTION
 # =========================================================
 def heuristic_extract_names(html_content: str, name_selector: Optional[str] = None) -> List[str]:
     soup = BeautifulSoup(html_content, "html.parser")
@@ -431,6 +591,7 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
                 out.append(cand)
         return list(dict.fromkeys(out))
 
+    # Table header heuristic: if any header contains "name", grab first td
     for table in soup.find_all("table"):
         headers = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
         if any("name" in h for h in headers):
@@ -444,6 +605,7 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
             if out:
                 return list(dict.fromkeys(out))
 
+    # General fallback: headings/links
     for sel in ["h3", "h4", "h2", "a"]:
         for el in soup.select(sel):
             cand = clean_extracted_name(el.get_text(" ", strip=True))
@@ -452,49 +614,11 @@ def heuristic_extract_names(html_content: str, name_selector: Optional[str] = No
 
     return list(dict.fromkeys(out))
 
-def heuristic_find_next(html_content: str, current_url: str, manual_next: Optional[str] = None) -> Optional[str]:
-    soup = BeautifulSoup(html_content, "html.parser")
-    base = soup.find("base", href=True)
-    base_url = base["href"] if base else current_url
-
-    if manual_next:
-        el = soup.select_one(manual_next)
-        if el and el.get("href"):
-            return urljoin(base_url, el.get("href"))
-
-    rel_next = soup.select_one("a[rel='next'][href]")
-    if rel_next:
-        return urljoin(base_url, rel_next["href"])
-
-    for a in soup.select("a[href]"):
-        t = (a.get_text(" ", strip=True) or "").strip().lower()
-        if t in {"next", "next page", ">", "›", "»"}:
-            return urljoin(base_url, a["href"])
-
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r"\bPage\s+(\d+)\s+of\s+(\d+)\b", text, flags=re.IGNORECASE)
-    if m:
-        cur, total = int(m.group(1)), int(m.group(2))
-        if cur < total:
-            u = urlparse(current_url)
-            qs = parse_qs(u.query)
-            for key in ["page", "p", "pg", "start"]:
-                if key in qs:
-                    try:
-                        val = int(qs[key][0])
-                        qs[key] = [str(val + 1)]
-                        return u._replace(query=urlencode(qs, doseq=True)).geturl()
-                    except Exception:
-                        pass
-    return None
-
-def extract_with_selectors(html_content: str, current_url: str, selectors: Dict[str, str]) -> Tuple[List[str], Optional[str]]:
-    soup = BeautifulSoup(html_content, "html.parser")
-    base = soup.find("base", href=True)
-    base_url = base["href"] if base else current_url
-
+def extract_with_selectors(html: str, current_url: str, selectors: Dict[str, str]) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    soup = BeautifulSoup(html, "html.parser")
     names: List[str] = []
-    name_sel = selectors.get("name_element") or ""
+
+    name_sel = (selectors.get("name_element") or "").strip()
     if name_sel:
         for el in soup.select(name_sel):
             cand = clean_extracted_name(el.get_text(" ", strip=True))
@@ -502,18 +626,14 @@ def extract_with_selectors(html_content: str, current_url: str, selectors: Dict[
                 names.append(cand)
     names = list(dict.fromkeys(names))
 
-    next_url = None
-    next_sel = selectors.get("next_element") or ""
-    if next_sel:
-        el = soup.select_one(next_sel)
-        if el and el.name == "a" and el.get("href"):
-            next_url = urljoin(base_url, el["href"])
+    next_sel = (selectors.get("next_element") or "").strip()
+    next_req = find_next_request_by_selector(html, current_url, next_sel) if next_sel else None
 
-    return names, next_url
+    return names, next_req
 
 
 # =========================================================
-#             PART 6: MATCHING + OPTIONAL VERIFICATION
+#             PART 7: MATCHING
 # =========================================================
 def rank_score(rank: int, top_n: int, max_points: int = 50) -> int:
     if rank <= 0 or top_n <= 0:
@@ -574,8 +694,7 @@ def batch_verify_names_nondestructive(df: pd.DataFrame, provider: str, key: str)
     for i in range(0, len(names), chunk_size):
         chunk = names[i:i + chunk_size]
         prompt = f"""
-You are a data QA assistant.
-For each string, decide if it looks like a HUMAN PERSON NAME (vs navigation/junk/company).
+For each string, decide if it looks like a HUMAN PERSON NAME (vs junk/navigation/company).
 Return STRICT JSON: keys are the input strings, values are short labels like:
 "Valid person name", "Looks like junk/navigation", "Looks like organization", "Ambiguous".
 
@@ -597,21 +716,27 @@ INPUT: {json.dumps(chunk)}
 
 
 # =========================================================
-#             PART 7: FETCHERS
+#             PART 8: FETCHERS
 # =========================================================
-def fetch_url(url: str, tls_impersonation: bool = False):
+def fetch_native(method: str, url: str, data: Optional[dict], tls_impersonation: bool = False):
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
-        "Referer": "https://google.com",
+        "Referer": url,
     }
     try:
         if tls_impersonation and HAS_CURL:
+            if method.upper() == "POST":
+                return crequests.post(url, headers=headers, data=data or {}, impersonate="chrome110", timeout=25)
             return crequests.get(url, headers=headers, impersonate="chrome110", timeout=25)
+
+        if method.upper() == "POST":
+            return requests.post(url, headers=headers, data=data or {}, timeout=25)
         return requests.get(url, headers=headers, timeout=25)
+
     except Exception:
         return None
 
@@ -625,7 +750,6 @@ def get_driver(headless=True):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-
     try:
         return webdriver.Chrome(options=options)
     except Exception:
@@ -645,7 +769,7 @@ def fetch_selenium(driver, url, scroll_count=0):
 
 
 # =========================================================
-#             PART 8: UI + MAIN EXECUTION
+#             PART 9: MAIN UI + EXECUTION
 # =========================================================
 st.markdown("### 🤖 Auto-Pilot Control Center")
 c1, c2 = st.columns([3, 1])
@@ -691,29 +815,31 @@ if st.session_state.running:
     # ------------------------------------------------------------------
     if "Search Injection" not in mode:
         driver = get_driver(headless=run_headless) if "Infinite" in mode else None
-        current_url = start_url
+
+        current_req = {"method": "GET", "url": start_url, "data": None}
 
         for page in range(1, int(max_pages) + 1):
             if not st.session_state.running:
                 break
 
-            if current_url in st.session_state.visited_urls:
-                status_log.info("🏁 Revisited URL; stopping.")
+            fp = request_fingerprint(current_req["method"], current_req["url"], current_req.get("data"))
+            if fp in st.session_state.visited_fps:
+                status_log.info("🏁 Pagination loop detected; stopping.")
                 break
-            st.session_state.visited_urls.add(current_url)
+            st.session_state.visited_fps.add(fp)
 
             status_log.update(label=f"Scanning Page {page}...", state="running")
-            raw_html = None
 
+            raw_html = None
             try:
                 if "Classic" in mode:
-                    r = fetch_url(current_url, tls_impersonation=use_browserlike_tls)
+                    r = fetch_native(current_req["method"], current_req["url"], current_req.get("data"), tls_impersonation=use_browserlike_tls)
                     if r is not None and getattr(r, "status_code", None) == 200:
                         raw_html = r.text
                     else:
                         status_log.warning(f"HTTP status: {getattr(r, 'status_code', None)}")
                 else:
-                    raw_html = fetch_selenium(driver, current_url, scroll_count=3)
+                    raw_html = fetch_selenium(driver, current_req["url"], scroll_count=3)
             except Exception as e:
                 status_log.warning(f"Fetch failed: {repr(e)}")
 
@@ -721,31 +847,42 @@ if st.session_state.running:
                 status_log.info("No HTML fetched; stopping.")
                 break
 
-            names: List[str] = []
-            next_url: Optional[str] = None
+            st.session_state.pages_scanned += 1
 
+            names: List[str] = []
+            next_req: Optional[Dict[str, Any]] = None
+
+            # 1) Try selectors (saved / learned / manual)
             selectors = dict(st.session_state.learned_selectors) if isinstance(st.session_state.learned_selectors, dict) else {}
             selectors.update(manual_overrides)
 
             if selectors.get("name_element"):
-                n2, nx2 = extract_with_selectors(raw_html, current_url, selectors)
+                n2, nx2 = extract_with_selectors(raw_html, current_req["url"], selectors)
                 if n2:
                     names = n2
-                    next_url = nx2
-                    status_log.write(f"⚡ Used selectors. Extracted {len(names)} names.")
+                    status_log.write(f"⚡ Selector extracted {len(names)} names.")
+                if nx2:
+                    next_req = nx2
 
+            # 2) Heuristic names if selectors failed
             if not names:
                 names = heuristic_extract_names(raw_html, manual_name_selector.strip() if manual_name_selector else None)
                 if names:
                     status_log.write(f"🧩 Heuristic extracted {len(names)} names.")
 
-            if not next_url:
-                next_url = heuristic_find_next(raw_html, current_url, manual_next_selector.strip() if manual_next_selector else None)
+            # 3) If no next_req yet, heuristic pagination
+            if not next_req:
+                next_req = find_next_request_heuristic(
+                    raw_html,
+                    current_req["url"],
+                    manual_next_selector.strip() if manual_next_selector else None
+                )
 
-            # AI learn selectors (one-time)
-            if api_key and not st.session_state.learned_selectors and (len(names) == 0 or not next_url):
+            # 4) AI selector learning (one-time) if still weak
+            if api_key and not st.session_state.learned_selectors and (len(names) == 0 or not next_req):
                 status_log.write("🧠 AI learning selectors (one-time)...")
-                learned = agent_learn_selectors(raw_html, current_url, ai_provider, api_key)
+                learned = agent_learn_selectors(raw_html, current_req["url"], ai_provider, api_key)
+
                 if isinstance(learned, dict) and learned.get("__error__"):
                     if show_debug_ai_payload:
                         status_log.error(str(learned["__error__"]))
@@ -756,11 +893,16 @@ if st.session_state.running:
                     st.session_state.learned_selectors = learned
                     status_log.success(f"🎓 Learned selectors: {learned}")
 
-                    n3, nx3 = extract_with_selectors(raw_html, current_url, learned)
+                    n3, nx3 = extract_with_selectors(raw_html, current_req["url"], learned)
                     if len(n3) > len(names):
                         names = n3
                     if nx3:
-                        next_url = nx3
+                        next_req = nx3
+
+                    # Even if AI gave a selector, if it didn't produce a next request,
+                    # try heuristic again (universal)
+                    if not next_req:
+                        next_req = find_next_request_heuristic(raw_html, current_req["url"])
 
             # MATCHING
             if names:
@@ -774,9 +916,14 @@ if st.session_state.running:
             else:
                 status_log.write("🤷 No names extracted.")
 
-            if next_url:
-                status_log.write(f"➡️ Next: {next_url}")
-                current_url = next_url
+            # NEXT PAGE
+            if next_req and next_req.get("url"):
+                current_req = {
+                    "method": next_req.get("method", "GET").upper(),
+                    "url": next_req["url"],
+                    "data": next_req.get("data"),
+                }
+                status_log.write(f"➡️ Next ({current_req['method']}): {current_req['url']}")
             else:
                 status_log.info("🏁 No more pages detected.")
                 break
@@ -865,7 +1012,7 @@ if st.session_state.running:
 
 
 # =========================================================
-#             PART 9: VERIFY & EXPORT
+#             PART 10: VERIFY & EXPORT
 # =========================================================
 if st.session_state.matches:
     st.markdown("---")
