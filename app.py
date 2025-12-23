@@ -1004,6 +1004,55 @@ def _best_people_container_html_from_page_source(page_html: str) -> Tuple[Option
 
     return best_html, best
 
+PEOPLE_RESULTS_FOR_RE = re.compile(r"people results for", re.I)
+
+def _find_people_results_container_in_html(page_html: str) -> Optional[str]:
+    """
+    MIT-style JS search: find the DOM block that contains 'People results for'
+    and climb upward to a container that looks like people results.
+    """
+    if not page_html:
+        return None
+
+    soup = BeautifulSoup(page_html, "html.parser")
+
+    # Find nodes containing the header text
+    hits = soup.find_all(string=PEOPLE_RESULTS_FOR_RE)
+    if not hits:
+        return None
+
+    best_html = None
+    best_score = -1
+
+    for hit in hits[:10]:
+        node = hit.parent
+        if not node:
+            continue
+
+        # Climb up a few levels and score each ancestor
+        cur = node
+        for _ in range(10):
+            if not cur or not getattr(cur, "name", None):
+                break
+            try:
+                txt = cur.get_text("\n", strip=True) or ""
+            except Exception:
+                txt = ""
+            if len(txt) >= 120:
+                metrics = _score_people_block(txt)
+                # Strong bonus if it contains the key header
+                if "people results for" in txt.lower():
+                    metrics["score"] += 60
+
+                if metrics["score"] > best_score:
+                    best_score = metrics["score"]
+                    best_html = str(cur)
+
+            cur = cur.parent
+
+    return best_html
+
+
 def _click_best_people_tab_if_any(driver) -> Optional[str]:
     if not try_people_tab_click:
         return None
@@ -1362,6 +1411,14 @@ def selenium_wait_for_people_results(
         except Exception:
             page_html = ""
 
+        # ✅ JS shortcut (MIT-style): if the DOM contains "People results for",
+        # grab that section directly from page_source and treat as results.
+        if PEOPLE_RESULTS_FOR_RE.search(page_html or ""):
+            people_section_html = _find_people_results_container_in_html(page_html or "")
+            if people_section_html:
+                if EMAIL_RE.search(people_section_html) or _extract_people_like_names(people_section_html):
+                    return "results", people_section_html, debug
+
         cont_html, cont_dbg = _best_people_container_html(driver)
         cont_text = ""
         if cont_html:
@@ -1634,16 +1691,21 @@ def _active_search_worker_thread(
             if state == "timeout":
                 out_q.put(("log", worker_id, f"⏱️ timeout for {surname} (using best container anyway)"))
             
-                # ✅ fallback 1: selenium container
-                people_container_html, _ = _best_people_container_html(driver)
+                try:
+                    page_html = driver.page_source or ""
+                except Exception:
+                    page_html = ""
             
-                # ✅ fallback 2: raw HTML scan (fixes virtualized/hydrated lists)
+                # 1) Prefer "People results for" section if present
+                people_container_html = _find_people_results_container_in_html(page_html)
+            
+                # 2) Otherwise fall back to raw best-container scan
                 if not people_container_html:
-                    try:
-                        page_html = driver.page_source or ""
-                    except Exception:
-                        page_html = ""
                     people_container_html, _ = _best_people_container_html_from_page_source(page_html)
+            
+                # 3) Last resort: selenium best-container
+                if not people_container_html:
+                    people_container_html, _ = _best_people_container_html(driver)
 
             people_records = _extract_people_like_records(people_container_html or "")
             out_q.put(("result", worker_id, surname, people_records, state))
