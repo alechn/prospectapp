@@ -404,7 +404,20 @@ def match_names(items: List[Union[str, Dict[str, Any]]], source: str) -> List[Di
         if not n:
             continue
 
-        dedup_key = (n, (meta_email or "").strip().lower())
+        def _norm_url(u: str) -> str:
+            u = (u or "").strip()
+            if not u:
+                return ""
+            u = u.split("#", 1)[0]  # strip fragment
+            return u
+
+        email_key = (meta_email or "").strip().lower()
+        url_key = _norm_url(meta_url or "").strip().lower()
+        name_key = normalize_token(n)
+
+        # Prefer strong identifiers to reduce duplicates:
+        # email > url > normalized name
+        dedup_key = email_key or url_key or name_key
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
@@ -688,6 +701,27 @@ def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = N
 #             ACTIVE SEARCH: WORKING “DEBUGGER” SUBMIT LOGIC (URGENT FIX)
 # =========================================================
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+
+# --- Email obfuscation (optional but very helpful) ---
+OBFUSCATED_EMAIL_RE = re.compile(
+    r"([A-Z0-9._%+\-]+)\s*(?:\(|\[)?\s*(?:at)\s*(?:\)|\])?\s*([A-Z0-9.\-]+)\s*(?:\(|\[)?\s*(?:dot)\s*(?:\)|\])?\s*([A-Z]{2,})",
+    re.I
+)
+
+def extract_obfuscated_email(text: str) -> Optional[str]:
+    """
+    Detects common patterns like:
+      - name [at] domain [dot] edu
+      - name(at)domain(dot)edu
+      - name at domain dot edu
+    Returns a reconstructed email or None.
+    """
+    if not text:
+        return None
+    m = OBFUSCATED_EMAIL_RE.search(text)
+    if not m:
+        return None
+    return f"{m.group(1)}@{m.group(2)}.{m.group(3)}"
 
 def _best_org_hint(desc: str) -> str:
     """
@@ -1280,10 +1314,11 @@ def _pick_description_from_text(text: str, name: str = "", email: str = "") -> s
     return t
 
 
-def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
+def _extract_people_like_records(container_html: str, base_url: str = "") -> List[Dict[str, Any]]:
     """
     Universal record extraction from the selected people-like container.
     Returns list of dicts: {name, email?, description?, url?}
+    base_url (optional): used to convert relative profile links into absolute URLs.
     """
     if not container_html:
         return []
@@ -1308,16 +1343,31 @@ def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     seen = set()
 
+    def _norm_url(u: str) -> str:
+        u = _norm_space(u)
+        if not u:
+            return ""
+        if u.lower().startswith("javascript:"):
+            return ""
+        # Convert relative -> absolute if we can
+        if base_url:
+            try:
+                u = urljoin(base_url, u)
+            except Exception:
+                pass
+        # Strip fragments
+        u = u.split("#", 1)[0]
+        return u
+
     def add_record(name: str, email: str = "", desc: str = "", url: str = ""):
         name = _norm_space(name)
         email = _norm_space(email)
         desc = _norm_space(desc)
-        url = _norm_space(url)
+        url = _norm_url(url)
 
         if not name:
             return
 
-        # ✅ Universal junk filter: drop nav/items unless they look like a person/profile
         low_name = (name or "").lower()
         low_url = (url or "").lower()
 
@@ -1325,12 +1375,18 @@ def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
             "directory", "profile", "people", "staff", "faculty", "user", "member", "id="
         ])
 
-        if not email and (not url or not looks_profile_url):
+        # Allow some profile links that don't contain the above keywords (but avoid obvious nav)
+        looks_like_link = bool(url) and not re.search(
+            r"(login|signup|search|about|news|events|privacy|terms|accessibility|contact)",
+            low_url
+        )
+
+        # ✅ Keep only entries that look like a person record
+        # (email OR profile-ish url OR a reasonable link)
+        if not email and not (looks_profile_url or looks_like_link):
             return
 
-        if low_url.startswith("javascript:"):
-            return
-
+        # Nav/junk name suppression (keep your universal behavior)
         if not email and re.search(r"[+\u2193]|admissions|campus|lifelong|about|news|locations|search results", low_name):
             return
 
@@ -1341,7 +1397,8 @@ def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
                 return
             c = name
 
-        key = (c.lower(), (email or "").lower())
+        # Strong dedupe: email > url > name
+        key = (email or "").lower() or (url or "").lower() or normalize_token(c)
         if key in seen:
             return
         seen.add(key)
@@ -1369,11 +1426,15 @@ def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
             if em:
                 emails.append(em)
 
-        # Visible email fallback
+        # Visible email fallback (real or obfuscated)
         if not emails:
             m = EMAIL_RE.search(txt)
             if m:
                 emails = [m.group(0)]
+            else:
+                ob = extract_obfuscated_email(txt)
+                if ob:
+                    emails = [ob]
 
         # URL: first non-mailto link in block
         url = ""
@@ -1762,8 +1823,11 @@ def _active_search_worker_thread(
                 if not people_container_html:
                     people_container_html, _ = _best_people_container_html(driver)
 
-            people_records = _extract_people_like_records(people_container_html or "") or []
-            out_q.put(("result", worker_id, surname, people_records, state))
+            people_records = _extract_people_like_records(
+                people_container_html or "",
+                base_url=(driver.current_url or "")
+            ) or []
+
 
     except Exception as e:
         out_q.put(("log", worker_id, f"💥 worker crash: {e}"))
