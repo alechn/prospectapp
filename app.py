@@ -66,7 +66,7 @@ if "visited_urls" not in st.session_state:
 
 
 # =========================================================
-#             SIDEBAR
+#             SIDEBAR (CLEAN)
 # =========================================================
 st.sidebar.header("🧠 AI Brain (Cleaning)")
 ai_provider = st.sidebar.selectbox(
@@ -76,73 +76,17 @@ ai_provider = st.sidebar.selectbox(
 api_key = st.sidebar.text_input(f"Enter {ai_provider.split()[0]} API Key", type="password")
 
 st.sidebar.markdown("---")
-st.sidebar.header("🛰️ Networking")
-search_delay = st.sidebar.slider("⏳ Wait Time (Sec)", 0, 20, 3)
-use_browserlike_tls = st.sidebar.checkbox("Use browser-like requests (curl_cffi)", value=False)
-if use_browserlike_tls and not HAS_CURL:
-    st.sidebar.warning("curl_cffi not installed; falling back to requests.")
-    use_browserlike_tls = False
-
-st.sidebar.markdown("---")
+st.sidebar.header("🔗 LinkedIn")
 enable_linkedin_links = st.sidebar.checkbox(
-    "Add LinkedIn search links (free)",
+    "Add LinkedIn search links",
     value=True,
     help="Adds a clickable Google search link per person (does NOT scrape LinkedIn)."
 )
-
 linkedin_org_hint = st.sidebar.text_input(
-    "LinkedIn org hint (optional)",
+    "Org hint (optional)",
     value="",
     placeholder="MIT, YC, Google, Nubank..."
 )
-
-st.sidebar.markdown("---")
-st.sidebar.header("🧪 Selenium")
-run_headless = st.sidebar.checkbox("Run Selenium headless", value=True)
-selenium_wait = st.sidebar.slider("Selenium wait timeout", 5, 60, 15)
-
-# New: speed + parallel
-st.sidebar.markdown("---")
-st.sidebar.header("⚡ Speed / Parallel")
-enable_light_chrome = st.sidebar.checkbox(
-    "Lightweight Chrome (disable images/fonts)",
-    value=True,
-    help="Often speeds up scraping significantly with little downside."
-)
-parallel_workers = st.sidebar.slider(
-    "Parallel Chrome workers (Active Search only)",
-    1, 4, 2,
-    help="Each worker runs its own Chrome instance. 2 is usually safe; 3-4 can crash on small machines."
-)
-# urgent fix: avoid constant hard resets
-max_consecutive_submit_failures = st.sidebar.slider(
-    "Max consecutive submit failures before hard reset",
-    1, 10, 3
-)
-# keep time logic stable: do NOT change selenium_wait behavior; add small optional initial sleep, default matches your current
-post_submit_sleep = st.sidebar.slider(
-    "Post-submit settle sleep (seconds)",
-    0.0, 5.0, 0.4, 0.1,
-    help="Small fixed pause after submitting before tab clicking / waiting (kept to avoid breaking working behavior)."
-)
-try_people_tab_click = st.sidebar.checkbox(
-    "Try to click People/Directory tab/filter",
-    value=True
-)
-
-with st.sidebar.expander("🛠️ Advanced / Debug"):
-    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3, table td.name")
-    manual_next_selector = st.text_input("Manual Next Selector", placeholder="e.g. a[rel='next'], input[value*='Next']")
-    manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
-    manual_search_button = st.text_input("Manual Search Button Selector", placeholder="e.g. button[type='submit']")
-    manual_search_param = st.text_input("Manual Search Param (URL mode)", placeholder="e.g. q or query")
-    debug_show_candidates = st.checkbox("Debug: show extracted candidates", value=False)
-    # urgent fix: remove non-universal MIT filter by default
-    block_mit_word = st.checkbox(
-        "Cleaner: block strings containing standalone 'MIT'",
-        value=False,
-        help="This is NOT universal; keep OFF unless you specifically want to exclude MIT."
-    )
 
 st.sidebar.markdown("---")
 allow_surname_only = st.sidebar.checkbox(
@@ -151,11 +95,66 @@ allow_surname_only = st.sidebar.checkbox(
     help="If a result is just 'Santos', count it as a weak match."
 )
 
-if st.sidebar.button("🧪 Check Drivers"):
-    st.sidebar.write(f"HAS_SELENIUM: {HAS_SELENIUM}")
-    st.sidebar.write(f"HAS_WEBDRIVER_MANAGER: {HAS_WEBDRIVER_MANAGER}")
-    st.sidebar.write(f"Chromedriver path: {os.path.exists('/usr/bin/chromedriver')}")
+# ----------------------------
+# Advanced / Debug (collapsed)
+# ----------------------------
+with st.sidebar.expander("🛠️ Advanced / Debug", expanded=False):
+    st.markdown("### 🛰️ Networking")
+    search_delay = st.slider("⏳ Wait Time (Sec)", 0, 20, 3)
+    use_browserlike_tls = st.checkbox("Use browser-like requests (curl_cffi)", value=False)
+    if use_browserlike_tls and not HAS_CURL:
+        st.warning("curl_cffi not installed; falling back to requests.")
+        use_browserlike_tls = False
 
+    st.markdown("### 🧪 Selenium")
+    run_headless = st.checkbox("Run Selenium headless", value=True)
+    selenium_wait = st.slider("Selenium wait timeout", 5, 60, 15)
+
+    st.markdown("### ⚡ Speed / Parallel")
+    enable_light_chrome = st.checkbox(
+        "Lightweight Chrome (disable images/fonts)",
+        value=True,
+        help="Often speeds up scraping significantly with little downside."
+    )
+    parallel_workers = st.slider(
+        "Parallel Chrome workers (Active Search only)",
+        1, 4, 2,
+        help="Each worker runs its own Chrome instance. 2 is usually safe; 3-4 can crash on small machines."
+    )
+    max_consecutive_submit_failures = st.slider(
+        "Max consecutive submit failures before hard reset",
+        1, 10, 3
+    )
+    post_submit_sleep = st.slider(
+        "Post-submit settle sleep (seconds)",
+        0.0, 5.0, 0.4, 0.1,
+        help="Small fixed pause after submitting before tab clicking / waiting (kept to avoid breaking working behavior)."
+    )
+    try_people_tab_click = st.checkbox(
+        "Try to click People/Directory tab/filter",
+        value=True
+    )
+
+    st.markdown("### 🧩 Manual selectors / debug")
+    manual_name_selector = st.text_input("Manual Name Selector", placeholder="e.g. h3, table td.name")
+    manual_next_selector = st.text_input("Manual Next Selector", placeholder="e.g. a[rel='next'], input[value*='Next']")
+    manual_search_selector = st.text_input("Manual Search Box Selector", placeholder="e.g. input[name='q']")
+    manual_search_button = st.text_input("Manual Search Button Selector", placeholder="e.g. button[type='submit']")
+    manual_search_param = st.text_input("Manual Search Param (URL mode)", placeholder="e.g. q or query")
+    debug_show_candidates = st.checkbox("Debug: show extracted candidates", value=False)
+
+    # This is generally not needed anymore; keep hidden by default.
+    block_mit_word = st.checkbox(
+        "Cleaner: block strings containing standalone 'MIT' (usually leave OFF)",
+        value=False
+    )
+
+    if st.button("🧪 Check Drivers"):
+        st.write(f"HAS_SELENIUM: {HAS_SELENIUM}")
+        st.write(f"HAS_WEBDRIVER_MANAGER: {HAS_WEBDRIVER_MANAGER}")
+        st.write(f"Chromedriver path: {os.path.exists('/usr/bin/chromedriver')}")
+
+st.sidebar.markdown("---")
 if st.sidebar.button("🛑 STOP", type="primary"):
     st.session_state.running = False
     st.stop()
