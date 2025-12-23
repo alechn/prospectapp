@@ -1371,11 +1371,16 @@ def batch_clean_with_ai(matches, api_key):
 
             elif ai_provider.startswith("OpenAI"):
                 client = OpenAI(api_key=api_key)
+                
+                # Cheapest generally-available option
+                openai_model = "gpt-4o-mini"
+
                 resp = client.responses.create(
-                    model="gpt-5.2-mini",
+                    model=openai_model,
                     input=prompt,
                 )
                 text = resp.output_text or ""
+
 
             else:
                 st.warning("Claude not implemented yet")
