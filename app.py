@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 from openai import OpenAI
+from urllib.parse import quote_plus
 
 # --- Optional curl_cffi ---
 try:
@@ -81,6 +82,13 @@ use_browserlike_tls = st.sidebar.checkbox("Use browser-like requests (curl_cffi)
 if use_browserlike_tls and not HAS_CURL:
     st.sidebar.warning("curl_cffi not installed; falling back to requests.")
     use_browserlike_tls = False
+
+st.sidebar.markdown("---")
+enable_linkedin_links = st.sidebar.checkbox(
+    "Add LinkedIn search links (free)",
+    value=True,
+    help="Adds a clickable Google search link per person (does NOT scrape LinkedIn)."
+)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🧪 Selenium")
@@ -151,7 +159,6 @@ if st.sidebar.button("🧹 Clear"):
     st.session_state.visited_fps = set()
     st.session_state.visited_urls = set()
     st.sidebar.success("Cleared.")
-
 
 # =========================================================
 #             BLOCKLIST + NAME CLEANING
@@ -419,6 +426,7 @@ def match_names(items: List[Union[str, Dict[str, Any]]], source: str) -> List[Di
                     "Surname Rank": rl,
                     "Source": source,
                     "Match Type": "Surname Only (Weak)",
+                    "LinkedIn Search": build_linkedin_google_search_url(n, meta_desc or "") if enable_linkedin_links else None,
                     "Status": "Valid"
                 })
             continue
@@ -449,6 +457,7 @@ def match_names(items: List[Union[str, Dict[str, Any]]], source: str) -> List[Di
                 "Surname Rank": rl if rl > 0 else None,
                 "Source": source,
                 "Match Type": "Strong" if (rf > 0 and rl > 0) else ("First Only" if rf > 0 else "Surname Only"),
+                "LinkedIn Search": build_linkedin_google_search_url(n, meta_desc or "") if enable_linkedin_links else None,
                 "Status": "Valid"
             })
 
@@ -674,6 +683,32 @@ def selenium_wait_results(driver, timeout: int, name_selector: Optional[str] = N
 #             ACTIVE SEARCH: WORKING “DEBUGGER” SUBMIT LOGIC (URGENT FIX)
 # =========================================================
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+
+def _best_org_hint(desc: str) -> str:
+    """
+    Small optional hint for search quality: take the left side of your "A | B | C" style
+    descriptions (e.g. 'Haystack Observatory', 'MIT Health'), without being MIT-specific.
+    """
+    d = " ".join((desc or "").split()).strip()
+    if not d:
+        return ""
+    # prefer first chunk before a pipe (your descriptions use pipes a lot)
+    chunk = d.split("|", 1)[0].strip()
+    # keep it short
+    if len(chunk) > 60:
+        chunk = chunk[:60].rsplit(" ", 1)[0].strip()
+    return chunk
+
+def build_linkedin_google_search_url(name: str, desc: str = "") -> str:
+    """
+    Free + stable: user clicks this to open Google results for LinkedIn profiles.
+    """
+    name = " ".join((name or "").split()).strip()
+    org = _best_org_hint(desc)
+    q = f'site:linkedin.com/in "{name}"'
+    if org:
+        q += f' "{org}"'
+    return "https://www.google.com/search?q=" + quote_plus(q)
 
 def find_search_input(driver):
     """
@@ -1788,6 +1823,7 @@ if st.session_state.matches:
             "Email": st.column_config.TextColumn("Email"),
             "Description": st.column_config.TextColumn("Description"),
             "URL": st.column_config.TextColumn("URL"),
+            "LinkedIn Search": st.column_config.LinkColumn("LinkedIn (search)", display_text="Search"),
         }
 
         st.dataframe(df, column_config=cols_config, use_container_width=True)
