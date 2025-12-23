@@ -1604,13 +1604,15 @@ if st.session_state.running:
         st.error("Missing Target URL")
         st.stop()
 
-total_names = int(max_pages) if mode.endswith("Surnames)") else None
-processed_names = 0
+    total_names = int(max_pages) if mode.endswith("Surnames)") else None
+    processed_names = 0
 
-status_log = st.status(
-    f"Running · 0 / {total_names} names" if total_names else "Running",
-    expanded=True
-)
+    status_log = st.status(
+        f"Running · 0 / {total_names} names" if total_names else "Running",
+        expanded=True
+    )
+
+    table_placeholder = st.empty()
 
     all_matches: List[Dict[str, Any]] = []
     all_seen = set()
