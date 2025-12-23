@@ -1779,76 +1779,93 @@ def _active_search_worker_thread(
             if stop_flag.is_set():
                 return
 
-            # Find input fresh each time (fast) without navigating
-            inp = find_search_input(driver)
-            if not inp:
-                consecutive_fails += 1
-                out_q.put(("log", worker_id, f"⚠️ no input for {surname} (fails={consecutive_fails})"))
-                if consecutive_fails >= int(max_consecutive_submit_failures):
-                    out_q.put(("log", worker_id, "🧯 hard reset (reload start_url)"))
-                    driver.get(start_url)
-                    selenium_wait_document_ready(driver, timeout=min(12, int(selenium_wait)))
-                    time.sleep(0.7)
-                    consecutive_fails = 0
+            # ---- PER-SURNAME SAFETY WRAP (prevents silent 0/5) ----
+            try:
+                # Find input fresh each time (fast) without navigating
+                inp = find_search_input(driver)
+                if not inp:
+                    consecutive_fails += 1
+                    out_q.put(("log", worker_id, f"⚠️ no input for {surname} (fails={consecutive_fails})"))
+                    if consecutive_fails >= int(max_consecutive_submit_failures):
+                        out_q.put(("log", worker_id, "🧯 hard reset (reload start_url)"))
+                        driver.get(start_url)
+                        selenium_wait_document_ready(driver, timeout=min(12, int(selenium_wait)))
+                        time.sleep(0.7)
+                        consecutive_fails = 0
+
+                    # IMPORTANT: still emit a result so UI increments
+                    out_q.put(("result", worker_id, surname, [], "no_input"))
+                    continue
+
+                out_q.put(("log", worker_id, f"⌨️ submitting: {surname}"))
+
+                ok = submit_query(driver, inp, surname)
+                if not ok:
+                    consecutive_fails += 1
+                    out_q.put(("log", worker_id, f"❌ submit failed for {surname} (fails={consecutive_fails})"))
+                    if consecutive_fails >= int(max_consecutive_submit_failures):
+                        out_q.put(("log", worker_id, "🧯 hard reset (reload start_url)"))
+                        driver.get(start_url)
+                        selenium_wait_document_ready(driver, timeout=min(12, int(selenium_wait)))
+                        time.sleep(0.7)
+                        consecutive_fails = 0
+
+                    out_q.put(("result", worker_id, surname, [], "submit_failed"))
+                    continue
+
+                consecutive_fails = 0
+
+                # Keep the time behavior stable
+                if post_submit_sleep > 0:
+                    time.sleep(float(post_submit_sleep))
+
+                clicked = _click_best_people_tab_if_any(driver)
+                if clicked:
+                    out_q.put(("log", worker_id, f"🧭 clicked: {clicked}"))
+
+                out_q.put(("log", worker_id, f"⏳ waiting results: {surname}"))
+
+                state, people_container_html, dbg = selenium_wait_for_people_results(
+                    driver=driver,
+                    term=surname,
+                    timeout=int(selenium_wait),
+                    poll_s=0.35
+                )
+
+                # Always emit a result (even no_results)
+                if state == "no_results":
+                    out_q.put(("result", worker_id, surname, [], "no_results"))
+                    continue
+
+                if state == "timeout":
+                    out_q.put(("log", worker_id, f"⏱️ timeout for {surname} (using best container anyway)"))
+
+                    try:
+                        page_html = driver.page_source or ""
+                    except Exception:
+                        page_html = ""
+
+                    # 1) Prefer "People results for" section if present
+                    people_container_html = _find_people_results_container_in_html(page_html)
+
+                    # 2) Otherwise fall back to raw best-container scan
+                    if not people_container_html:
+                        people_container_html, _ = _best_people_container_html_from_page_source(page_html)
+
+                    # 3) Last resort: selenium best-container
+                    if not people_container_html:
+                        people_container_html, _ = _best_people_container_html(driver)
+
+                # Extract records (keep your existing call if you haven't applied base_url changes)
+                people_records = _extract_people_like_records(people_container_html or "") or []
+
+                out_q.put(("result", worker_id, surname, people_records, state))
+
+            except Exception as e_one:
+                # Key: never silently die mid-run; always advance UI + log
+                out_q.put(("log", worker_id, f"💥 surname crash {surname}: {e_one}"))
+                out_q.put(("result", worker_id, surname, [], "surname_crash"))
                 continue
-
-            ok = submit_query(driver, inp, surname)
-            if not ok:
-                consecutive_fails += 1
-                out_q.put(("log", worker_id, f"❌ submit failed for {surname} (fails={consecutive_fails})"))
-                if consecutive_fails >= int(max_consecutive_submit_failures):
-                    out_q.put(("log", worker_id, "🧯 hard reset (reload start_url)"))
-                    driver.get(start_url)
-                    selenium_wait_document_ready(driver, timeout=min(12, int(selenium_wait)))
-                    time.sleep(0.7)
-                    consecutive_fails = 0
-                continue
-
-            consecutive_fails = 0
-
-            # Keep the time behavior stable
-            if post_submit_sleep > 0:
-                time.sleep(float(post_submit_sleep))
-
-            clicked = _click_best_people_tab_if_any(driver)
-            if clicked:
-                out_q.put(("log", worker_id, f"🧭 clicked: {clicked}"))
-
-            state, people_container_html, dbg = selenium_wait_for_people_results(
-                driver=driver,
-                term=surname,
-                timeout=int(selenium_wait),
-                poll_s=0.35
-            )
-
-            if state == "no_results":
-                out_q.put(("result", worker_id, surname, [], "no_results"))
-                continue
-
-            if state == "timeout":
-                out_q.put(("log", worker_id, f"⏱️ timeout for {surname} (using best container anyway)"))
-            
-                try:
-                    page_html = driver.page_source or ""
-                except Exception:
-                    page_html = ""
-            
-                # 1) Prefer "People results for" section if present
-                people_container_html = _find_people_results_container_in_html(page_html)
-            
-                # 2) Otherwise fall back to raw best-container scan
-                if not people_container_html:
-                    people_container_html, _ = _best_people_container_html_from_page_source(page_html)
-            
-                # 3) Last resort: selenium best-container
-                if not people_container_html:
-                    people_container_html, _ = _best_people_container_html(driver)
-
-            people_records = _extract_people_like_records(
-                people_container_html or "",
-                base_url=(driver.current_url or "")
-            ) or []
-
 
     except Exception as e:
         out_q.put(("log", worker_id, f"💥 worker crash: {e}"))
