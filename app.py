@@ -1772,7 +1772,7 @@ def _active_search_worker_thread(
                 if not people_container_html:
                     people_container_html, _ = _best_people_container_html(driver)
 
-            people_records = _extract_people_like_records(people_container_html or "")
+            people_records = _extract_people_like_records(people_container_html or "") or []
             out_q.put(("result", worker_id, surname, people_records, state))
 
     except Exception as e:
@@ -1946,6 +1946,7 @@ if st.session_state.running:
 
                     elif kind == "result":
                         _, wid, surname, people_records, state = msg
+                        people_records = people_records or []
                         processed_names += 1
                         status_log.update(
                         label=f"Running · {processed_names} / {total_names} names",
