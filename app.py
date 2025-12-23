@@ -1023,27 +1023,75 @@ def _extract_people_like_names(container_html: str) -> List[str]:
 def _norm_space(s: str) -> str:
     return " ".join((s or "").split()).strip()
 
+def _strip_name_tokens(text: str, name: str) -> str:
+    """
+    Remove name tokens from description text (case-insensitive).
+    Handles comma-form variants and individual tokens.
+    """
+    t = text or ""
+    n = (name or "").strip()
+    if not t or not n:
+        return t
+
+    # Normalize whitespace
+    t = " ".join(t.split())
+
+    # Build variants to remove
+    variants = set()
+    variants.add(n)
+
+    parts = [p for p in re.split(r"\s+", n) if p]
+    if len(parts) >= 2:
+        variants.add(f"{parts[-1]} {parts[0]}")  # "Surname First"
+        variants.add(f"{parts[0]} {parts[-1]}")  # "First Surname"
+        variants.add(f"{parts[-1]}, {parts[0]}") # "Surname, First"
+
+    # Remove full-phrase variants first
+    for v in sorted(variants, key=len, reverse=True):
+        if not v:
+            continue
+        t = re.sub(rf"\b{re.escape(v)}\b", " ", t, flags=re.I)
+
+    # Then remove individual tokens (first/middle/last)
+    # Only remove tokens length >= 2 to avoid nuking initials too aggressively
+    for tok in parts:
+        if len(tok) < 2:
+            continue
+        t = re.sub(rf"\b{re.escape(tok)}\b", " ", t, flags=re.I)
+
+    # Cleanup separators/punctuation leftovers
+    t = re.sub(r"\s*\|\s*", " | ", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    t = re.sub(r"^[\|\-–—,:;]+", "", t).strip()
+    t = re.sub(r"[\|\-–—,:;]+$", "", t).strip()
+
+    return t
+
 def _pick_description_from_text(text: str, name: str = "", email: str = "") -> str:
     """
-    Universal: takes a small local block of text and returns a short description,
-    avoiding just repeating the name/email. No keyword filtering.
+    Universal: local block -> short description, stripping name + email.
     """
-    t = _norm_space(text)
+    t = " ".join((text or "").split()).strip()
     if not t:
         return ""
 
-    if name:
-        t = t.replace(name, " ")
+    # Remove email first (if present)
     if email:
-        t = t.replace(email, " ")
+        t = re.sub(rf"\b{re.escape(email)}\b", " ", t, flags=re.I)
 
-    t = _norm_space(t)
+    # Strip the person's name tokens/variants
+    if name:
+        t = _strip_name_tokens(t, name)
+
+    # Final normalize + shorten
+    t = " ".join(t.split()).strip()
     if not t:
         return ""
 
     if len(t) > 180:
         t = t[:180].rsplit(" ", 1)[0].strip() + "…"
     return t
+
 
 def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
     """
