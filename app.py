@@ -90,6 +90,12 @@ enable_linkedin_links = st.sidebar.checkbox(
     help="Adds a clickable Google search link per person (does NOT scrape LinkedIn)."
 )
 
+linkedin_org_hint = st.sidebar.text_input(
+    "LinkedIn org hint (optional)",
+    value="",
+    placeholder="MIT, YC, Google, Nubank..."
+)
+
 st.sidebar.markdown("---")
 st.sidebar.header("🧪 Selenium")
 run_headless = st.sidebar.checkbox("Run Selenium headless", value=True)
@@ -426,7 +432,7 @@ def match_names(items: List[Union[str, Dict[str, Any]]], source: str) -> List[Di
                     "Surname Rank": rl,
                     "Source": source,
                     "Match Type": "Surname Only (Weak)",
-                    "LinkedIn Search": build_linkedin_google_search_url(n, meta_desc or "") if enable_linkedin_links else None,
+                    "LinkedIn Search": build_linkedin_google_search_url(n, linkedin_org_hint) if enable_linkedin_links else None,
                     "Status": "Valid"
                 })
             continue
@@ -457,7 +463,7 @@ def match_names(items: List[Union[str, Dict[str, Any]]], source: str) -> List[Di
                 "Surname Rank": rl if rl > 0 else None,
                 "Source": source,
                 "Match Type": "Strong" if (rf > 0 and rl > 0) else ("First Only" if rf > 0 else "Surname Only"),
-                "LinkedIn Search": build_linkedin_google_search_url(n, meta_desc or "") if enable_linkedin_links else None,
+                "LinkedIn Search": build_linkedin_google_search_url(n, linkedin_org_hint) if enable_linkedin_links else None,
                 "Status": "Valid"
             })
 
@@ -699,15 +705,21 @@ def _best_org_hint(desc: str) -> str:
         chunk = chunk[:60].rsplit(" ", 1)[0].strip()
     return chunk
 
-def build_linkedin_google_search_url(name: str, desc: str = "") -> str:
+def build_linkedin_google_search_url(name: str, org_hint: str = "") -> str:
     """
     Free + stable: user clicks this to open Google results for LinkedIn profiles.
+    Name is quoted; org hint (if provided) is NOT quoted.
     """
     name = " ".join((name or "").split()).strip()
-    org = _best_org_hint(desc)
+    if not name:
+        return ""
+
+    org_hint = " ".join((org_hint or "").split()).strip()
+
     q = f'site:linkedin.com/in "{name}"'
-    if org:
-        q += f' "{org}"'
+    if org_hint:
+        q += f" {org_hint}"  # unquoted on purpose
+
     return "https://www.google.com/search?q=" + quote_plus(q)
 
 def find_search_input(driver):
