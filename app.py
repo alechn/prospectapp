@@ -1383,9 +1383,11 @@ def _extract_people_like_records(container_html: str, base_url: str = "") -> Lis
         )
 
         # ✅ Keep only entries that look like a person record
-        # (email OR profile-ish url OR a reasonable link)
+        strong_name = bool(NAME_SPACE_RE.match(name) or NAME_COMMA_RE.match(name))
+
         if not email and not (looks_profile_url or looks_like_link):
-            return
+            if not strong_name:
+                return
 
         # Nav/junk name suppression (keep your universal behavior)
         if not email and re.search(r"[+\u2193]|admissions|campus|lifelong|about|news|locations|search results", low_name):
