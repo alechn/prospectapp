@@ -8,7 +8,7 @@ import io
 import os
 import subprocess
 import sys
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
@@ -176,12 +176,13 @@ NAME_SPACE_RE = re.compile(
 )
 
 def normalize_token(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     s = unidecode(str(s).strip().upper())
     return "".join(ch for ch in s if "A" <= ch <= "Z")
 
 def clean_extracted_name(raw_text):
-    if not isinstance(raw_text, str): 
+    if not isinstance(raw_text, str):
         return None
 
     raw_text = " ".join(raw_text.split()).strip()
@@ -277,17 +278,20 @@ def fetch_ibge_full_from_api() -> Tuple[Dict[str, int], Dict[str, int], Dict[str
         while True:
             try:
                 r = requests.get(url, params={"page": page}, timeout=30)
-                if r.status_code != 200: break
+                if r.status_code != 200:
+                    break
                 items = r.json().get("items", [])
-                if not items: break
+                if not items:
+                    break
                 for it in items:
                     n = normalize_token(it.get("nome"))
                     if n:
                         out[n] = int(it.get("rank", 0) or 0)
                 page += 1
-                if len(out) > 20000: break
+                if len(out) > 20000:
+                    break
                 time.sleep(0.08)
-            except:
+            except Exception:
                 break
         return out
 
@@ -349,18 +353,48 @@ with st.sidebar.status("Loading IBGE...", expanded=False) as s:
 #             MATCHING
 # =========================================================
 def calculate_score(rank, limit, weight=50):
-    if not rank or rank > limit: return 0
+    if not rank or rank > limit:
+        return 0
     return weight * (1 - (rank / limit))
 
-def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
-    found = []
+def match_names(items: List[Union[str, Dict[str, Any]]], source: str) -> List[Dict[str, Any]]:
+    """
+    Backward compatible:
+      - items can be List[str] (names), OR
+      - List[dict] with keys like: name/email/description/url
+    """
+    found: List[Dict[str, Any]] = []
     seen = set()
 
-    for raw in names:
-        n = clean_extracted_name(raw)
-        if not n or n in seen:
+    for item in items:
+        raw_name = None
+        meta_email = None
+        meta_desc = None
+        meta_url = None
+
+        if isinstance(item, dict):
+            raw_name = item.get("name") or item.get("Full Name") or item.get("full_name")
+            meta_email = item.get("email")
+            meta_desc = item.get("description") or item.get("desc")
+            meta_url = item.get("url")
+        else:
+            raw_name = item
+
+        n = clean_extracted_name(raw_name)
+        if not n:
+            # dict fallback: allow bounded 2..7 tokens if name is "clean-ish"
+            if isinstance(item, dict) and raw_name:
+                raw_name2 = " ".join(str(raw_name).split()).strip()
+                toks = raw_name2.split()
+                if 2 <= len(toks) <= 7:
+                    n = raw_name2
+        if not n:
             continue
-        seen.add(n)
+
+        dedup_key = (n, (meta_email or "").strip().lower())
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
 
         parts = n.split()
 
@@ -376,6 +410,9 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
                 score = calculate_score(rl, int(limit_surname), 50)
                 found.append({
                     "Full Name": n,
+                    "Email": meta_email,
+                    "Description": meta_desc,
+                    "URL": meta_url,
                     "Brazil Score": round(score, 1),
                     "First Rank": None,
                     "Surname Rank": rl,
@@ -403,6 +440,9 @@ def match_names(names: List[str], source: str) -> List[Dict[str, Any]]:
         if total_score > 5:
             found.append({
                 "Full Name": n,
+                "Email": meta_email,
+                "Description": meta_desc,
+                "URL": meta_url,
                 "Brazil Score": total_score,
                 "First Rank": rf if rf > 0 else None,
                 "Surname Rank": rl if rl > 0 else None,
@@ -491,7 +531,8 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
                 return {"method": "GET", "url": urljoin(base_url, el["href"]), "data": None}
             if el.name in ("button", "input"):
                 req = extract_form_request_from_element(el, base_url)
-                if req: return req
+                if req:
+                    return req
 
     el = soup.select_one("a[rel='next'][href]")
     if el:
@@ -512,12 +553,14 @@ def find_next_request_heuristic(html: str, current_url: str, manual_next: Option
         if btn.name == "button":
             if looks_like_next(btn.get_text(" ", strip=True)) or looks_like_next(btn.get("aria-label", "")):
                 req = extract_form_request_from_element(btn, base_url)
-                if req: return req
+                if req:
+                    return req
         else:
             t = btn.get("value", "") or btn.get("aria-label", "") or ""
             if looks_like_next(t):
                 req = extract_form_request_from_element(btn, base_url)
-                if req: return req
+                if req:
+                    return req
 
     u = urlparse(base_url)
     qs = parse_qs(u.query)
@@ -926,6 +969,9 @@ def _click_best_people_tab_if_any(driver) -> Optional[str]:
     return None
 
 def _extract_people_like_names(container_html: str) -> List[str]:
+    """
+    Kept for stability + waiter evidence detection.
+    """
     if not container_html:
         return []
 
@@ -970,6 +1016,176 @@ def _extract_people_like_names(container_html: str) -> List[str]:
             dedup.append(x)
     return dedup
 
+
+# ===========================
+# NEW: RICH RECORD EXTRACTION
+# ===========================
+def _norm_space(s: str) -> str:
+    return " ".join((s or "").split()).strip()
+
+def _pick_description_from_text(text: str, name: str = "", email: str = "") -> str:
+    """
+    Universal: takes a small local block of text and returns a short description,
+    avoiding just repeating the name/email. No keyword filtering.
+    """
+    t = _norm_space(text)
+    if not t:
+        return ""
+
+    if name:
+        t = t.replace(name, " ")
+    if email:
+        t = t.replace(email, " ")
+
+    t = _norm_space(t)
+    if not t:
+        return ""
+
+    if len(t) > 180:
+        t = t[:180].rsplit(" ", 1)[0].strip() + "…"
+    return t
+
+def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
+    """
+    Universal record extraction from the selected people-like container.
+    Returns list of dicts: {name, email?, description?, url?}
+
+    Strategy:
+    - Walk likely "item blocks" (tr, li, article, [role=listitem], cards-ish divs).
+    - Pull mailto email(s) and any nearby anchor href (profile url).
+    - Find name from headers/strong/anchors or name-like lines.
+    - Description = remaining nearby text in the same block, trimmed.
+    """
+    if not container_html:
+        return []
+
+    soup = BeautifulSoup(container_html, "html.parser")
+
+    item_selectors = [
+        "tr", "li", "article", "[role='listitem']",
+        ".card", ".result", ".person", ".profile", ".directory-item",
+        "div"
+    ]
+
+    blocks = []
+    for sel in item_selectors:
+        try:
+            blocks.extend(soup.select(sel))
+        except Exception:
+            continue
+        if len(blocks) >= 250:
+            break
+
+    records: List[Dict[str, Any]] = []
+    seen = set()
+
+    def add_record(name: str, email: str = "", desc: str = "", url: str = ""):
+        name = _norm_space(name)
+        email = _norm_space(email)
+        desc = _norm_space(desc)
+        url = _norm_space(url)
+
+        if not name:
+            return
+
+        c = clean_extracted_name(name)
+        if not c:
+            toks = name.split()
+            if not (2 <= len(toks) <= 7):
+                return
+            c = name
+
+        key = (c.lower(), (email or "").lower())
+        if key in seen:
+            return
+        seen.add(key)
+
+        records.append({
+            "name": c,
+            "email": email or None,
+            "description": desc or None,
+            "url": url or None,
+        })
+
+    for blk in blocks[:250]:
+        try:
+            txt = blk.get_text("\n", strip=True)
+        except Exception:
+            continue
+        if not txt or len(txt) < 8:
+            continue
+
+        # Emails: mailto preferred
+        emails: List[str] = []
+        for a in blk.select("a[href^='mailto:']"):
+            href = a.get("href") or ""
+            em = href.replace("mailto:", "").split("?")[0].strip()
+            if em:
+                emails.append(em)
+
+        # Visible email fallback
+        if not emails:
+            m = EMAIL_RE.search(txt)
+            if m:
+                emails = [m.group(0)]
+
+        # URL: first non-mailto link in block
+        url = ""
+        for a in blk.select("a[href]"):
+            href = (a.get("href") or "").strip()
+            if not href or href.lower().startswith("mailto:"):
+                continue
+            url = href
+            break
+
+        # Name candidates: headers/strong/a + line-based
+        name_candidates: List[str] = []
+        for sel in ["h1", "h2", "h3", "h4", "strong", "a"]:
+            try:
+                for el in blk.select(sel)[:8]:
+                    t = el.get_text(" ", strip=True)
+                    if t:
+                        name_candidates.append(t)
+            except Exception:
+                pass
+
+        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+        for ln in lines[:12]:
+            if NAME_COMMA_RE.match(ln):
+                parts = [p.strip() for p in ln.split(",") if p.strip()]
+                if len(parts) >= 2:
+                    name_candidates.append(f"{parts[1]} {parts[0]}".strip())
+            elif NAME_SPACE_RE.match(ln):
+                name_candidates.append(ln)
+
+        chosen_name = ""
+        for cand in name_candidates:
+            c = clean_extracted_name(cand)
+            if c:
+                chosen_name = c
+                break
+        if not chosen_name and name_candidates:
+            for cand in name_candidates:
+                toks = cand.split()
+                if 2 <= len(toks) <= 7:
+                    chosen_name = _norm_space(cand)
+                    break
+
+        if not chosen_name:
+            continue
+
+        primary_email = emails[0] if emails else ""
+        desc = _pick_description_from_text(txt, name=chosen_name, email=primary_email)
+
+        if emails:
+            for em in list(dict.fromkeys(emails))[:3]:
+                add_record(chosen_name, email=em, desc=desc, url=url)
+        else:
+            add_record(chosen_name, email="", desc=desc, url=url)
+
+    return records
+
+
 def selenium_wait_for_people_results(
     driver,
     term: str,
@@ -1013,7 +1229,7 @@ def selenium_wait_for_people_results(
         sig = _text_signature(cont_text)
         elapsed = round(time.time() - start, 2)
 
-        # Evidence of results
+        # Evidence of results (keep old stable evidence path)
         people_names = _extract_people_like_names(cont_html or "")
         page_has_email = bool(EMAIL_RE.search(page_html or ""))
         cont_has_email = bool(EMAIL_RE.search(cont_text or ""))
@@ -1043,7 +1259,6 @@ def selenium_wait_for_people_results(
 
         # Regular “changed container” heuristic (kept)
         if sig != base_sig and cont_dbg.get("score", -1) >= 20:
-            # if it changed but still no evidence, keep waiting
             pass
 
         time.sleep(poll_s)
@@ -1172,7 +1387,7 @@ def _active_search_worker_thread(
 
             consecutive_fails = 0
 
-            # Keep the time behavior stable (your request)
+            # Keep the time behavior stable
             if post_submit_sleep > 0:
                 time.sleep(float(post_submit_sleep))
 
@@ -1195,8 +1410,8 @@ def _active_search_worker_thread(
                 out_q.put(("log", worker_id, f"⏱️ timeout for {surname} (using best container anyway)"))
                 people_container_html, _ = _best_people_container_html(driver)
 
-            people_names = _extract_people_like_names(people_container_html or "")
-            out_q.put(("result", worker_id, surname, people_names, state))
+            people_records = _extract_people_like_records(people_container_html or "")
+            out_q.put(("result", worker_id, surname, people_records, state))
 
     except Exception as e:
         out_q.put(("log", worker_id, f"💥 worker crash: {e}"))
@@ -1345,11 +1560,9 @@ if st.session_state.running:
 
             done_threads = 0
             alive = [True] * len(threads)
-            started = time.time()
 
             # Main UI loop: consume results
             while done_threads < len(threads) and st.session_state.running:
-                # Drain messages quickly
                 try:
                     msg = out_q.get(timeout=0.4)
                 except Empty:
@@ -1363,14 +1576,13 @@ if st.session_state.running:
                         status_log.write(f"[W{wid}] {text}")
 
                     elif kind == "result":
-                        _, wid, surname, people_names, state = msg
+                        _, wid, surname, people_records, state = msg
 
-                        if debug_show_candidates and people_names:
-                            st.write(f"[W{wid}] {surname} candidates (first 30):", people_names[:30])
+                        if debug_show_candidates and people_records:
+                            st.write(f"[W{wid}] {surname} candidates (first 30):", people_records[:30])
 
-                        # If none, do nothing (avoid falling back to full-page scrape here; it’s slower and can pull junk)
-                        if people_names:
-                            matches = match_names(people_names, f"Search: {surname}")
+                        if people_records:
+                            matches = match_names(people_records, f"Search: {surname}")
                         else:
                             matches = []
 
@@ -1383,12 +1595,12 @@ if st.session_state.running:
                             all_matches.sort(key=lambda x: x["Brazil Score"], reverse=True)
                             st.session_state.matches = all_matches
                             table_placeholder.dataframe(pd.DataFrame(all_matches), height=320, use_container_width=True)
-                            status_log.write(f"✅ '{surname}': +{len(matches)} matches (candidates={len(people_names)})")
+                            status_log.write(f"✅ '{surname}': +{len(matches)} matches (candidates={len(people_records)})")
                         else:
                             if state == "no_results":
                                 status_log.write(f"🚫 '{surname}': no results")
                             else:
-                                status_log.write(f"🤷 '{surname}': 0 matches (candidates={len(people_names)})")
+                                status_log.write(f"🤷 '{surname}': 0 matches (candidates={len(people_records)})")
 
                 # Update thread liveness
                 for i, t in enumerate(threads):
@@ -1396,24 +1608,18 @@ if st.session_state.running:
                         alive[i] = False
                         done_threads += 1
 
-                # A tiny sleep prevents UI churn
                 time.sleep(0.05)
 
-                # Stop button behavior
                 if not st.session_state.running:
                     break
 
         finally:
-            # Stop workers
             stop_flag.set()
             for t in threads:
                 try:
                     t.join(timeout=1.0)
                 except Exception:
                     pass
-
-        # Respect your existing delay semantics between cycles? (Parallel mode ignores per-surname delay by design)
-        # We still keep your global search_delay for Classic/Infinite, and rely on selenium_wait + post_submit_sleep here.
 
     status_log.update(label="Scanning Complete", state="complete")
     st.session_state.running = False
@@ -1445,6 +1651,9 @@ if st.session_state.matches:
         cols_config = {
             "Brazil Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.1f"),
             "Status": st.column_config.TextColumn("Status"),
+            "Email": st.column_config.TextColumn("Email"),
+            "Description": st.column_config.TextColumn("Description"),
+            "URL": st.column_config.TextColumn("URL"),
         }
 
         st.dataframe(df, column_config=cols_config, use_container_width=True)
