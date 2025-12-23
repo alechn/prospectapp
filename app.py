@@ -810,6 +810,7 @@ def submit_query(driver, inp, term: str) -> bool:
     """
     Keep the debugger's robust submit order:
     ENTER -> click submit -> inp.submit()
+    BUT make clearing bulletproof (fixes SANTOSOUZA / OLIVEIRPEREIRA).
     """
     try:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
@@ -820,22 +821,65 @@ def submit_query(driver, inp, term: str) -> bool:
     except Exception:
         pass
 
-    # Clear
+    # --- HARD CLEAR (do several methods) ---
     try:
-        inp.send_keys(Keys.CONTROL + "a")
-        inp.send_keys(Keys.BACKSPACE)
-    except Exception:
-        pass
-    try:
-        driver.execute_script("arguments[0].value='';", inp)
+        inp.clear()
     except Exception:
         pass
 
     try:
+        inp.send_keys(Keys.CONTROL, "a")
+        inp.send_keys(Keys.BACKSPACE)
+    except Exception:
+        pass
+
+    # JS clear + dispatch input event (important for React/JS sites)
+    try:
+        driver.execute_script(
+            "arguments[0].value=''; arguments[0].dispatchEvent(new Event('input',{bubbles:true}));",
+            inp
+        )
+    except Exception:
+        pass
+
+    time.sleep(0.05)
+
+    # --- SET VALUE via JS + then type (covers JS-controlled inputs) ---
+    try:
+        driver.execute_script(
+            "arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('input',{bubbles:true}));",
+            inp, term
+        )
+    except Exception:
+        pass
+
+    # Type as well (some sites only react to key events)
+    try:
+        inp.click()
+        inp.send_keys(Keys.CONTROL, "a")
         inp.send_keys(term)
     except Exception:
         return False
 
+    # --- VERIFY we really set the term (prevents concatenation) ---
+    try:
+        val = (inp.get_attribute("value") or "").strip()
+        if term not in val or len(val) > len(term) + 2:
+            # One more hard reset attempt
+            try:
+                driver.execute_script(
+                    "arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('input',{bubbles:true}));",
+                    inp, term
+                )
+                val2 = (inp.get_attribute("value") or "").strip()
+                if term not in val2:
+                    return False
+            except Exception:
+                return False
+    except Exception:
+        pass
+
+    # Submit order (unchanged)
     try:
         inp.send_keys(Keys.RETURN)
         return True
@@ -850,6 +894,7 @@ def submit_query(driver, inp, term: str) -> bool:
         return True
     except Exception:
         return False
+
 
 
 # =========================================================
@@ -1269,33 +1314,53 @@ def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     seen = set()
 
-    def add_record(name: str, email: str = "", desc: str = "", url: str = ""):
-        name = _norm_space(name)
-        email = _norm_space(email)
-        desc = _norm_space(desc)
-        url = _norm_space(url)
+def add_record(name: str, email: str = "", desc: str = "", url: str = ""):
+    name = _norm_space(name)
+    email = _norm_space(email)
+    desc = _norm_space(desc)
+    url = _norm_space(url)
 
-        if not name:
+    if not name:
+        return
+
+    # ✅ Universal junk filter: drop nav/items unless they look like a person/profile
+    low_name = (name or "").lower()
+    low_url = (url or "").lower()
+
+    looks_profile_url = any(x in low_url for x in [
+        "directory", "profile", "people", "staff", "faculty", "user", "member", "id="
+    ])
+
+    # If no email and URL doesn't look like a profile, skip
+    if not email and (not url or not looks_profile_url):
+        return
+
+    # Drop javascript:void links
+    if low_url.startswith("javascript:"):
+        return
+
+    # Optional extra: drop obvious section/nav names (keeps it fairly universal)
+    if not email and re.search(r"[+\u2193]|admissions|campus|lifelong|about|news|locations|search results", low_name):
+        return
+
+    c = clean_extracted_name(name)
+    if not c:
+        toks = name.split()
+        if not (2 <= len(toks) <= 7):
             return
+        c = name
 
-        c = clean_extracted_name(name)
-        if not c:
-            toks = name.split()
-            if not (2 <= len(toks) <= 7):
-                return
-            c = name
+    key = (c.lower(), (email or "").lower())
+    if key in seen:
+        return
+    seen.add(key)
 
-        key = (c.lower(), (email or "").lower())
-        if key in seen:
-            return
-        seen.add(key)
-
-        records.append({
-            "name": c,
-            "email": email or None,
-            "description": desc or None,
-            "url": url or None,
-        })
+    records.append({
+        "name": c,
+        "email": email or None,
+        "description": desc or None,
+        "url": url or None,
+    })
 
     for blk in blocks[:250]:
         try:
