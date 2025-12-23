@@ -1604,8 +1604,13 @@ if st.session_state.running:
         st.error("Missing Target URL")
         st.stop()
 
-    status_log = st.status("Initializing...", expanded=True)
-    table_placeholder = st.empty()
+total_names = int(max_pages) if mode.endswith("Surnames)") else None
+processed_names = 0
+
+status_log = st.status(
+    f"Running · 0 / {total_names} names" if total_names else "Running",
+    expanded=True
+)
 
     all_matches: List[Dict[str, Any]] = []
     all_seen = set()
@@ -1750,6 +1755,11 @@ if st.session_state.running:
 
                     elif kind == "result":
                         _, wid, surname, people_records, state = msg
+                        processed_names += 1
+                        status_log.update(
+                        label=f"Running · {processed_names} / {total_names} names",
+                        state="running"
+                        )
 
                         if debug_show_candidates and people_records:
                             st.write(f"[W{wid}] {surname} candidates (first 30):", people_records[:30])
@@ -1794,7 +1804,10 @@ if st.session_state.running:
                 except Exception:
                     pass
 
-    status_log.update(label="Scanning Complete", state="complete")
+    status_log.update(
+    label=f"Complete · {processed_names} / {total_names} names",
+    state="complete"
+    )
     st.session_state.running = False
 
 
