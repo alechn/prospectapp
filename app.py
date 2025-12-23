@@ -976,6 +976,11 @@ def selenium_wait_for_people_results(
     timeout: int,
     poll_s: float = 0.35
 ) -> Tuple[str, Optional[str], Dict[str, Any]]:
+    """
+    Safer waiter:
+    - avoids early false 'no_results' while JS is still hydrating
+    - only accepts 'no_results' after a short grace period AND no evidence of results
+    """
     start = time.time()
 
     base_html, base_dbg = _best_people_container_html(driver)
@@ -985,22 +990,20 @@ def selenium_wait_for_people_results(
     base_sig = _text_signature(base_text)
 
     debug = {
-        "baseline": {
-            "sig": base_sig,
-            "metrics": base_dbg
-        },
+        "baseline": {"sig": base_sig, "metrics": base_dbg},
         "ticks": []
     }
 
+    # --- NEW: grace period before believing "no results" ---
+    NO_RESULTS_GRACE_S = 1.25  # small, keeps your time behavior effectively the same
+
     while (time.time() - start) < timeout:
         selenium_wait_document_ready(driver, timeout=3)
+
         try:
             page_html = driver.page_source or ""
         except Exception:
             page_html = ""
-
-        if page_has_no_results_signal(page_html):
-            return "no_results", None, debug
 
         cont_html, cont_dbg = _best_people_container_html(driver)
         cont_text = ""
@@ -1008,21 +1011,40 @@ def selenium_wait_for_people_results(
             cont_text = BeautifulSoup(cont_html, "html.parser").get_text(" ", strip=True)
 
         sig = _text_signature(cont_text)
-        elapsed = round(time.time() - start, 1)
+        elapsed = round(time.time() - start, 2)
+
+        # Evidence of results
+        people_names = _extract_people_like_names(cont_html or "")
+        page_has_email = bool(EMAIL_RE.search(page_html or ""))
+        cont_has_email = bool(EMAIL_RE.search(cont_text or ""))
 
         term_seen = (term.lower() in (page_html or "").lower()) or (term.lower() in (cont_text or "").lower())
-        people_names = _extract_people_like_names(cont_html or "")
+
         debug["ticks"].append({
             "t": elapsed,
             "sig": sig,
             "term_seen": bool(term_seen),
             "metrics": cont_dbg,
-            "people_names": len(people_names)
+            "people_names": len(people_names),
+            "page_has_email": page_has_email,
+            "cont_has_email": cont_has_email,
         })
 
-        if (sig != base_sig and cont_dbg.get("score", -1) >= 20) or len(people_names) > 0:
-            if len(people_names) > 0 or cont_dbg.get("emails", 0) > 0 or cont_dbg.get("mailtos", 0) > 0:
-                return "results", cont_html, debug
+        # ✅ If we have any real results evidence, return results immediately
+        if people_names or cont_has_email or page_has_email:
+            return "results", cont_html, debug
+
+        # ✅ Only after grace period: consider no-results, and only if term is actually present
+        if elapsed >= NO_RESULTS_GRACE_S and term_seen:
+            if page_has_no_results_signal(page_html):
+                # extra guard: don't trust no-results if container "looks like" people results
+                if cont_dbg.get("nameish", 0) < 2 and cont_dbg.get("emails", 0) == 0 and cont_dbg.get("mailtos", 0) == 0:
+                    return "no_results", None, debug
+
+        # Regular “changed container” heuristic (kept)
+        if sig != base_sig and cont_dbg.get("score", -1) >= 20:
+            # if it changed but still no evidence, keep waiting
+            pass
 
         time.sleep(poll_s)
 
