@@ -912,7 +912,16 @@ def _score_people_block(text: str) -> Dict[str, Any]:
                 nameish += 1
 
     people_hint = 1 if ("people results" in tlow or re.search(r"\bpeople\b", tlow)) else 0
-    score = (emails * 12) + (mailtos * 18) + (nameish * 8) + (people_hint * 10)
+    people_results_for = 1 if ("people results for" in tlow) else 0
+    has_people_header = 1 if re.search(r"\bpeople\b", tlow) else 0
+    
+    # Penalize non-people sections that often show up on MIT search pages
+    websites_hint = 1 if re.search(r"\bwebsites\b", tlow) else 0
+    locations_hint = 1 if re.search(r"\blocations\b", tlow) else 0
+
+    score = (emails * 12) + (mailtos * 18) + (nameish * 8)
+    score += (people_results_for * 35) + (has_people_header * 10)
+    score -= (websites_hint * 15) + (locations_hint * 15)
 
     return {
         "score": score,
@@ -1348,9 +1357,15 @@ def selenium_wait_for_people_results(
         # ✅ Only after grace period: consider no-results, and only if term is actually present
         if elapsed >= NO_RESULTS_GRACE_S and term_seen:
             if page_has_no_results_signal(page_html):
-                # extra guard: don't trust no-results if container "looks like" people results
-                if cont_dbg.get("nameish", 0) < 2 and cont_dbg.get("emails", 0) == 0 and cont_dbg.get("mailtos", 0) == 0:
-                    return "no_results", None, debug
+
+                # 🚫 IMPORTANT: don't trust "no results" if the page shows People results
+                if re.search(r"people results for", page_html or "", re.I) or re.search(r"people results for", cont_text or "", re.I):
+                    # keep waiting / allow container scoring to pick the right block
+                    pass
+                else:
+                    # only accept no-results if there's truly no people evidence
+                    if cont_dbg.get("nameish", 0) < 2 and cont_dbg.get("emails", 0) == 0 and cont_dbg.get("mailtos", 0) == 0:
+                        return "no_results", None, debug
 
         # Regular “changed container” heuristic (kept)
         if sig != base_sig and cont_dbg.get("score", -1) >= 20:
