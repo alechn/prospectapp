@@ -13,6 +13,7 @@ from unidecode import unidecode
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+from openai import OpenAI
 
 # --- Optional curl_cffi ---
 try:
@@ -1317,40 +1318,86 @@ def selenium_wait_for_people_results(
 # =========================================================
 #             AI CLEANING AGENT (unchanged)
 # =========================================================
+def build_ai_clean_prompt(batch_rows: List[Dict[str, Any]]) -> str:
+    return f"""
+You are cleaning scraped "people" results.
+
+Mark items as JUNK if they look like:
+- search engine result headers / "results for" / "custom search"
+- bot checks / captcha text (e.g., "Please verify that you are not a robot")
+- navigation / website chrome / generic site sections
+- javascript:void(0) or empty/meaningless URLs
+- anything clearly not a person entry
+
+Return ONLY strict JSON:
+{{"junk":[<indices>]}}
+where <indices> are the "i" values.
+
+Input rows:
+{json.dumps(batch_rows, ensure_ascii=False)}
+"""
+
 def batch_clean_with_ai(matches, api_key):
     if not api_key:
         st.error("API Key required.")
         return matches
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    # Build context rows (THIS is why AI now works)
+    rows = []
+    for i, m in enumerate(matches):
+        rows.append({
+            "i": i,
+            "name": m.get("Full Name"),
+            "desc": m.get("Description"),
+            "url": m.get("URL"),
+            "source": m.get("Source"),
+        })
 
-    names = [m["Full Name"] for m in matches]
-    junk_names = []
-
-    batch_size = 50
+    junk_idx = set()
+    batch_size = 40
     progress_bar = st.progress(0)
 
-    for i in range(0, len(names), batch_size):
-        batch = names[i:i+batch_size]
-        prompt = f"""
-        Identify junk strings (titles, places, nav items) in this list.
-        Return JSON list of JUNK items only.
-        List: {json.dumps(batch)}
-        """
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start:start + batch_size]
+        prompt = build_ai_clean_prompt(batch)
+
         try:
-            response = model.generate_content(prompt)
-            text = response.text.replace("```json", "").replace("```", "")
-            found_junk = json.loads(text)
-            junk_names.extend(found_junk)
-        except Exception:
-            pass
+            # 🔀 PROVIDER SWITCH (THIS is the agnostic part)
+            if ai_provider.startswith("Google"):
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel("gemini-2.0-flash")
+                resp = model.generate_content(prompt)
+                text = resp.text or ""
 
-        progress_bar.progress(min((i + batch_size) / len(names), 1.0))
-        time.sleep(1)
+            elif ai_provider.startswith("OpenAI"):
+                client = OpenAI(api_key=api_key)
+                resp = client.responses.create(
+                    model="gpt-5.2-mini",
+                    input=prompt,
+                )
+                text = resp.output_text or ""
 
-    for m in matches:
-        if m["Full Name"] in junk_names:
+            else:
+                st.warning("Claude not implemented yet")
+                text = ""
+
+            # Parse strict JSON
+            text = text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(text)
+
+            for idx in data.get("junk", []):
+                if isinstance(idx, int):
+                    junk_idx.add(idx)
+
+        except Exception as e:
+            st.warning(f"AI cleaning failed for batch {start}: {e}")
+
+        progress_bar.progress(min((start + batch_size) / len(rows), 1.0))
+        time.sleep(0.4)
+
+    # Apply results
+    for i, m in enumerate(matches):
+        if i in junk_idx:
             m["Status"] = "Junk (AI Flagged)"
             m["Brazil Score"] = -1
         else:
@@ -1358,6 +1405,33 @@ def batch_clean_with_ai(matches, api_key):
 
     return matches
 
+def rule_flag_junk(m: Dict[str, Any]) -> bool:
+    blob = " ".join([
+        str(m.get("Full Name") or ""),
+        str(m.get("Description") or ""),
+        str(m.get("Source") or ""),
+        str(m.get("URL") or ""),
+    ]).lower()
+
+    bad_phrases = [
+        "please verify that you are not a robot",
+        "not a robot",
+        "captcha",
+        "custom search",
+        "results for",
+        "website results",
+        "sort by: relevance",
+        "relevance date",
+        "javascript:void(0)",
+    ]
+    if any(p in blob for p in bad_phrases):
+        return True
+
+    url = (m.get("URL") or "").lower()
+    if url.startswith("javascript:"):
+        return True
+
+    return False
 
 # =========================================================
 #             MAIN UI
@@ -1677,6 +1751,13 @@ if st.session_state.running:
 #             POST-PROCESSING UI
 # =========================================================
 if st.session_state.matches:
+    
+        # 🚫 Rule-based junk filter (runs BEFORE AI)
+    for m in st.session_state.matches:
+        if rule_flag_junk(m):
+            m["Status"] = "Junk (Rule)"
+            m["Brazil Score"] = -1
+
     st.markdown("---")
     col1, col2 = st.columns([1, 4])
 
