@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 import google.generativeai as genai
 from openai import OpenAI
 from urllib.parse import quote_plus
+from datetime import datetime
 
 # --- Optional curl_cffi ---
 try:
@@ -1709,6 +1710,26 @@ def rule_flag_junk(m: Dict[str, Any]) -> bool:
 
     return False
 
+def _safe_filename_token(s: str) -> str:
+    """
+    Make a string safe for filenames across OSes.
+    """
+    s = (s or "").strip().lower()
+    s = re.sub(r"https?://", "", s)
+    s = re.sub(r"[^a-z0-9\-\.]+", "-", s)
+    return s.strip("-") or "unknown"
+
+def _mode_to_token(mode: str) -> str:
+    if not mode:
+        return "unknown"
+    if mode.startswith("Classic"):
+        return "classic"
+    if mode.startswith("Infinite"):
+        return "infinite"
+    if mode.startswith("Active"):
+        return "active-search"
+    return _safe_filename_token(mode)
+
 # =========================================================
 #             MAIN UI
 # =========================================================
@@ -2099,10 +2120,28 @@ if st.session_state.matches:
         st.dataframe(df, column_config=cols_config, use_container_width=True)
 
     c1, c2 = st.columns(2)
+
+    # Build filename parts (DATE ONLY)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    domain_token = _safe_filename_token(start_url)
+    mode_token = _mode_to_token(mode)
+    
+    base_name = f"results_{domain_token}_{mode_token}_{date_str}"
+    
     with c1:
-        st.download_button("📥 CSV", df.to_csv(index=False).encode("utf-8"), "results.csv")
+        st.download_button(
+            "📥 CSV",
+            df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{base_name}.csv"
+        )
+    
     with c2:
         b = io.BytesIO()
         with pd.ExcelWriter(b, engine="xlsxwriter") as w:
             df.to_excel(w, index=False)
-        st.download_button("📥 Excel", b.getvalue(), "results.xlsx")
+    
+        st.download_button(
+            "📥 Excel",
+            b.getvalue(),
+            file_name=f"{base_name}.xlsx"
+        )
