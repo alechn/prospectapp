@@ -967,6 +967,43 @@ def _best_people_container_html(driver) -> Tuple[Optional[str], Dict[str, Any]]:
 
     return best_html, best
 
+def _best_people_container_html_from_page_source(page_html: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Fallback: pick the best people-like container by scanning raw HTML text,
+    avoiding Selenium .text issues on hydrated/virtualized results.
+    Returns (outer_html_str, metrics_dict)
+    """
+    if not page_html:
+        return None, {"score": -1}
+
+    soup = BeautifulSoup(page_html, "html.parser")
+    tags = ["main", "section", "article", "div", "ul", "ol", "table"]
+
+    best = {"score": -1, "text": "", "emails": 0, "mailtos": 0, "nameish": 0, "people_hint": 0, "title": ""}
+    best_html = None
+
+    for tag in tags:
+        for el in soup.find_all(tag)[:400]:
+            txt = el.get_text("\n", strip=True) or ""
+            if len(txt) < 120:
+                continue
+
+            metrics = _score_people_block(txt)
+
+            # Same gate as Selenium version
+            if metrics["emails"] == 0 and metrics["mailtos"] == 0 and metrics["nameish"] < 2:
+                continue
+
+            # Strongly prefer blocks that literally contain "People results for"
+            if "people results for" in txt.lower():
+                metrics["score"] += 40
+
+            if metrics["score"] > best["score"]:
+                best = metrics
+                best_html = str(el)
+
+    return best_html, best
+
 def _click_best_people_tab_if_any(driver) -> Optional[str]:
     if not try_people_tab_click:
         return None
@@ -1596,7 +1633,17 @@ def _active_search_worker_thread(
 
             if state == "timeout":
                 out_q.put(("log", worker_id, f"⏱️ timeout for {surname} (using best container anyway)"))
+            
+                # ✅ fallback 1: selenium container
                 people_container_html, _ = _best_people_container_html(driver)
+            
+                # ✅ fallback 2: raw HTML scan (fixes virtualized/hydrated lists)
+                if not people_container_html:
+                    try:
+                        page_html = driver.page_source or ""
+                    except Exception:
+                        page_html = ""
+                    people_container_html, _ = _best_people_container_html_from_page_source(page_html)
 
             people_records = _extract_people_like_records(people_container_html or "")
             out_q.put(("result", worker_id, surname, people_records, state))
