@@ -1284,12 +1284,6 @@ def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
     """
     Universal record extraction from the selected people-like container.
     Returns list of dicts: {name, email?, description?, url?}
-
-    Strategy:
-    - Walk likely "item blocks" (tr, li, article, [role=listitem], cards-ish divs).
-    - Pull mailto email(s) and any nearby anchor href (profile url).
-    - Find name from headers/strong/anchors or name-like lines.
-    - Description = remaining nearby text in the same block, trimmed.
     """
     if not container_html:
         return []
@@ -1314,53 +1308,50 @@ def _extract_people_like_records(container_html: str) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     seen = set()
 
-def add_record(name: str, email: str = "", desc: str = "", url: str = ""):
-    name = _norm_space(name)
-    email = _norm_space(email)
-    desc = _norm_space(desc)
-    url = _norm_space(url)
+    def add_record(name: str, email: str = "", desc: str = "", url: str = ""):
+        name = _norm_space(name)
+        email = _norm_space(email)
+        desc = _norm_space(desc)
+        url = _norm_space(url)
 
-    if not name:
-        return
-
-    # ✅ Universal junk filter: drop nav/items unless they look like a person/profile
-    low_name = (name or "").lower()
-    low_url = (url or "").lower()
-
-    looks_profile_url = any(x in low_url for x in [
-        "directory", "profile", "people", "staff", "faculty", "user", "member", "id="
-    ])
-
-    # If no email and URL doesn't look like a profile, skip
-    if not email and (not url or not looks_profile_url):
-        return
-
-    # Drop javascript:void links
-    if low_url.startswith("javascript:"):
-        return
-
-    # Optional extra: drop obvious section/nav names (keeps it fairly universal)
-    if not email and re.search(r"[+\u2193]|admissions|campus|lifelong|about|news|locations|search results", low_name):
-        return
-
-    c = clean_extracted_name(name)
-    if not c:
-        toks = name.split()
-        if not (2 <= len(toks) <= 7):
+        if not name:
             return
-        c = name
 
-    key = (c.lower(), (email or "").lower())
-    if key in seen:
-        return
-    seen.add(key)
+        # ✅ Universal junk filter: drop nav/items unless they look like a person/profile
+        low_name = (name or "").lower()
+        low_url = (url or "").lower()
 
-    records.append({
-        "name": c,
-        "email": email or None,
-        "description": desc or None,
-        "url": url or None,
-    })
+        looks_profile_url = any(x in low_url for x in [
+            "directory", "profile", "people", "staff", "faculty", "user", "member", "id="
+        ])
+
+        if not email and (not url or not looks_profile_url):
+            return
+
+        if low_url.startswith("javascript:"):
+            return
+
+        if not email and re.search(r"[+\u2193]|admissions|campus|lifelong|about|news|locations|search results", low_name):
+            return
+
+        c = clean_extracted_name(name)
+        if not c:
+            toks = name.split()
+            if not (2 <= len(toks) <= 7):
+                return
+            c = name
+
+        key = (c.lower(), (email or "").lower())
+        if key in seen:
+            return
+        seen.add(key)
+
+        records.append({
+            "name": c,
+            "email": email or None,
+            "description": desc or None,
+            "url": url or None,
+        })
 
     for blk in blocks[:250]:
         try:
@@ -1439,7 +1430,6 @@ def add_record(name: str, email: str = "", desc: str = "", url: str = ""):
             add_record(chosen_name, email="", desc=desc, url=url)
 
     return records
-
 
 def selenium_wait_for_people_results(
     driver,
