@@ -1752,6 +1752,9 @@ mode = st.radio(
 
 if st.button("🚀 Start Mission", type="primary"):
     st.session_state.running = True
+    # Reset run-specific state so loop detection doesn't false-trigger
+    st.session_state.visited_fps = set()
+    st.session_state.visited_urls = set()
 
 
 # =========================================================
