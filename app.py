@@ -254,19 +254,35 @@ def clean_extracted_name(raw_text):
 def request_fingerprint(method: str, url: str, data: Optional[dict]) -> str:
     return f"{method.upper()}|{url}|{json.dumps(data or {}, sort_keys=True, ensure_ascii=False)}"
 
-def fetch_native(method: str, url: str, data: Optional[dict] = None):
+def fetch_native(method: str, url: str, data: Optional[dict] = None, session: Optional[requests.Session] = None):
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
+    sess = session or requests
     try:
         if use_browserlike_tls and HAS_CURL:
+            # curl_cffi doesn't share cookies with requests.Session; keep it stateless.
             if method.upper() == "POST":
                 return crequests.post(url, headers=headers, data=data or {}, impersonate="chrome110", timeout=25)
             return crequests.get(url, headers=headers, impersonate="chrome110", timeout=25)
 
         if method.upper() == "POST":
-            return requests.post(url, headers=headers, data=data or {}, timeout=25)
-        return requests.get(url, headers=headers, timeout=25)
+            return sess.post(url, headers=headers, data=data or {}, timeout=25)
+        return sess.get(url, headers=headers, timeout=25)
     except Exception:
         return None
+
+
+@st.cache_resource
+def get_http_session():
+    """
+    Reusable HTTP session for Classic mode so cookies persist across GET/POST pagination.
+    Fixes sites that require session cookies/hidden state between pages (common on POST pagination).
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return s
 
 
 # =========================================================
@@ -1908,6 +1924,8 @@ if st.session_state.running:
     # ---------------------------
     if mode.startswith("Classic"):
         current_req = {"method": "GET", "url": start_url, "data": None}
+        http_sess = get_http_session()
+
 
         for page in range(1, int(max_pages) + 1):
             fp = request_fingerprint(current_req["method"], current_req["url"], current_req.get("data"))
@@ -1918,7 +1936,7 @@ if st.session_state.running:
 
             status_log.update(label=f"Scanning Page {page}...", state="running")
 
-            r = fetch_native(current_req["method"], current_req["url"], current_req.get("data"))
+            r = fetch_native(current_req["method"], current_req["url"], current_req.get("data"), session=http_sess)
             if not r or getattr(r, "status_code", None) != 200:
                 status_log.warning("Fetch failed.")
                 break
